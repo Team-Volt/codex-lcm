@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-test("Codex plugin manifest points to MCP and hook manifests", () => {
+test("Codex plugin manifest points to MCP and skills", () => {
   const manifest = JSON.parse(fs.readFileSync(".codex-plugin/plugin.json", "utf8"));
 
   assert.equal(manifest.name, "codex-lcm");
@@ -39,4 +39,14 @@ test("hook manifest registers all required Codex lifecycle hooks", () => {
     const command = manifest.hooks[event][0].hooks[0].command;
     assert.match(command, new RegExp(`codex-lcm" hook ${event}`, "u"));
   }
+});
+
+test("marketplace entry installs the repository plugin root", () => {
+  const marketplace = JSON.parse(fs.readFileSync("../../.agents/plugins/marketplace.json", "utf8"));
+
+  assert.equal(marketplace.name, "codex-lcm");
+  assert.equal(marketplace.plugins[0].name, "codex-lcm");
+  assert.deepEqual(marketplace.plugins[0].source, { source: "local", path: "./plugins/codex-lcm" });
+  assert.equal(marketplace.plugins[0].policy.installation, "AVAILABLE");
+  assert.equal(marketplace.plugins[0].policy.authentication, "ON_INSTALL");
 });

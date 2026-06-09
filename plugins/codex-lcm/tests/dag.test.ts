@@ -165,6 +165,38 @@ test("packs old matching events from long sessions instead of only the recent ta
   storage.close();
 });
 
+test("packs direct query matches before adjacent context under tight budgets", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "small-budget-session";
+  const cwd = "/tmp/dag-small-budget";
+
+  ingest(storage, "SessionStart", {
+    session_id: sessionId,
+    cwd,
+    message: "adjacent context that should not crowd out the direct match",
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    prompt: "tiny-budget-needle direct search match",
+  }, "2026-06-09T12:00:01.000Z");
+
+  const packed = storage.packContext({
+    query: "tiny-budget-needle",
+    cwd,
+    budgetTokens: 120,
+  });
+
+  assert.match(packed.markdown, /tiny-budget-needle direct search match/u);
+  const promptIndex = packed.markdown.indexOf("UserPromptSubmit");
+  const sessionIndex = packed.markdown.indexOf("SessionStart");
+  assert.equal(promptIndex !== -1, true);
+  assert.equal(sessionIndex === -1 || promptIndex < sessionIndex, true);
+
+  storage.close();
+});
+
 test("migrates pre-DAG SQLite indexes before creating graph indexes", () => {
   const home = tempHome();
   fs.mkdirSync(home, { recursive: true });

@@ -384,21 +384,28 @@ export class LcmStorage {
   packContext(args: { query?: string; sessionIds?: string[]; budgetTokens?: number; cwd?: string } = {}): PackedContext {
     const budgetTokens = Math.max(16, args.budgetTokens ?? 1200);
     const budgetChars = budgetTokens * 4;
-    const eventCandidates = new Map<string, NormalizedEvent>();
+    const eventCandidates = new Map<string, { event: NormalizedEvent; rank: number; order: number }>();
     const checkpointCandidates = new Map<string, GraphNode>();
     const query = args.query?.trim() ?? "";
     const candidateSessionIds = new Set(args.sessionIds ?? []);
+    let candidateOrder = 0;
 
-    const addEvent = (event: NormalizedEvent) => {
-      eventCandidates.set(event.event_id, event);
+    const addEvent = (event: NormalizedEvent, rank: number) => {
+      const existing = eventCandidates.get(event.event_id);
+      if (!existing) {
+        eventCandidates.set(event.event_id, { event, rank, order: candidateOrder });
+        candidateOrder += 1;
+      } else if (rank < existing.rank) {
+        eventCandidates.set(event.event_id, { event, rank, order: existing.order });
+      }
       candidateSessionIds.add(event.session_id);
     };
 
     if (query.length > 0) {
       const matches = this.searchEvents({ query, cwd: args.cwd, sessionIds: args.sessionIds, limit: 24 });
       for (const event of matches) {
-        addEvent(event);
-        for (const neighbor of this.getAdjacentEvents(event.event_id, 2)) addEvent(neighbor);
+        addEvent(event, 0);
+        for (const neighbor of this.getAdjacentEvents(event.event_id, 2)) addEvent(neighbor, 1);
       }
     }
 
@@ -411,7 +418,8 @@ export class LcmStorage {
       const checkpoint = this.getLatestCheckpoint(sessionId);
       if (checkpoint) checkpointCandidates.set(checkpoint.node_id, checkpoint);
       const recent = this.getRecentContext({ sessionId, limit: args.sessionIds?.length ? 50 : 12 });
-      for (const event of recent.events) addEvent(event);
+      const recentRank = query.length > 0 ? 2 : 0;
+      for (const event of recent.events) addEvent(event, recentRank);
     }
 
     const lines = ["# Codex LCM Context", ""];
@@ -422,31 +430,43 @@ export class LcmStorage {
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
       .map((checkpoint) => ({ checkpoint, text: checkpointToMarkdown(checkpoint) }));
     const eventItems = [...eventCandidates.values()]
-      .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
-      .map((event) => ({ event, text: eventToMarkdown(event) }));
+      .sort((a, b) => a.rank - b.rank || a.order - b.order || a.event.timestamp.localeCompare(b.event.timestamp))
+      .map((candidate) => ({ event: candidate.event, text: eventToMarkdown(candidate.event) }));
 
-    for (const { checkpoint, text } of checkpointItems) {
-      if (chars + text.length > budgetChars) continue;
-      lines.push(text);
-      chars += text.length;
-      sources.push({
-        kind: "checkpoint",
-        session_id: checkpoint.session_id,
-        node_id: checkpoint.node_id,
-        timestamp: checkpoint.timestamp,
-      });
-    }
+    const addCheckpointItems = () => {
+      for (const { checkpoint, text } of checkpointItems) {
+        if (chars + text.length > budgetChars) continue;
+        lines.push(text);
+        chars += text.length;
+        sources.push({
+          kind: "checkpoint",
+          session_id: checkpoint.session_id,
+          node_id: checkpoint.node_id,
+          timestamp: checkpoint.timestamp,
+        });
+      }
+    };
 
-    for (const { event, text } of eventItems) {
-      if (chars + text.length > budgetChars) break;
-      lines.push(text);
-      chars += text.length;
-      sources.push({
-        kind: event.hook_event === "Note" ? "note" : "event",
-        session_id: event.session_id,
-        event_id: event.event_id,
-        timestamp: event.timestamp,
-      });
+    const addEventItems = () => {
+      for (const { event, text } of eventItems) {
+        if (chars + text.length > budgetChars) continue;
+        lines.push(text);
+        chars += text.length;
+        sources.push({
+          kind: event.hook_event === "Note" ? "note" : "event",
+          session_id: event.session_id,
+          event_id: event.event_id,
+          timestamp: event.timestamp,
+        });
+      }
+    };
+
+    if (query.length > 0) {
+      addEventItems();
+      addCheckpointItems();
+    } else {
+      addCheckpointItems();
+      addEventItems();
     }
 
     return {

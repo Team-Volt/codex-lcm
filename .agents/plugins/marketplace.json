@@ -1,0 +1,20 @@
+{
+  "name": "codex-lcm",
+  "interface": {
+    "displayName": "Codex LCM"
+  },
+  "plugins": [
+    {
+      "name": "codex-lcm",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-lcm"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}
