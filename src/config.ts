@@ -23,7 +23,7 @@ export const DEFAULT_LIMITS: LcmLimits = {
   maxParseErrorPreviewBytes: 4 * 1024,
 };
 
-export function resolveHome(env: Record<string, string | undefined> = process.env): string {
+function resolveHome(env: Record<string, string | undefined> = process.env): string {
   return path.resolve(env.CODEX_LCM_HOME || path.join(os.homedir(), ".codex-lcm"));
 }
 

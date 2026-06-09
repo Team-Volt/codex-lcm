@@ -66,7 +66,7 @@ export function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-export function byteLength(value: string): number {
+function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
 

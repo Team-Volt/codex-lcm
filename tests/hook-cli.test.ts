@@ -29,6 +29,18 @@ test("hook command ingests a synthetic projectless prompt event", () => {
   assert.equal(JSON.parse(health.stdout).event_count, 1);
 });
 
+test("hook command rejects oversized stdin before writing storage", () => {
+  const home = tempHome();
+  const result = runCli(["hook", "UserPromptSubmit"], {
+    input: "x".repeat(512 * 1024 + 1),
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /exceeds the 524288 byte limit/u);
+  assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+});
+
 test("hook command captures git metadata as optional session metadata", () => {
   const home = tempHome();
   const repo = tempHome("codex-lcm-git-");

@@ -84,9 +84,27 @@ test("rejects edges that would introduce a graph cycle", () => {
   const eventNode = graph.nodes.find((node) => node.kind === "event" && node.event_id);
   assert.ok(sessionNode);
   assert.ok(eventNode);
-  assert.equal(storage.wouldCreateCycleForTest(eventNode.node_id, sessionNode.node_id), true);
+  const graphInternals = storage as unknown as {
+    wouldCreateCycle(fromNodeId: string, toNodeId: string): boolean;
+    insertGraphEdge(
+      fromNodeId: string,
+      toNodeId: string,
+      kind: string,
+      sessionId: string,
+      position: number,
+      createdAt: string,
+    ): void;
+  };
+  assert.equal(graphInternals.wouldCreateCycle(eventNode.node_id, sessionNode.node_id), true);
   assert.throws(
-    () => storage.insertGraphEdgeForTest(eventNode.node_id, sessionNode.node_id, "invalid_back_edge", sessionId),
+    () => graphInternals.insertGraphEdge(
+      eventNode.node_id,
+      sessionNode.node_id,
+      "invalid_back_edge",
+      sessionId,
+      0,
+      new Date(0).toISOString(),
+    ),
     /cycle/u,
   );
 

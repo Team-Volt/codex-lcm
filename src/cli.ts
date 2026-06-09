@@ -1,4 +1,4 @@
-import { loadConfig, pluginRoot } from "./config.ts";
+import { DEFAULT_LIMITS, loadConfig, pluginRoot } from "./config.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
 import { planInstall, planUninstall, readStatus } from "./installer.ts";
@@ -81,12 +81,18 @@ Commands:
 `);
 }
 
-async function readStdinWithLimit(): Promise<string> {
-  let input = "";
+async function readStdinWithLimit(limit = DEFAULT_LIMITS.maxInputBytes): Promise<string> {
+  const chunks: string[] = [];
+  let bytes = 0;
   for await (const chunk of process.stdin) {
-    input += chunk;
+    const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    bytes += Buffer.byteLength(text, "utf8");
+    if (bytes > limit) {
+      throw new Error(`Hook input exceeds the ${limit} byte limit.`);
+    }
+    chunks.push(text);
   }
-  return input;
+  return chunks.join("");
 }
 
 function extractCwd(rawInput: string): string | undefined {

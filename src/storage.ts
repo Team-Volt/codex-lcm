@@ -806,20 +806,15 @@ export class LcmStorage {
     return row !== undefined;
   }
 
-  wouldCreateCycleForTest(fromNodeId: string, toNodeId: string): boolean {
-    return this.wouldCreateCycle(fromNodeId, toNodeId);
-  }
-
-  insertGraphEdgeForTest(fromNodeId: string, toNodeId: string, kind: string, sessionId: string): void {
-    this.insertGraphEdge(fromNodeId, toNodeId, kind, sessionId, 0, new Date(0).toISOString());
-  }
-
   private ensureColumn(table: string, column: string, type: string): void {
     if (!this.db) return;
-    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all()
+    const tableName = sqlIdentifier(table);
+    const columnName = sqlIdentifier(column);
+    const columnType = sqlColumnType(type);
+    const columns = this.db.prepare(`PRAGMA table_info(${tableName})`).all()
       .map((row) => String((row as { name: string }).name));
-    if (!columns.includes(column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    if (!columns.includes(columnName)) {
+      this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`);
     }
   }
 
@@ -953,6 +948,20 @@ function toFtsQuery(query: string): string {
     .split(/\s+/u)
     .map((term) => `"${term.replaceAll('"', '""')}"`)
     .join(" AND ");
+}
+
+function sqlIdentifier(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) {
+    throw new Error(`Invalid SQL identifier: ${value}`);
+  }
+  return value;
+}
+
+function sqlColumnType(value: string): string {
+  if (!/^[A-Z][A-Z0-9_]*(?:\s+[A-Z][A-Z0-9_]*)*$/u.test(value)) {
+    throw new Error(`Invalid SQL column type: ${value}`);
+  }
+  return value;
 }
 
 function eventSearchText(event: NormalizedEvent): string {

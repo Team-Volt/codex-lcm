@@ -55,7 +55,7 @@ export function readStatus(options: InstallerOptions = {}) {
   };
 }
 
-export function buildHookConfig(root: string) {
+function buildHookConfig(root: string) {
   const binPath = path.join(root, "bin", "codex-lcm");
   const hooks: Record<string, Array<{ hooks: Array<{ type: "command"; command: string; statusMessage?: string }>; matcher?: string }>> = {};
   for (const event of HOOK_EVENTS) {
