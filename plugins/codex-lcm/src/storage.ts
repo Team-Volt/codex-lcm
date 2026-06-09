@@ -391,6 +391,7 @@ export class LcmStorage {
     let candidateOrder = 0;
 
     const addEvent = (event: NormalizedEvent, rank: number) => {
+      if (isCodexLcmToolEvent(event)) return;
       const existing = eventCandidates.get(event.event_id);
       if (!existing) {
         eventCandidates.set(event.event_id, { event, rank, order: candidateOrder });
@@ -1071,6 +1072,11 @@ function extractEventMetadata(event: NormalizedEvent): { turn_id?: string; tool_
 
 function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function isCodexLcmToolEvent(event: NormalizedEvent): boolean {
+  const toolName = event.tool_name || stringField(event.payload.tool_name) || stringField(event.payload.toolName);
+  return toolName?.startsWith("mcp__codex_lcm__") ?? false;
 }
 
 function sessionNodeId(sessionId: string): string {
