@@ -13,6 +13,8 @@ test("install dry-run reports MCP and hook wiring without modifying Codex home",
   const planned = JSON.parse(result.stdout);
   assert.equal(planned.mode, "dry-run");
   assert.match(planned.mcp.command, /codex mcp add codex-lcm -- node /u);
+  assert.match(planned.skills.path, /skills$/u);
+  assert.match(planned.skills.recall_skill, /lcm-recall\/SKILL\.md$/u);
   assert.equal(planned.hooks.SessionStart[0].hooks[0].type, "command");
   assert.match(planned.hooks.SessionStart[0].hooks[0].command, /codex-lcm" hook SessionStart/u);
   assert.equal(fs.existsSync(path.join(codexHome, "hooks.json")), false);
@@ -46,4 +48,5 @@ test("status reads Codex home and reports absent wiring", () => {
   assert.equal(status.hooks_json_exists, true);
   assert.equal(status.mcp_configured, false);
   assert.equal(status.hooks_configured, false);
+  assert.equal(status.recall_skill_available, true);
 });

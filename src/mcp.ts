@@ -52,11 +52,27 @@ const TOOLS = [
   {
     name: "lcm_get_session",
     title: "LCM Get Session",
-    description: "Retrieve sanitized raw events for a session.",
+    description: "Retrieve sanitized raw events for a session, optionally paged for long sessions.",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string" },
+        limit: { type: "number" },
+        cursor: { type: "string" },
+      },
+      required: ["sessionId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "lcm_get_session_graph",
+    title: "LCM Get Session Graph",
+    description: "Retrieve a bounded DAG slice for a session, including session, turn, event, and checkpoint nodes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        limit: { type: "number", default: 200 },
       },
       required: ["sessionId"],
     },
@@ -139,7 +155,11 @@ function handleMessage(message: JsonRpcMessage, storage: ReturnType<typeof creat
       protocolVersion: params?.protocolVersion ?? "2025-11-25",
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-      instructions: "Use Codex LCM tools to retrieve sanitized session events, notes, and packed context across Codex sessions.",
+      instructions: [
+        "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, and packed context across Codex sessions.",
+        "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
+        "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
+      ].join(" "),
     });
     return;
   }
@@ -188,8 +208,17 @@ function callTool(storage: ReturnType<typeof createStorage>, params: Record<stri
       return toolResult(`Found ${matches.length} matching sessions.`, { matches });
     }
     case "lcm_get_session": {
-      const session = storage.getSession(stringArg(args.sessionId, "sessionId"));
+      const session = storage.getSession(stringArg(args.sessionId, "sessionId"), {
+        limit: optionalNumber(args.limit),
+        cursor: optionalString(args.cursor),
+      });
       return toolResult(`Loaded ${session.events.length} events.`, session);
+    }
+    case "lcm_get_session_graph": {
+      const graph = storage.getSessionGraph(stringArg(args.sessionId, "sessionId"), {
+        limit: optionalNumber(args.limit),
+      });
+      return toolResult(`Loaded graph with ${graph.nodes.length} nodes and ${graph.edges.length} edges.`, graph);
     }
     case "lcm_get_recent_context": {
       const context = storage.getRecentContext({

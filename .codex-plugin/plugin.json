@@ -13,6 +13,7 @@
     "mcp",
     "hooks"
   ],
+  "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "hooks": "./hooks/hooks.codex.json",
   "interface": {

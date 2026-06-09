@@ -8,7 +8,16 @@ test("Codex plugin manifest points to MCP and hook manifests", () => {
   assert.equal(manifest.name, "codex-lcm");
   assert.equal(manifest.mcpServers, "./.mcp.json");
   assert.equal(manifest.hooks, "./hooks/hooks.codex.json");
+  assert.equal(manifest.skills, "./skills/");
   assert.equal(manifest.interface.displayName, "Codex LCM");
+});
+
+test("plugin includes a Codex skill that nudges agents to use LCM", () => {
+  const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
+
+  assert.match(skill, /^---\nname: lcm-recall/mu);
+  assert.match(skill, /lcm_search_sessions/u);
+  assert.match(skill, /lcm_pack_context/u);
 });
 
 test("MCP manifest registers the local stdio server", () => {

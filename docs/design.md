@@ -25,10 +25,20 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 Storage defaults to `~/.codex-lcm` and can be overridden with `CODEX_LCM_HOME`.
 
 - `events.jsonl`: append-only sanitized raw event log. This is written first and must succeed even if SQLite indexing fails.
-- `index.sqlite`: derived index with `sessions`, `events`, `notes`, and FTS search tables.
+- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `graph_nodes`, and `graph_edges`.
 - Events include schema version, event ID, timestamp, hook event, session ID, cwd, optional repo root, optional git branch, sanitized payload, redaction metadata, truncation metadata, and a SHA-256 hash of the original stdin.
 
 Raw event capture is lossless for retained sanitized payloads. Privacy and safety controls run before persistence: obvious secrets are redacted, oversized strings/objects are truncated with hashes and byte counts, and binary/image-like blobs are replaced with metadata.
+
+The DAG layer is deterministic and rebuildable from indexed raw events:
+
+- Session nodes anchor session IDs.
+- Turn nodes group events with the same `turn_id`.
+- Event nodes reference raw event IDs.
+- Checkpoint nodes summarize structure at `PreCompact` and every 50 indexed events.
+- Edges are typed as `contains`, `next`, `tool_result`, or `checkpoint`.
+
+Edge insertion rejects self-edges and recursive back edges, so the derived graph remains acyclic. Graph failures are treated as index failures; the raw JSONL event has already been written and remains recoverable.
 
 ## Hook Behavior
 
@@ -41,10 +51,13 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 - `lcm_health`: report storage paths, index status, event count, session count, and current configuration.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
 - `lcm_search_sessions`: cross-session search using SQLite FTS, with recent-session fallback for empty queries.
-- `lcm_get_session`: retrieve a session by ID with sanitized raw events.
+- `lcm_get_session`: retrieve a session by ID with sanitized raw events; supports `limit` and `cursor` for long sessions.
+- `lcm_get_session_graph`: retrieve a bounded DAG slice for a session.
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
-- `lcm_pack_context`: pack search results, notes, and recent events into a token-budgeted Markdown context block.
+- `lcm_pack_context`: pack matching events, nearby graph context, checkpoints, notes, and recent events into a token-budgeted Markdown context block.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
+
+The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex when to call LCM and how to avoid loading entire long sessions unnecessarily.
 
 ## Install Policy
 
@@ -60,6 +73,6 @@ The implementation must not edit `~/.codex/config.toml` or `~/.codex/hooks.json`
 
 - First version is local only and requires no external APIs.
 - Embeddings are deferred; FTS is the first search backend.
-- If SQLite indexing is unavailable, raw JSONL append still works and retrieval falls back to scanning `events.jsonl`.
+- If SQLite indexing is unavailable, raw JSONL append still works and retrieval falls back to scanning `events.jsonl`; graph retrieval returns a bounded fallback graph from raw events when possible.
 - Hook payload shape is based on verified local installed hook examples and tolerant parsing. Unknown future Codex fields are preserved inside the sanitized payload.
 - Actual Codex Desktop hook dispatch is not assumed by tests; smoke tests use synthetic hook events and direct MCP stdio calls.

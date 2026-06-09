@@ -19,6 +19,14 @@ try {
     cwd: root,
     prompt: "smoke searchable context with sk-proj-secret-value",
   });
+  for (let index = 0; index < 20; index += 1) {
+    runHook("UserPromptSubmit", {
+      session_id: "smoke-long-session",
+      turn_id: `smoke-turn-${index}`,
+      cwd: root,
+      prompt: index === 2 ? "smoke-old-dag-marker should survive long-session packing" : `smoke filler ${index}`,
+    });
+  }
 
   const responses = runMcp([
     { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
@@ -40,10 +48,30 @@ try {
         arguments: { query: "searchable", budgetTokens: 120 },
       },
     },
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "lcm_get_session_graph",
+        arguments: { sessionId: "smoke-session", limit: 20 },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: {
+        name: "lcm_pack_context",
+        arguments: { query: "smoke-old-dag-marker", budgetTokens: 160 },
+      },
+    },
   ]);
 
   assert.equal(responses[1].result.structuredContent.matches[0].session_id, "smoke-session");
   assert.match(responses[2].result.structuredContent.markdown, /smoke searchable context/u);
+  assert.equal(responses[3].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
+  assert.match(responses[4].result.structuredContent.markdown, /smoke-old-dag-marker/u);
   assert.doesNotMatch(fs.readFileSync(path.join(home, "events.jsonl"), "utf8"), /sk-proj-secret-value/u);
 
   process.stdout.write(`Smoke test passed with CODEX_LCM_HOME=${home}\n`);

@@ -27,6 +27,7 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_current_session",
       "lcm_search_sessions",
       "lcm_get_session",
+      "lcm_get_session_graph",
       "lcm_get_recent_context",
       "lcm_pack_context",
       "lcm_record_note",
@@ -63,11 +64,21 @@ test("MCP tools search and retrieve synthetic hook data", () => {
       method: "tools/call",
       params: {
         name: "lcm_get_session",
-        arguments: { sessionId: "mcp-session" },
+        arguments: { sessionId: "mcp-session", limit: 20 },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "lcm_get_session_graph",
+        arguments: { sessionId: "mcp-session", limit: 20 },
       },
     },
   ], { CODEX_LCM_HOME: home });
 
   assert.equal(responses[1].result.structuredContent.matches[0].session_id, "mcp-session");
   assert.equal(responses[2].result.structuredContent.session.session_id, "mcp-session");
+  assert.equal(responses[3].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
 });

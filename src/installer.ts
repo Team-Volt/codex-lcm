@@ -16,6 +16,11 @@ export function planInstall(options: InstallerOptions = {}) {
   return {
     mode: "dry-run",
     plugin_root: root,
+    skills: {
+      path: path.join(root, "skills"),
+      recall_skill: path.join(root, "skills", "lcm-recall", "SKILL.md"),
+      note: "Loaded when Codex installs this directory as a plugin; direct MCP/hooks wiring still gets MCP server instructions.",
+    },
     mcp: {
       command: `codex mcp add codex-lcm -- node ${JSON.stringify(binPath)} mcp`,
     },
@@ -35,6 +40,7 @@ export function planUninstall(_options: InstallerOptions = {}) {
 
 export function readStatus(options: InstallerOptions = {}) {
   const home = path.resolve(options.codexHome ?? codexHome());
+  const root = path.resolve(options.root ?? pluginRoot());
   const configPath = path.join(home, "config.toml");
   const hooksPath = path.join(home, "hooks.json");
   const configText = readOptional(configPath);
@@ -45,6 +51,7 @@ export function readStatus(options: InstallerOptions = {}) {
     hooks_json_exists: hooksText !== undefined,
     mcp_configured: configText !== undefined && /mcp_servers\.(?:"codex-lcm"|codex-lcm)|command\s*=\s*".*codex-lcm/u.test(configText),
     hooks_configured: hooksText !== undefined && hooksText.includes("codex-lcm"),
+    recall_skill_available: fs.existsSync(path.join(root, "skills", "lcm-recall", "SKILL.md")),
   };
 }
 

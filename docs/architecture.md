@@ -7,7 +7,7 @@
 3. The payload is normalized into a stable event schema.
 4. Obvious secrets and oversized content are sanitized.
 5. The sanitized event is appended to `events.jsonl`.
-6. SQLite indexing is attempted. Index failure does not undo or block raw append.
+6. SQLite indexing is attempted. This builds session rows, FTS rows, and a derived DAG. Index failure does not undo or block raw append.
 7. `codex-lcm mcp` serves health, search, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
 
 ## Event Schema
@@ -49,8 +49,36 @@ SQLite tables:
 - `sessions`
 - `events`
 - `event_fts`
+- `graph_nodes`
+- `graph_edges`
 
 The first version creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
+
+## DAG Index
+
+The graph index is derived and deterministic. Raw JSONL remains the source of truth.
+
+Node kinds:
+
+- `session`: one per Codex session ID.
+- `turn`: one per session/turn ID when hook payloads include `turn_id`.
+- `event`: one per stored raw event.
+- `checkpoint`: structural checkpoint nodes created on `PreCompact` and every 50 indexed events.
+
+Edge kinds:
+
+- `contains`: session to turn/event, turn to event.
+- `next`: previous event to next event within the same session.
+- `tool_result`: matching `PreToolUse` to `PostToolUse` with the same `tool_use_id`.
+- `checkpoint`: session to checkpoint.
+
+Before inserting an edge, storage runs a recursive reachability check from the prospective child to the prospective parent. If the parent is already reachable from the child, the edge is rejected because it would create a cycle.
+
+For very long sessions, callers should prefer bounded graph and event access:
+
+- `lcm_get_session` with `limit` and `cursor`.
+- `lcm_get_session_graph` with a bounded `limit`.
+- `lcm_pack_context`, which searches matching events first, then adds nearby graph context, checkpoints, and recent tails.
 
 ## MCP Protocol
 
