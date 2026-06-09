@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "codex-lcm": {
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./bin/codex-lcm",
+        "mcp"
+      ]
+    }
+  }
+}

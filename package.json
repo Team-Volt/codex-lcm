@@ -1,0 +1,16 @@
+{
+  "name": "codex-lcm",
+  "version": "0.1.0",
+  "description": "Codex-native session-first lossless context memory plugin.",
+  "type": "module",
+  "bin": {
+    "codex-lcm": "./bin/codex-lcm"
+  },
+  "scripts": {
+    "test": "node --no-warnings --test tests/*.test.ts",
+    "smoke": "node --no-warnings scripts/smoke-test.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

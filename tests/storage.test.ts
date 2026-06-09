@@ -1,0 +1,104 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+
+import { normalizeHookEvent } from "../src/events.ts";
+import { createStorage } from "../src/storage.ts";
+import { tempHome } from "./helpers.ts";
+
+const now = () => new Date("2026-06-09T12:00:00.000Z");
+
+test("appends JSONL and indexes searchable cross-session events", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "s1", cwd: "/tmp/a", prompt: "alpha pool chemistry" }),
+    env: {},
+    now,
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "s2", cwd: "/tmp/b", prompt: "beta app store copy" }),
+    env: {},
+    now,
+  }));
+
+  const health = storage.health();
+  assert.equal(health.event_count, 2);
+  assert.equal(health.session_count, 2);
+  assert.equal(health.raw_log_exists, true);
+
+  const matches = storage.searchSessions({ query: "pool chemistry", limit: 5 });
+  assert.deepEqual(matches.map((match) => match.session_id), ["s1"]);
+  assert.equal(matches[0].cwd, "/tmp/a");
+
+  storage.close();
+});
+
+test("retrieves recent context by explicit session or latest cwd match", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "SessionStart",
+    rawInput: JSON.stringify({ session_id: "older", cwd: "/tmp/work", message: "first" }),
+    env: {},
+    now: () => new Date("2026-06-09T11:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "newer", cwd: "/tmp/work", prompt: "latest context" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  assert.equal(storage.getCurrentSession({ cwd: "/tmp/work" })?.session_id, "newer");
+  assert.equal(storage.getRecentContext({ cwd: "/tmp/work", limit: 5 }).session_id, "newer");
+  assert.equal(storage.getRecentContext({ sessionId: "older", limit: 5 }).events[0].session_id, "older");
+
+  storage.close();
+});
+
+test("records notes and packs context within a budget", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.recordNote({
+    sessionId: "note-session",
+    cwd: "/tmp/notes",
+    text: "Important design note about session-first retrieval.",
+  });
+
+  const packed = storage.packContext({
+    query: "session-first",
+    budgetTokens: 80,
+  });
+
+  assert.match(packed.markdown, /Important design note/u);
+  assert.equal(packed.sources.some((source) => source.kind === "note"), true);
+  assert.ok(packed.estimated_tokens <= 80);
+
+  storage.close();
+});
+
+test("still appends raw JSONL when SQLite index is unavailable", () => {
+  const home = tempHome();
+  fs.mkdirSync(path.join(home, "index.sqlite"));
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "raw-first", cwd: "/tmp/raw", prompt: "raw append survives" }),
+    env: {},
+    now,
+  }));
+
+  const raw = fs.readFileSync(path.join(home, "events.jsonl"), "utf8");
+  assert.match(raw, /raw append survives/u);
+  assert.equal(storage.health().event_count, 1);
+
+  storage.close();
+});

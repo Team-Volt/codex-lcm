@@ -1,0 +1,35 @@
+{
+  "name": "codex-lcm",
+  "version": "0.1.0",
+  "description": "Codex-native session-first lossless context memory with hook ingestion and MCP retrieval.",
+  "author": {
+    "name": "Local Development"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "memory",
+    "context",
+    "mcp",
+    "hooks"
+  ],
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.codex.json",
+  "interface": {
+    "displayName": "Codex LCM",
+    "shortDescription": "Session-first lossless context memory for Codex",
+    "longDescription": "Codex LCM captures sanitized raw Codex hook events into append-only JSONL, builds a local SQLite FTS index, and exposes health, search, retrieval, note, and context-packing tools through MCP.",
+    "developerName": "Local Development",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Search my Codex session memory",
+      "Pack recent Codex context for this task"
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}
