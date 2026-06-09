@@ -10,6 +10,20 @@
 6. SQLite indexing is attempted. This builds session rows, FTS rows, and a derived DAG. Index failure does not undo or block raw append.
 7. `codex-lcm mcp` serves health, search, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
 
+## Plugin Packaging
+
+Codex LCM is packaged as a native Codex plugin. The manifest at
+`.codex-plugin/plugin.json` declares:
+
+- `mcpServers`: points to `.mcp.json`, which starts `node ./bin/codex-lcm mcp`.
+- `hooks`: points to `hooks/hooks.codex.json`, which registers the six lifecycle hooks.
+- `skills`: points to `skills/`, which exposes `lcm-recall`.
+
+After `codex plugin add codex-lcm@codex-lcm`, these plugin-owned resources are
+the active install surface. The `codex-lcm install --dry-run` command is not
+part of native plugin installation; it only prints an equivalent manual wiring
+plan for development or compatibility checks.
+
 ## Event Schema
 
 Every stored event includes:

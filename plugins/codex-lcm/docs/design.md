@@ -61,13 +61,21 @@ The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex wh
 
 ## Install Policy
 
-The plugin repository contains plugin-native MCP and hook manifests, but the CLI also provides explicit wiring helpers:
+Native Codex plugin installation is the primary path. The plugin manifest
+declares the MCP server, hook manifest, and `skills/` directory, so
+`codex plugin add codex-lcm@codex-lcm` is enough to install the runtime pieces
+that Codex owns.
+
+The CLI also provides explicit dry-run wiring helpers for development,
+diagnostics, and manual or older setups:
 
 - `codex-lcm install --dry-run` prints the `codex mcp add` command and the hook entries that would be merged into `~/.codex/hooks.json`.
 - `codex-lcm status` reads current Codex config/hooks and reports whether MCP and hook wiring appear present.
 - `codex-lcm uninstall --dry-run` prints the `codex mcp remove` command and hook commands that would be removed.
 
-The implementation must not edit `~/.codex/config.toml` or `~/.codex/hooks.json` unless the user explicitly chooses a non-dry-run apply path.
+The dry-run helpers are not required after native plugin installation and do not
+copy skills. There is currently no non-dry-run apply path; the implementation
+must not edit `~/.codex/config.toml` or `~/.codex/hooks.json` itself.
 
 ## Limits
 
@@ -75,4 +83,6 @@ The implementation must not edit `~/.codex/config.toml` or `~/.codex/hooks.json`
 - Embeddings are deferred; FTS is the first search backend.
 - If SQLite indexing is unavailable, raw JSONL append still works and retrieval falls back to scanning `events.jsonl`; graph retrieval returns a bounded fallback graph from raw events when possible.
 - Hook payload shape is based on verified local installed hook examples and tolerant parsing. Unknown future Codex fields are preserved inside the sanitized payload.
-- Actual Codex Desktop hook dispatch is not assumed by tests; smoke tests use synthetic hook events and direct MCP stdio calls.
+- Unit and smoke tests use synthetic hook events and direct MCP stdio calls.
+  Native hook dispatch was additionally verified through the local Codex TUI
+  trust flow during installation.

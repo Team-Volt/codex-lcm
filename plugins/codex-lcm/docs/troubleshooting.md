@@ -17,7 +17,9 @@ codex plugin marketplace list
 codex plugin list
 ```
 
-For manual wiring, run the dry-run command and inspect the printed MCP command:
+Native plugin install should expose the MCP server through `.mcp.json`. The
+manual planner is only for development, diagnostics, or older/manual setups
+where you want to inspect equivalent wiring:
 
 ```sh
 node bin/codex-lcm install --dry-run
@@ -36,7 +38,10 @@ Check the hook entries:
 node bin/codex-lcm install --dry-run --json
 ```
 
-The dry run prints commands for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. This tool does not edit `~/.codex/hooks.json` automatically.
+The dry run prints commands for `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. This tool is not needed
+after native plugin installation and does not edit `~/.codex/hooks.json`
+automatically.
 
 For native plugin installs, Codex discovers hooks through `.codex-plugin/plugin.json`:
 
@@ -45,6 +50,18 @@ For native plugin installs, Codex discovers hooks through `.codex-plugin/plugin.
 ```
 
 The local plugin-creator validator bundled with this Codex build currently rejects the `hooks` field, but the live Codex CLI/TUI and the installed AgentMemory plugin both use that field for plugin-owned hook discovery. If hooks do not prompt for review after install, verify that the field is still present.
+
+## Skill Does Not Appear
+
+Native plugin installation loads skills from:
+
+```json
+"skills": "./skills/"
+```
+
+The installed skill is `lcm-recall`. The `codex-lcm install --dry-run` command
+does not copy or install skills; it only reports where the skill lives in the
+plugin package.
 
 ## Storage Problems
 

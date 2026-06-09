@@ -16,10 +16,10 @@ Verified on this machine with Node `v22.22.3`, Codex plugin manifests using `.co
 node bin/codex-lcm --help
 node bin/codex-lcm mcp
 node bin/codex-lcm hook UserPromptSubmit
-node bin/codex-lcm install --dry-run
+node bin/codex-lcm install --dry-run  # optional manual wiring plan
 node bin/codex-lcm status
 node bin/codex-lcm health
-node bin/codex-lcm uninstall --dry-run
+node bin/codex-lcm uninstall --dry-run  # optional manual cleanup plan
 ```
 
 Storage defaults to `~/.codex-lcm`. Override storage for hook and MCP operations with:
@@ -41,6 +41,10 @@ CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 
 ## Installing
 
+Native Codex plugin installation is the primary install path. It wires the MCP
+server, hook manifest, and skill from `.codex-plugin/plugin.json`; no separate
+`codex-lcm install` step is required.
+
 Install as a Codex plugin from this local checkout:
 
 ```sh
@@ -57,7 +61,17 @@ codex plugin add codex-lcm@codex-lcm
 
 The first TUI session after install asks you to review and trust the hooks. That review is expected because Codex hooks can run outside the sandbox after you trust them.
 
-Dry-run first:
+To remove the native plugin, use Codex's plugin manager:
+
+```sh
+codex plugin remove codex-lcm@codex-lcm
+```
+
+### Manual Wiring Planner
+
+`codex-lcm install` is retained for development, diagnostics, and manual or
+older setups where you want to inspect equivalent MCP and hook wiring without
+changing `~/.codex`:
 
 ```sh
 node bin/codex-lcm install --dry-run
@@ -65,9 +79,10 @@ node bin/codex-lcm install --dry-run
 
 The dry run prints the `codex mcp add codex-lcm -- node ".../bin/codex-lcm" mcp` command and the hook entries that would be merged into `~/.codex/hooks.json`.
 
-This tool does not modify `~/.codex/config.toml` or `~/.codex/hooks.json` automatically. Review the dry-run output before applying any wiring yourself.
+This command is not needed after native plugin installation. It does not modify
+`~/.codex/config.toml`, `~/.codex/hooks.json`, or the installed skill.
 
-The repository also includes native Codex plugin files:
+The native Codex plugin files are:
 
 - `.codex-plugin/plugin.json`
 - `.mcp.json`
@@ -75,7 +90,9 @@ The repository also includes native Codex plugin files:
 - `../../.agents/plugins/marketplace.json`
 - `skills/lcm-recall/SKILL.md`
 
-The `lcm-recall` skill nudges Codex to use LCM on resumes, compaction recovery, long-running work, and questions that depend on prior local session context.
+The `lcm-recall` skill is loaded by native plugin installation and nudges Codex
+to use LCM on resumes, compaction recovery, long-running work, and questions
+that depend on prior local session context.
 
 ## What Is Captured
 
@@ -131,5 +148,5 @@ The smoke test uses a temporary `CODEX_LCM_HOME`, sends synthetic hook events, s
 - Embeddings are not implemented. Search is SQLite FTS plus raw-log fallback.
 - Checkpoints are structural and extractive; they do not call an LLM or external summarizer.
 - Hook payload compatibility is based on verified local Codex/installed-plugin behavior and tolerant parsing.
-- Actual global Codex hook installation is dry-run only in this first version.
+- `codex-lcm install` and `codex-lcm uninstall` are dry-run manual wiring planners. Native plugin install and removal are handled by `codex plugin add` and `codex plugin remove`.
 - `node:sqlite` is used through Node 22 and should be treated as a local runtime dependency.

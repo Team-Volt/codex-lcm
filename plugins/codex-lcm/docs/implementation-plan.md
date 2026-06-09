@@ -1,4 +1,9 @@
-# Codex LCM Implementation Plan
+# Codex LCM Implementation Plan And Status
+
+This plan has been implemented. The current native plugin manifest installs the
+MCP server, lifecycle hooks, and `lcm-recall` skill through Codex plugin
+installation. The `codex-lcm install` and `codex-lcm uninstall` commands remain
+dry-run manual wiring planners, not the primary install path.
 
 ## Tasks
 
@@ -15,7 +20,8 @@
    - Storage appends JSONL before indexing and can rebuild/search the SQLite index.
    - Hook ingestion handles malformed input, projectless sessions, and git metadata.
    - MCP tools list and call correctly over newline-delimited JSON-RPC.
-   - Installer dry-runs print planned MCP and hook changes without touching `~/.codex`.
+   - Native plugin manifest declares MCP, hooks, and skill resources.
+   - Manual installer dry-runs print planned MCP and hook changes without touching `~/.codex`.
 
 3. Implement core modules:
    - `src/config.ts`: paths, limits, env handling.
@@ -24,7 +30,7 @@
    - `src/git.ts`: best-effort repo root/branch metadata.
    - `src/storage.ts`: JSONL append, SQLite schema, indexing, search, notes, context packing.
    - `src/mcp.ts`: stdio JSON-RPC server and MCP tool handlers.
-   - `src/installer.ts`: status and dry-run install/uninstall planning.
+   - `src/installer.ts`: status and dry-run manual install/uninstall planning.
    - `src/cli.ts`: command dispatch.
 
 4. Add user docs:
@@ -46,5 +52,6 @@
 - Git repo root and branch are metadata only.
 - Search crosses sessions and is not project-bound.
 - Context packing respects a character/token budget.
-- Dry-run installer does not modify `~/.codex`.
+- Native plugin install owns MCP, hooks, and skill wiring.
+- Dry-run manual wiring planner does not modify `~/.codex`.
 - README documents captured data and limitations clearly.

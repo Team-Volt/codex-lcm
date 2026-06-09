@@ -19,7 +19,7 @@ export function planInstall(options: InstallerOptions = {}) {
     skills: {
       path: path.join(root, "skills"),
       recall_skill: path.join(root, "skills", "lcm-recall", "SKILL.md"),
-      note: "Loaded when Codex installs this directory as a plugin; direct MCP/hooks wiring still gets MCP server instructions.",
+      note: "Loaded by native Codex plugin installation; this dry-run planner does not copy or install skills.",
     },
     mcp: {
       command: `codex mcp add codex-lcm -- node ${JSON.stringify(binPath)} mcp`,

@@ -74,10 +74,10 @@ function printHelp(): void {
 Commands:
   codex-lcm mcp
   codex-lcm hook <event>
-  codex-lcm install --dry-run [--json]
+  codex-lcm install --dry-run [--json]   Print manual MCP/hook wiring plan
   codex-lcm status [--json]
   codex-lcm health [--json]
-  codex-lcm uninstall --dry-run [--json]
+  codex-lcm uninstall --dry-run [--json] Print manual cleanup plan
 `);
 }
 
