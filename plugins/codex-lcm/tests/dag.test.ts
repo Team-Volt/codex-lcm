@@ -197,6 +197,41 @@ test("packs direct query matches before adjacent context under tight budgets", (
   storage.close();
 });
 
+test("pack context ignores LCM retrieval tool self-references", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "self-ref-session";
+  const cwd = "/tmp/self-ref";
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    prompt: "needle-public-readme prompt from the user",
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "PreToolUse", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    tool_name: "mcp__codex_lcm__lcm_pack_context",
+    tool_input: {
+      query: "needle-public-readme prompt from the user",
+      budgetTokens: 600,
+    },
+    tool_use_id: "lcm-tool-call",
+  }, "2026-06-09T12:00:01.000Z");
+
+  const packed = storage.packContext({
+    cwd,
+    query: "needle-public-readme prompt from the user",
+    budgetTokens: 400,
+  });
+
+  assert.match(packed.markdown, /needle-public-readme prompt from the user/u);
+  assert.doesNotMatch(packed.markdown, /mcp__codex_lcm__lcm_pack_context/u);
+
+  storage.close();
+});
+
 test("migrates pre-DAG SQLite indexes before creating graph indexes", () => {
   const home = tempHome();
   fs.mkdirSync(home, { recursive: true });

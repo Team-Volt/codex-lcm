@@ -80,7 +80,7 @@ export function sanitizeForStorage(value: unknown, options: RedactionOptions = {
   const payloadBytes = safeJsonByteLength(sanitized);
   if (payloadBytes > limits.maxPayloadBytes) {
     const json = JSON.stringify(sanitized);
-    const preview = json.slice(0, limits.maxPayloadBytes);
+    const preview = truncateUtf8(json, limits.maxPayloadBytes);
     truncations.push({
       path: "$",
       kind: "payload",
@@ -183,8 +183,20 @@ function truncateString(
     kind: "string",
     original_bytes: bytes,
     sha256: sha256(value),
-    preview: value.slice(0, limits.maxStringBytes),
+    preview: truncateUtf8(value, limits.maxStringBytes),
   };
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let output = "";
+  let bytes = 0;
+  for (const char of value) {
+    const charBytes = byteLength(char);
+    if (bytes + charBytes > maxBytes) break;
+    output += char;
+    bytes += charBytes;
+  }
+  return output;
 }
 
 function safeJsonByteLength(value: unknown): number {

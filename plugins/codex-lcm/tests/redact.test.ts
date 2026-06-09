@@ -47,3 +47,20 @@ test("truncates oversized string values with hash metadata", () => {
   });
   assert.equal(result.truncations.length, 1);
 });
+
+test("truncated previews respect byte limits for multibyte text", () => {
+  const result = sanitizeForStorage({ content: "水".repeat(20) }, { maxStringBytes: 10 });
+  const content = (result.value as { content: { preview: string } }).content;
+
+  assert.equal(Buffer.byteLength(content.preview, "utf8") <= 10, true);
+});
+
+test("payload truncation previews respect byte limits for multibyte text", () => {
+  const result = sanitizeForStorage(
+    { content: "水".repeat(20) },
+    { maxStringBytes: 1_000, maxPayloadBytes: 20 },
+  );
+  const value = result.value as { preview: string };
+
+  assert.equal(Buffer.byteLength(value.preview, "utf8") <= 20, true);
+});

@@ -19,6 +19,13 @@ try {
     cwd: root,
     prompt: "smoke searchable context with sk-proj-secret-value",
   });
+  runHook("PreToolUse", {
+    session_id: "smoke-session",
+    cwd: root,
+    tool_name: "mcp__codex_lcm__lcm_pack_context",
+    tool_input: { query: "smoke searchable context", budgetTokens: 120 },
+    tool_use_id: "smoke-lcm-self-reference",
+  });
   for (let index = 0; index < 20; index += 1) {
     runHook("UserPromptSubmit", {
       session_id: "smoke-long-session",
@@ -70,6 +77,7 @@ try {
 
   assert.equal(responses[1].result.structuredContent.matches[0].session_id, "smoke-session");
   assert.match(responses[2].result.structuredContent.markdown, /smoke searchable context/u);
+  assert.doesNotMatch(responses[2].result.structuredContent.markdown, /mcp__codex_lcm__/u);
   assert.equal(responses[3].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
   assert.match(responses[4].result.structuredContent.markdown, /smoke-old-dag-marker/u);
   assert.doesNotMatch(fs.readFileSync(path.join(home, "events.jsonl"), "utf8"), /sk-proj-secret-value/u);

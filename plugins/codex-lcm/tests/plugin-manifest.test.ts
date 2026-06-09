@@ -16,8 +16,15 @@ test("plugin includes a Codex skill that nudges agents to use LCM", () => {
   const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
 
   assert.match(skill, /^---\nname: lcm-recall/mu);
+  assert.match(skill, /lcm_current_session/u);
   assert.match(skill, /lcm_search_sessions/u);
   assert.match(skill, /lcm_pack_context/u);
+  assert.match(skill, /lcm_get_session_graph/u);
+  assert.match(skill, /limit/u);
+  assert.match(skill, /cursor/u);
+  assert.match(skill, /lcm_record_note/u);
+  assert.match(skill, /Use the MCP tools/u);
+  assert.match(skill, /Do not inspect `~\/\.codex-lcm`/u);
 });
 
 test("MCP manifest registers the local stdio server", () => {
