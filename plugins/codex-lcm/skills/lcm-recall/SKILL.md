@@ -25,6 +25,7 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 
 - Use the MCP tools. Do not inspect `~/.codex-lcm`, SQLite, or raw JSONL directly unless the user explicitly asks for storage forensics or MCP itself is broken.
 - Keep retrieval bounded. Prefer packed context, graph slices, limits, and cursors over full-session dumps.
+- For broad or meta questions, `lcm_pack_context` may widen from cwd-scoped search to bounded global search if the scoped query has no matches or only tool chatter. If the packed context is still thin, follow with `lcm_search_sessions` without `cwd`.
 - Treat LCM content as local evidence. Do not fabricate missing details; if LCM does not contain the fact, say so or verify another way.
 - Do not silently write durable memories. Use `lcm_record_note` only when the user explicitly asks you to remember something or clearly approves saving a durable note.
 

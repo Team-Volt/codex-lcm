@@ -38,9 +38,12 @@ A typical retrieval flow is:
 
 1. Locate the current or latest relevant session by cwd, repo root, or session ID.
 2. Search across sessions when the user asks about prior work or when the task
-   resumes an older thread.
+   resumes an older thread. Search tries exact FTS first, then relaxes broad
+   queries so one missing word does not make retrieval look empty.
 3. Pack a bounded context block from matching events, nearby graph context,
-   checkpoints, notes, and recent session tails.
+   checkpoints, notes, and recent session tails. If a cwd-scoped pack finds no
+   matches, or only finds low-signal tool chatter, it falls back to a bounded
+   global search before returning nothing.
 4. Page through long sessions or request a bounded graph slice instead of loading
    an entire raw history at once.
 

@@ -150,11 +150,11 @@ export class LcmStorage {
   searchSessions(args: SearchSessionArgs): SessionSummary[] {
     const limit = clampLimit(args.limit, 10);
     if (!this.db) {
-      const query = args.query?.trim().toLowerCase() ?? "";
+      const query = args.query?.trim() ?? "";
       return summarizeSessions(readRawEvents(this.config.rawLogPath)
         .filter((event) => !args.cwd || event.cwd === args.cwd)
         .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
-        .filter((event) => query.length === 0 || JSON.stringify(event).toLowerCase().includes(query)))
+        .filter((event) => matchesQueryText(JSON.stringify(event), query)))
         .slice(0, limit);
     }
     const query = args.query?.trim() ?? "";
@@ -169,22 +169,24 @@ export class LcmStorage {
       `).all(args.cwd ?? null, args.repoRoot ?? null, limit).map(rowToSessionSummary);
     }
 
-    const ftsQuery = toFtsQuery(query);
-    const rows = this.db.prepare(`
-      SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
-             COUNT(e.event_id) AS match_count,
-             MAX(e.timestamp) AS last_match_at
-      FROM event_fts f
-      JOIN events e ON e.event_id = f.event_id
-      JOIN sessions s ON s.session_id = e.session_id
-      WHERE event_fts MATCH ?1
-        AND (?2 IS NULL OR s.cwd = ?2)
-        AND (?3 IS NULL OR s.repo_root = ?3)
-      GROUP BY s.session_id
-      ORDER BY last_match_at DESC
-      LIMIT ?4
-    `).all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, limit);
-    return rows.map(rowToSessionSummary);
+    let rows: unknown[] = [];
+    const statement = this.db.prepare(`
+        SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
+               e.raw_json, e.timestamp AS match_timestamp
+        FROM event_fts f
+        JOIN events e ON e.event_id = f.event_id
+        JOIN sessions s ON s.session_id = e.session_id
+        WHERE event_fts MATCH ?1
+          AND (?2 IS NULL OR s.cwd = ?2)
+          AND (?3 IS NULL OR s.repo_root = ?3)
+        ORDER BY bm25(event_fts) ASC, e.timestamp DESC
+        LIMIT ?4
+      `);
+    for (const ftsQuery of toFtsQueries(query)) {
+      rows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
+      if (rows.length > 0) break;
+    }
+    return rankSessionRows(rows, query).slice(0, limit);
   }
 
   getCurrentSession(args: { sessionId?: string; cwd?: string; repoRoot?: string } = {}): SessionSummary | undefined {
@@ -274,12 +276,11 @@ export class LcmStorage {
     const limit = clampLimit(args.limit, 20);
     const query = args.query?.trim() ?? "";
     if (!this.db) {
-      const lowered = query.toLowerCase();
       return readRawEvents(this.config.rawLogPath)
         .filter((event) => !args.cwd || event.cwd === args.cwd)
         .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
         .filter((event) => !args.sessionIds?.length || args.sessionIds.includes(event.session_id))
-        .filter((event) => lowered.length === 0 || JSON.stringify(event).toLowerCase().includes(lowered))
+        .filter((event) => matchesQueryText(JSON.stringify(event), query))
         .slice(0, limit);
     }
     if (query.length === 0) {
@@ -294,20 +295,25 @@ export class LcmStorage {
     }
 
     const sessionFilter = args.sessionIds?.length ? new Set(args.sessionIds) : undefined;
-    const rows = this.db.prepare(`
-      SELECT e.raw_json, e.session_id
-      FROM event_fts f
-      JOIN events e ON e.event_id = f.event_id
-      WHERE event_fts MATCH ?1
-        AND (?2 IS NULL OR e.cwd = ?2)
-        AND (?3 IS NULL OR e.repo_root = ?3)
-      ORDER BY bm25(event_fts) ASC, e.timestamp DESC
-      LIMIT ?4
-    `).all(toFtsQuery(query), args.cwd ?? null, args.repoRoot ?? null, Math.max(limit, 50));
-    return rows
+    let rows: unknown[] = [];
+    const statement = this.db.prepare(`
+        SELECT e.raw_json, e.session_id
+        FROM event_fts f
+        JOIN events e ON e.event_id = f.event_id
+        WHERE event_fts MATCH ?1
+          AND (?2 IS NULL OR e.cwd = ?2)
+          AND (?3 IS NULL OR e.repo_root = ?3)
+        ORDER BY bm25(event_fts) ASC, e.timestamp DESC
+        LIMIT ?4
+      `);
+    for (const ftsQuery of toFtsQueries(query)) {
+      rows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 10, 50));
+      if (rows.length > 0) break;
+    }
+    const events = rows
       .filter((row) => !sessionFilter || sessionFilter.has(String((row as { session_id: string }).session_id)))
-      .slice(0, limit)
       .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent);
+    return rankEventsForContext(events, query).slice(0, limit);
   }
 
   private getAdjacentEvents(eventId: string, limit: number): NormalizedEvent[] {
@@ -403,7 +409,13 @@ export class LcmStorage {
     };
 
     if (query.length > 0) {
-      const matches = this.searchEvents({ query, cwd: args.cwd, sessionIds: args.sessionIds, limit: 24 });
+      let matches = this.searchEvents({ query, cwd: args.cwd, sessionIds: args.sessionIds, limit: 24 });
+      if (args.cwd && !args.sessionIds?.length && (matches.length === 0 || !matches.some(isHighSignalContextEvent))) {
+        matches = rankEventsForContext([
+          ...matches,
+          ...this.searchEvents({ query, limit: 24 }),
+        ], query).slice(0, 24);
+      }
       for (const event of matches) {
         addEvent(event, 0);
         for (const neighbor of this.getAdjacentEvents(event.event_id, 2)) addEvent(neighbor, 1);
@@ -411,7 +423,10 @@ export class LcmStorage {
     }
 
     if (candidateSessionIds.size === 0) {
-      const sessions = this.searchSessions({ query: args.query, cwd: args.cwd, limit: 8 });
+      let sessions = this.searchSessions({ query: args.query, cwd: args.cwd, limit: 8 });
+      if (sessions.length === 0 && query.length > 0 && args.cwd && !args.sessionIds?.length) {
+        sessions = this.searchSessions({ query: args.query, limit: 8 });
+      }
       for (const session of sessions) candidateSessionIds.add(session.session_id);
     }
 
@@ -914,6 +929,63 @@ function rowToSessionSummary(row: unknown): SessionSummary {
   };
 }
 
+function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
+  const sessions = new Map<string, {
+    summary: SessionSummary;
+    score: number;
+    matchCount: number;
+    lastMatchAt: string;
+    firstOrder: number;
+  }>();
+  rows.forEach((row, order) => {
+    const record = row as Record<string, unknown>;
+    const sessionId = String(record.session_id);
+    const matchAt = String(record.match_timestamp ?? record.last_seen ?? "");
+    const rawJson = typeof record.raw_json === "string" ? record.raw_json : "";
+    const existing = sessions.get(sessionId);
+    if (!existing) {
+      sessions.set(sessionId, {
+        summary: rowToSessionSummary(row),
+        score: queryTermHitCount(rawJson, query),
+        matchCount: 1,
+        lastMatchAt: matchAt,
+        firstOrder: order,
+      });
+      return;
+    }
+    existing.score += queryTermHitCount(rawJson, query);
+    existing.matchCount += 1;
+    if (matchAt > existing.lastMatchAt) existing.lastMatchAt = matchAt;
+  });
+  return [...sessions.values()]
+    .sort((a, b) =>
+      b.score - a.score ||
+      b.matchCount - a.matchCount ||
+      b.lastMatchAt.localeCompare(a.lastMatchAt) ||
+      a.firstOrder - b.firstOrder)
+    .map((entry) => entry.summary);
+}
+
+function rankEventsForContext(events: NormalizedEvent[], query: string): NormalizedEvent[] {
+  return [...events].sort((a, b) =>
+    eventContextPriority(a) - eventContextPriority(b) ||
+    queryTermHitCount(JSON.stringify(b.payload), query) - queryTermHitCount(JSON.stringify(a.payload), query) ||
+    b.timestamp.localeCompare(a.timestamp));
+}
+
+function eventContextPriority(event: NormalizedEvent): number {
+  if (event.hook_event === "Note") return 0;
+  if (event.hook_event === "UserPromptSubmit") return 1;
+  if (event.hook_event === "PreCompact" || event.hook_event === "Stop") return 2;
+  if (event.hook_event === "SessionStart") return 3;
+  if (event.tool_name) return 5;
+  return 4;
+}
+
+function isHighSignalContextEvent(event: NormalizedEvent): boolean {
+  return eventContextPriority(event) <= 2;
+}
+
 function rowToGraphNode(row: unknown): GraphNode {
   const record = row as Record<string, unknown>;
   return {
@@ -964,11 +1036,80 @@ function parseCursor(cursor: string | undefined): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-function toFtsQuery(query: string): string {
+const QUERY_STOP_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "for",
+  "from",
+  "how",
+  "in",
+  "is",
+  "it",
+  "me",
+  "my",
+  "of",
+  "on",
+  "or",
+  "out",
+  "the",
+  "to",
+  "what",
+  "when",
+  "where",
+  "with",
+]);
+
+function toFtsQueries(query: string): string[] {
+  const strict = toStrictFtsQuery(query);
+  const relaxed = toRelaxedFtsQuery(query);
+  return relaxed && relaxed !== strict ? [strict, relaxed] : [strict];
+}
+
+function toStrictFtsQuery(query: string): string {
   return query
     .split(/\s+/u)
-    .map((term) => `"${term.replaceAll('"', '""')}"`)
+    .map(quoteFtsTerm)
     .join(" AND ");
+}
+
+function toRelaxedFtsQuery(query: string): string | undefined {
+  const terms = queryTerms(query);
+  if (terms.length < 2) return undefined;
+  return terms.map(quoteFtsTerm).join(" OR ");
+}
+
+function quoteFtsTerm(term: string): string {
+  return `"${term.replaceAll('"', '""')}"`;
+}
+
+function queryTerms(query: string): string[] {
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const term of query.toLowerCase().split(/[^\p{L}\p{N}_]+/u)) {
+    if (term.length < 2 || QUERY_STOP_WORDS.has(term) || seen.has(term)) continue;
+    seen.add(term);
+    terms.push(term);
+    if (terms.length >= 12) break;
+  }
+  return terms;
+}
+
+function matchesQueryText(text: string, query: string): boolean {
+  const trimmed = query.trim().toLowerCase();
+  if (trimmed.length === 0) return true;
+  const lowered = text.toLowerCase();
+  if (lowered.includes(trimmed)) return true;
+  return queryTerms(trimmed).some((term) => lowered.includes(term));
+}
+
+function queryTermHitCount(text: string, query: string): number {
+  const lowered = text.toLowerCase();
+  return queryTerms(query).filter((term) => lowered.includes(term)).length;
 }
 
 function sqlIdentifier(value: string): string {

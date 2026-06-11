@@ -123,6 +123,14 @@ Edges are inserted with a recursive cycle check. The graph is derived from raw e
 
 For long sessions, `lcm_get_session` accepts `limit` and `cursor`, `lcm_get_session_graph` returns bounded graph slices, and `lcm_pack_context` prioritizes matching events plus nearby graph context before adding recent tails. This avoids missing old-but-relevant events just because they are outside the latest event window.
 
+For broad questions, search is intentionally two-pass. Codex LCM tries strict
+SQLite FTS first, then falls back to a relaxed term query when the strict query
+has no hits. Session results are ranked by substantive query-term coverage before
+recency. `lcm_pack_context` keeps cwd scoping when it finds high-signal matches,
+but if a cwd-scoped query is empty or only finds tool chatter, it performs a
+bounded global fallback so broad meta questions do not return empty or
+misleadingly narrow context just because the current directory is too narrow.
+
 ## Privacy And Safety
 
 Before writing to disk, Codex LCM:

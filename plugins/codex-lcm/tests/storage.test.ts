@@ -38,6 +38,66 @@ test("appends JSONL and indexes searchable cross-session events", () => {
   storage.close();
 });
 
+test("search sessions relaxes broad queries when strict FTS has no match", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "broad-session",
+      cwd: "/tmp/broad",
+      prompt: "codex-lcm retrieval quality notes",
+    }),
+    env: {},
+    now,
+  }));
+
+  const matches = storage.searchSessions({
+    query: "how is codex-lcm working out retrieval quality plumbing intelligence layer",
+    limit: 5,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["broad-session"]);
+
+  storage.close();
+});
+
+test("search sessions ranks substantive broad matches ahead of newer shallow matches", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "substantive-session",
+      cwd: "/tmp/broad",
+      prompt: "codex-lcm retrieval quality plumbing intelligence layer assessment",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "shallow-session",
+      cwd: "/tmp/broad",
+      prompt: "quality",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:01:00.000Z"),
+  }));
+
+  const matches = storage.searchSessions({
+    query: "how is codex-lcm working out retrieval quality plumbing intelligence layer",
+    limit: 2,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["substantive-session", "shallow-session"]);
+
+  storage.close();
+});
+
 test("retrieves recent context by explicit session or latest cwd match", () => {
   const home = tempHome();
   const storage = createStorage({ home });

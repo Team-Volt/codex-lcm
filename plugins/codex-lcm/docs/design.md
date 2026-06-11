@@ -50,11 +50,11 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 
 - `lcm_health`: report storage paths, index status, event count, session count, and current configuration.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
-- `lcm_search_sessions`: cross-session search using SQLite FTS, with recent-session fallback for empty queries.
+- `lcm_search_sessions`: cross-session search using SQLite FTS, with recent-session fallback for empty queries and relaxed broad-query retry when strict FTS has no hits.
 - `lcm_get_session`: retrieve a session by ID with sanitized raw events; supports `limit` and `cursor` for long sessions.
 - `lcm_get_session_graph`: retrieve a bounded DAG slice for a session.
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
-- `lcm_pack_context`: pack matching events, nearby graph context, checkpoints, notes, and recent events into a token-budgeted Markdown context block.
+- `lcm_pack_context`: pack matching events, nearby graph context, checkpoints, notes, and recent events into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search only when scoped retrieval is empty.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
 
 The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex when to call LCM and how to avoid loading entire long sessions unnecessarily.

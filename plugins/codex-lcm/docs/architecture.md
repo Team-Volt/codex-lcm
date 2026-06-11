@@ -94,6 +94,14 @@ For very long sessions, callers should prefer bounded graph and event access:
 - `lcm_get_session_graph` with a bounded `limit`.
 - `lcm_pack_context`, which searches matching events first, then adds nearby graph context, checkpoints, and recent tails.
 
+Search uses strict SQLite FTS first. If a non-empty query has no strict hits, LCM
+builds a relaxed query from non-stopword terms and retries. Session search ranks
+results by query-term coverage before recency, so a newer shallow hit should not
+hide an older session with more of the requested substance. For context packing,
+cwd remains the first boundary, but a cwd-scoped query that finds no matches
+or only finds low-signal tool events falls back to a bounded global search before
+returning an empty or misleadingly narrow pack.
+
 ## MCP Protocol
 
 The server follows the local Codex plugin pattern verified in the installed OpenAI Developers plugin: one JSON-RPC message per line over stdio.
