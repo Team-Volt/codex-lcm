@@ -232,6 +232,101 @@ test("pack context ignores LCM retrieval tool self-references", () => {
   storage.close();
 });
 
+test("pack context falls back to global matches when cwd-scoped search is empty", () => {
+  const storage = createStorage({ home: tempHome() });
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "lcm-meta-session",
+    turn_id: "turn-1",
+    cwd: "/Users/djr/Projects/codex-lcm",
+    prompt: "codex-lcm retrieval quality plumbing intelligence layer assessment",
+  }, "2026-06-09T12:00:00.000Z");
+
+  const packed = storage.packContext({
+    cwd: "/Users/djr",
+    query: "codex-lcm retrieval quality plumbing intelligence layer",
+    budgetTokens: 300,
+  });
+
+  assert.match(packed.markdown, /codex-lcm retrieval quality plumbing intelligence/u);
+  assert.equal(packed.sources.some((source) => source.kind === "event" && source.session_id === "lcm-meta-session"), true);
+
+  storage.close();
+});
+
+test("pack context ranks matching user prompts before matching tool chatter", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "rank-session";
+  const cwd = "/tmp/rank";
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    prompt: `rank-needle user decision about LCM retrieval quality ${"background ".repeat(10)}`,
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "PostToolUse", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    tool_name: "Bash",
+    tool_input: {
+      command: "echo rank-needle",
+    },
+    tool_response: "rank-needle retrieval quality ".repeat(8),
+    tool_use_id: "tool-rank",
+  }, "2026-06-09T12:00:01.000Z");
+
+  const packed = storage.packContext({
+    cwd,
+    query: "rank-needle retrieval quality",
+    budgetTokens: 500,
+  });
+
+  const promptIndex = packed.markdown.indexOf("UserPromptSubmit");
+  const toolIndex = packed.markdown.indexOf("PostToolUse");
+  assert.notEqual(promptIndex, -1);
+  assert.notEqual(toolIndex, -1);
+  assert.equal(promptIndex < toolIndex, true);
+
+  storage.close();
+});
+
+test("pack context supplements scoped tool-only hits with global high-signal matches", () => {
+  const storage = createStorage({ home: tempHome() });
+
+  ingest(storage, "PostToolUse", {
+    session_id: "tool-only-session",
+    cwd: "/Users/djr",
+    tool_name: "Bash",
+    tool_input: {
+      command: "sed hooks.json",
+    },
+    tool_response: "codex-lcm retrieval quality plumbing intelligence layer ".repeat(6),
+    tool_use_id: "tool-only",
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "global-high-signal-session",
+    turn_id: "turn-1",
+    cwd: "/Users/djr/Projects/codex-lcm",
+    prompt: "codex-lcm retrieval quality plumbing intelligence layer user evaluation",
+  }, "2026-06-09T12:00:01.000Z");
+
+  const packed = storage.packContext({
+    cwd: "/Users/djr",
+    query: "codex-lcm retrieval quality plumbing intelligence layer",
+    budgetTokens: 500,
+  });
+
+  const promptIndex = packed.markdown.indexOf("UserPromptSubmit");
+  const toolIndex = packed.markdown.indexOf("PostToolUse");
+  assert.notEqual(promptIndex, -1);
+  assert.notEqual(toolIndex, -1);
+  assert.equal(promptIndex < toolIndex, true);
+
+  storage.close();
+});
+
 test("migrates pre-DAG SQLite indexes before creating graph indexes", () => {
   const home = tempHome();
   fs.mkdirSync(home, { recursive: true });
