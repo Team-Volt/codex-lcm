@@ -6,10 +6,25 @@ test("Codex plugin manifest points to MCP and skills", () => {
   const manifest = JSON.parse(fs.readFileSync(".codex-plugin/plugin.json", "utf8"));
 
   assert.equal(manifest.name, "codex-lcm");
+  assert.equal(manifest.license, "MIT");
+  assert.equal(manifest.author.name, "Team Volt");
   assert.equal(manifest.mcpServers, "./.mcp.json");
   assert.equal(manifest.hooks, "./hooks/hooks.codex.json");
   assert.equal(manifest.skills, "./skills/");
   assert.equal(manifest.interface.displayName, "Codex LCM");
+  assert.equal(manifest.interface.developerName, "Team Volt");
+});
+
+test("package and repository declare the MIT license", () => {
+  const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  const packageLicense = fs.readFileSync("LICENSE", "utf8");
+  const repositoryLicense = fs.readFileSync("../../LICENSE", "utf8");
+
+  assert.equal(packageJson.license, "MIT");
+  assert.equal(packageJson.author, "Team Volt");
+  assert.equal(packageLicense, repositoryLicense);
+  assert.match(packageLicense, /^MIT License$/mu);
+  assert.match(packageLicense, /^Copyright \(c\) 2026 Team Volt$/mu);
 });
 
 test("plugin includes a Codex skill that nudges agents to use LCM", () => {

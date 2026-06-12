@@ -147,3 +147,7 @@ For deeper implementation notes, see:
 - `plugins/codex-lcm/docs/design.md`
 - `plugins/codex-lcm/docs/architecture.md`
 - `plugins/codex-lcm/docs/troubleshooting.md`
+
+## License
+
+Codex LCM is released under the MIT License. See `LICENSE` for the full text.
