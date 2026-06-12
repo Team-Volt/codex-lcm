@@ -80,7 +80,7 @@ const TOOLS = [
   {
     name: "lcm_get_session_graph",
     title: "LCM Get Session Graph",
-    description: "Retrieve a bounded DAG slice for a session, including session, turn, event, and checkpoint nodes.",
+    description: "Retrieve a bounded DAG slice for a session, including session, turn, event, checkpoint, and summary nodes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -109,7 +109,7 @@ const TOOLS = [
   {
     name: "lcm_pack_context",
     title: "LCM Pack Context",
-    description: "Pack relevant events and notes into a token-budgeted Markdown context block.",
+    description: "Pack relevant summary nodes and bounded source lineage into a token-budgeted Markdown context block.",
     inputSchema: {
       type: "object",
       properties: {
@@ -169,9 +169,9 @@ function handleMessage(message: JsonRpcMessage, storage: ReturnType<typeof creat
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions: [
-        "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, and packed context across Codex sessions.",
+        "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, summary nodes, and packed context across Codex sessions.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
-        "Use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
+        "Use lcm_pack_context for summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
         "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
       ].join(" "),
     });
