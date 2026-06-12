@@ -60,7 +60,7 @@ plan for the DAG, long-session retrieval, and skill-nudge work.
 
 ## Task 3: Long-Session Retrieval
 
-- [x] Add row-level `searchEvents()` over FTS.
+- [x] Add summary-node search over FTS with bounded source-event expansion.
 - [x] Add `getSessionGraph(sessionId, limit)` returning bounded nodes and edges.
 - [x] Add paged `getSession(sessionId, { limit, cursor })` returning `next_cursor`.
 - [x] Update `packContext()` to prioritize matching events, graph neighbors, latest checkpoint nodes, then bounded recent tail.
