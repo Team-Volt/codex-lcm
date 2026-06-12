@@ -46,7 +46,22 @@ export type RecentContext = {
 export type PackedContext = {
   markdown: string;
   estimated_tokens: number;
-  sources: Array<{ kind: "event" | "note" | "checkpoint"; session_id: string; event_id?: string; node_id?: string; timestamp: string }>;
+  sources: Array<{ kind: "event" | "note" | "checkpoint" | "summary"; session_id: string; event_id?: string; node_id?: string; timestamp: string }>;
+};
+
+export type SessionMemorySummary = {
+  session_id: string;
+  updated_at: string;
+  cwd: string;
+  repo_root?: string;
+  git_branch?: string;
+  title: string;
+  overview: string;
+  topics: string[];
+  key_prompts: string[];
+  outcomes: string[];
+  tools: string[];
+  source_event_ids: string[];
 };
 
 export type GraphNode = {
@@ -91,6 +106,7 @@ export type Health = {
   session_count: number;
   graph_node_count?: number;
   graph_edge_count?: number;
+  summary_count?: number;
 };
 
 const CHECKPOINT_INTERVAL = 50;
@@ -107,6 +123,7 @@ export class LcmStorage {
       this.db = new DatabaseSync(this.config.indexPath);
       this.initialize();
       this.backfillGraph();
+      this.backfillSessionMemorySummaries();
     } catch (error) {
       this.db = undefined;
       this.indexError = error instanceof Error ? error.message : String(error);
@@ -143,6 +160,7 @@ export class LcmStorage {
       ...(this.db ? {
         graph_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_nodes")),
         graph_edge_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_edges")),
+        summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
       } : {}),
     };
   }
@@ -170,9 +188,9 @@ export class LcmStorage {
     }
 
     let rows: unknown[] = [];
-    const statement = this.db.prepare(`
+    const eventStatement = this.db.prepare(`
         SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
-               e.raw_json, e.timestamp AS match_timestamp
+               e.raw_json AS match_text, e.timestamp AS match_timestamp, 1 AS match_weight
         FROM event_fts f
         JOIN events e ON e.event_id = f.event_id
         JOIN sessions s ON s.session_id = e.session_id
@@ -182,8 +200,23 @@ export class LcmStorage {
         ORDER BY bm25(event_fts) ASC, e.timestamp DESC
         LIMIT ?4
       `);
+    const summaryStatement = this.db.prepare(`
+        SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
+               ss.summary_text AS match_text, ss.updated_at AS match_timestamp, 3 AS match_weight
+        FROM session_summary_fts f
+        JOIN session_summaries ss ON ss.session_id = f.session_id
+        JOIN sessions s ON s.session_id = ss.session_id
+        WHERE session_summary_fts MATCH ?1
+          AND (?2 IS NULL OR s.cwd = ?2)
+          AND (?3 IS NULL OR s.repo_root = ?3)
+        ORDER BY bm25(session_summary_fts) ASC, ss.updated_at DESC
+        LIMIT ?4
+      `);
     for (const ftsQuery of toFtsQueries(query)) {
-      rows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
+      rows = [
+        ...summaryStatement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50)),
+        ...eventStatement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50)),
+      ];
       if (rows.length > 0) break;
     }
     return rankSessionRows(rows, query).slice(0, limit);
@@ -387,9 +420,24 @@ export class LcmStorage {
     return event;
   }
 
+  getSessionMemorySummary(sessionId: string): SessionMemorySummary | undefined {
+    if (!this.db) {
+      const events = readRawEvents(this.config.rawLogPath).filter((event) => event.session_id === sessionId);
+      return events.length > 0 ? buildSessionMemorySummary(events) : undefined;
+    }
+    const row = this.db.prepare(`
+      SELECT session_id, updated_at, cwd, repo_root, git_branch, title, overview, topics_json,
+             key_prompts_json, outcomes_json, tools_json, source_event_ids_json
+      FROM session_summaries
+      WHERE session_id = ?1
+    `).get(sessionId);
+    return row ? rowToSessionMemorySummary(row) : undefined;
+  }
+
   packContext(args: { query?: string; sessionIds?: string[]; budgetTokens?: number; cwd?: string } = {}): PackedContext {
     const budgetTokens = Math.max(16, args.budgetTokens ?? 1200);
     const budgetChars = budgetTokens * 4;
+    const summaryCandidates = new Map<string, SessionMemorySummary>();
     const eventCandidates = new Map<string, { event: NormalizedEvent; rank: number; order: number }>();
     const checkpointCandidates = new Map<string, GraphNode>();
     const query = args.query?.trim() ?? "";
@@ -431,6 +479,8 @@ export class LcmStorage {
     }
 
     for (const sessionId of candidateSessionIds) {
+      const summary = this.getSessionMemorySummary(sessionId);
+      if (summary) summaryCandidates.set(sessionId, summary);
       const checkpoint = this.getLatestCheckpoint(sessionId);
       if (checkpoint) checkpointCandidates.set(checkpoint.node_id, checkpoint);
       const recent = this.getRecentContext({ sessionId, limit: args.sessionIds?.length ? 50 : 12 });
@@ -442,6 +492,11 @@ export class LcmStorage {
     const sources: PackedContext["sources"] = [];
     let chars = lines.join("\n").length;
 
+    const summaryItems = [...summaryCandidates.values()]
+      .sort((a, b) =>
+        queryTermHitCount(summarySearchText(b), query) - queryTermHitCount(summarySearchText(a), query) ||
+        b.updated_at.localeCompare(a.updated_at))
+      .map((summary) => ({ summary, text: sessionSummaryToMarkdown(summary) }));
     const checkpointItems = [...checkpointCandidates.values()]
       .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
       .map((checkpoint) => ({ checkpoint, text: checkpointToMarkdown(checkpoint) }));
@@ -463,6 +518,22 @@ export class LcmStorage {
       }
     };
 
+    const addSummaryItems = () => {
+      if (query.length > 0 && budgetTokens < 250) return;
+      if (query.length > 0 && summaryItems.length > 1 && budgetTokens < 700) return;
+      for (const { summary, text } of summaryItems) {
+        if (chars + text.length > budgetChars) continue;
+        lines.push(text);
+        chars += text.length;
+        sources.push({
+          kind: "summary",
+          session_id: summary.session_id,
+          event_id: summary.source_event_ids[0],
+          timestamp: summary.updated_at,
+        });
+      }
+    };
+
     const addEventItems = () => {
       for (const { event, text } of eventItems) {
         if (chars + text.length > budgetChars) continue;
@@ -478,9 +549,11 @@ export class LcmStorage {
     };
 
     if (query.length > 0) {
+      addSummaryItems();
       addEventItems();
       addCheckpointItems();
     } else {
+      addSummaryItems();
       addCheckpointItems();
       addEventItems();
     }
@@ -551,11 +624,33 @@ export class LcmStorage {
         PRIMARY KEY (from_node_id, to_node_id, kind),
         CHECK (from_node_id <> to_node_id)
       );
+      CREATE TABLE IF NOT EXISTS session_summaries (
+        session_id TEXT PRIMARY KEY,
+        updated_at TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        repo_root TEXT,
+        git_branch TEXT,
+        title TEXT NOT NULL,
+        overview TEXT NOT NULL,
+        topics_json TEXT NOT NULL,
+        key_prompts_json TEXT NOT NULL,
+        outcomes_json TEXT NOT NULL,
+        tools_json TEXT NOT NULL,
+        source_event_ids_json TEXT NOT NULL,
+        summary_text TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS session_summary_fts USING fts5(
+        session_id UNINDEXED,
+        cwd,
+        repo_root,
+        content
+      );
       CREATE INDEX IF NOT EXISTS idx_graph_nodes_session_kind_time ON graph_nodes(session_id, kind, timestamp);
       CREATE INDEX IF NOT EXISTS idx_graph_nodes_event ON graph_nodes(event_id);
       CREATE INDEX IF NOT EXISTS idx_graph_edges_from ON graph_edges(from_node_id, kind);
       CREATE INDEX IF NOT EXISTS idx_graph_edges_to ON graph_edges(to_node_id, kind);
       CREATE INDEX IF NOT EXISTS idx_graph_edges_session ON graph_edges(session_id, kind, position);
+      CREATE INDEX IF NOT EXISTS idx_session_summaries_updated ON session_summaries(updated_at);
     `);
     this.ensureColumn("events", "turn_id", "TEXT");
     this.ensureColumn("events", "tool_use_id", "TEXT");
@@ -623,6 +718,7 @@ export class LcmStorage {
       const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
       const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
       this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
+      this.rebuildSessionMemorySummary(event.session_id);
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -881,6 +977,35 @@ export class LcmStorage {
         `).run(metadata.turn_id ?? null, metadata.tool_use_id ?? null, event.event_id);
         this.indexGraphForEvent(event, count, Number((row as { rowid: number }).rowid));
       }
+      for (const sessionId of counts.keys()) this.rebuildSessionMemorySummary(sessionId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures; the original backfill error is more useful.
+      }
+      this.indexError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private backfillSessionMemorySummaries(): void {
+    if (!this.db) return;
+    const rows = this.db.prepare(`
+      SELECT s.session_id
+      FROM sessions s
+      LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
+      WHERE ss.session_id IS NULL
+      ORDER BY s.last_seen DESC
+      LIMIT 1000
+    `).all();
+    if (rows.length === 0) return;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        this.rebuildSessionMemorySummary(String((row as { session_id: string }).session_id));
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -909,6 +1034,60 @@ export class LcmStorage {
     const row = this.db.prepare(sql).get() as { count: number };
     return row.count;
   }
+
+  private rebuildSessionMemorySummary(sessionId: string): void {
+    if (!this.db) return;
+    const rows = this.db.prepare(`
+      SELECT raw_json FROM events
+      WHERE session_id = ?1
+      ORDER BY timestamp ASC, rowid ASC
+      LIMIT 1000
+    `).all(sessionId);
+    const events = rows
+      .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
+      .filter((event) => !isCodexLcmToolEvent(event));
+    if (events.length === 0) return;
+    const summary = buildSessionMemorySummary(events);
+    const summaryText = summarySearchText(summary);
+    this.db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
+    this.db.prepare(`
+      INSERT INTO session_summaries
+        (session_id, updated_at, cwd, repo_root, git_branch, title, overview, topics_json,
+         key_prompts_json, outcomes_json, tools_json, source_event_ids_json, summary_text)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+      ON CONFLICT(session_id) DO UPDATE SET
+        updated_at = excluded.updated_at,
+        cwd = excluded.cwd,
+        repo_root = excluded.repo_root,
+        git_branch = excluded.git_branch,
+        title = excluded.title,
+        overview = excluded.overview,
+        topics_json = excluded.topics_json,
+        key_prompts_json = excluded.key_prompts_json,
+        outcomes_json = excluded.outcomes_json,
+        tools_json = excluded.tools_json,
+        source_event_ids_json = excluded.source_event_ids_json,
+        summary_text = excluded.summary_text
+    `).run(
+      summary.session_id,
+      summary.updated_at,
+      summary.cwd,
+      summary.repo_root ?? null,
+      summary.git_branch ?? null,
+      summary.title,
+      summary.overview,
+      JSON.stringify(summary.topics),
+      JSON.stringify(summary.key_prompts),
+      JSON.stringify(summary.outcomes),
+      JSON.stringify(summary.tools),
+      JSON.stringify(summary.source_event_ids),
+      summaryText,
+    );
+    this.db.prepare(`
+      INSERT INTO session_summary_fts (session_id, cwd, repo_root, content)
+      VALUES (?1, ?2, ?3, ?4)
+    `).run(summary.session_id, summary.cwd, summary.repo_root ?? "", summaryText);
+  }
 }
 
 export function createStorage(options: StorageOptions = {}): LcmStorage {
@@ -929,6 +1108,24 @@ function rowToSessionSummary(row: unknown): SessionSummary {
   };
 }
 
+function rowToSessionMemorySummary(row: unknown): SessionMemorySummary {
+  const record = row as Record<string, unknown>;
+  return {
+    session_id: String(record.session_id),
+    updated_at: String(record.updated_at),
+    cwd: String(record.cwd),
+    ...(record.repo_root ? { repo_root: String(record.repo_root) } : {}),
+    ...(record.git_branch ? { git_branch: String(record.git_branch) } : {}),
+    title: String(record.title),
+    overview: String(record.overview),
+    topics: parseStringArray(record.topics_json),
+    key_prompts: parseStringArray(record.key_prompts_json),
+    outcomes: parseStringArray(record.outcomes_json),
+    tools: parseStringArray(record.tools_json),
+    source_event_ids: parseStringArray(record.source_event_ids_json),
+  };
+}
+
 function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
   const sessions = new Map<string, {
     summary: SessionSummary;
@@ -941,19 +1138,20 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
     const record = row as Record<string, unknown>;
     const sessionId = String(record.session_id);
     const matchAt = String(record.match_timestamp ?? record.last_seen ?? "");
-    const rawJson = typeof record.raw_json === "string" ? record.raw_json : "";
+    const matchText = typeof record.match_text === "string" ? record.match_text : "";
+    const weight = typeof record.match_weight === "number" ? record.match_weight : 1;
     const existing = sessions.get(sessionId);
     if (!existing) {
       sessions.set(sessionId, {
         summary: rowToSessionSummary(row),
-        score: queryTermHitCount(rawJson, query),
+        score: queryTermHitCount(matchText, query) * weight,
         matchCount: 1,
         lastMatchAt: matchAt,
         firstOrder: order,
       });
       return;
     }
-    existing.score += queryTermHitCount(rawJson, query);
+    existing.score += queryTermHitCount(matchText, query) * weight;
     existing.matchCount += 1;
     if (matchAt > existing.lastMatchAt) existing.lastMatchAt = matchAt;
   });
@@ -1023,6 +1221,16 @@ function parseMetadata(value: unknown): Record<string, unknown> {
     return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
   } catch {
     return {};
+  }
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return [];
   }
 }
 
@@ -1162,6 +1370,34 @@ function checkpointToMarkdown(node: GraphNode): string {
   ].join("\n");
 }
 
+function sessionSummaryToMarkdown(summary: SessionMemorySummary): string {
+  const lines = [
+    `## ${summary.updated_at} Session Summary`,
+    `session: ${summary.session_id}`,
+    `cwd: ${summary.cwd}`,
+    `Title: ${summary.title}`,
+    `Overview: ${truncateText(summary.overview, 180)}`,
+  ];
+  if (summary.topics.length > 0) lines.push(`Topics: ${summary.topics.slice(0, 16).join(", ")}`);
+  if (summary.key_prompts.length > 0) lines.push(`Key prompts: ${summary.key_prompts.slice(0, 2).join(" | ")}`);
+  if (summary.outcomes.length > 0) lines.push(`Outcomes: ${summary.outcomes.slice(0, 2).join(" | ")}`);
+  if (summary.tools.length > 0) lines.push(`Tools: ${summary.tools.slice(0, 5).join(", ")}`);
+  if (summary.source_event_ids.length > 0) lines.push(`Sources: ${summary.source_event_ids.slice(0, 3).map(shortSourceId).join(", ")}`);
+  lines.push("");
+  return lines.join("\n");
+}
+
+function summarySearchText(summary: SessionMemorySummary): string {
+  return [
+    summary.title,
+    summary.overview,
+    ...summary.topics,
+    ...summary.key_prompts,
+    ...summary.outcomes,
+    ...summary.tools,
+  ].join("\n");
+}
+
 function readRawEvents(rawLogPath: string): NormalizedEvent[] {
   if (!fs.existsSync(rawLogPath)) return [];
   return fs.readFileSync(rawLogPath, "utf8")
@@ -1174,6 +1410,122 @@ function readRawEvents(rawLogPath: string): NormalizedEvent[] {
         return [];
       }
     });
+}
+
+function buildSessionMemorySummary(events: NormalizedEvent[]): SessionMemorySummary {
+  const sorted = [...events].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const sessionId = sorted[0]?.session_id ?? "";
+  const latest = sorted.at(-1);
+  const prompts = sorted
+    .filter((event) => event.hook_event === "UserPromptSubmit" || event.hook_event === "Note")
+    .map(eventSignalText)
+    .filter((text) => text.length > 0);
+  const outcomes = sorted
+    .filter((event) => event.hook_event === "Stop" || event.hook_event === "PreCompact")
+    .map(eventSignalText)
+    .filter((text) => text.length > 0);
+  const tools = uniqueStrings(sorted
+    .map((event) => event.tool_name || stringField(event.payload.tool_name) || stringField(event.payload.toolName))
+    .filter((tool): tool is string => typeof tool === "string" && tool.length > 0 && !tool.startsWith("mcp__codex_lcm__")))
+    .slice(0, 8);
+  const signalTexts = [...prompts, ...outcomes];
+  const topics = extractTopics(signalTexts.join("\n"));
+  const title = titleFromText(prompts[0] || outcomes[0] || latest?.hook_event || "Codex session");
+  const overview = overviewFromSignals(prompts, outcomes, tools);
+  const sourceEventIds = sorted
+    .filter((event) => isSummarySourceEvent(event))
+    .map((event) => event.event_id)
+    .slice(0, 12);
+  return {
+    session_id: sessionId,
+    updated_at: latest?.timestamp ?? new Date(0).toISOString(),
+    cwd: latest?.cwd ?? sorted[0]?.cwd ?? "",
+    ...(latest?.repo_root ? { repo_root: latest.repo_root } : sorted[0]?.repo_root ? { repo_root: sorted[0].repo_root } : {}),
+    ...(latest?.git_branch ? { git_branch: latest.git_branch } : sorted[0]?.git_branch ? { git_branch: sorted[0].git_branch } : {}),
+    title,
+    overview,
+    topics,
+    key_prompts: prompts.map(compactWhitespace).map((text) => truncateText(text, 120)).slice(0, 5),
+    outcomes: outcomes.map(compactWhitespace).map((text) => truncateText(text, 120)).slice(0, 5),
+    tools,
+    source_event_ids: sourceEventIds.length > 0 ? sourceEventIds : sorted.slice(0, 6).map((event) => event.event_id),
+  };
+}
+
+function eventSignalText(event: NormalizedEvent): string {
+  if (event.hook_event === "UserPromptSubmit") {
+    return stringField(event.payload.prompt) || stringField(event.payload.message) || "";
+  }
+  if (event.hook_event === "Note") {
+    return stringField(event.payload.note) || stringField(event.payload.text) || "";
+  }
+  if (event.hook_event === "Stop") {
+    return stringField(event.payload.last_assistant_message) || stringField(event.payload.summary) || "";
+  }
+  if (event.hook_event === "PreCompact") {
+    return stringField(event.payload.summary) || stringField(event.payload.reason) || "";
+  }
+  return "";
+}
+
+function isSummarySourceEvent(event: NormalizedEvent): boolean {
+  return event.hook_event === "UserPromptSubmit" ||
+    event.hook_event === "Note" ||
+    event.hook_event === "Stop" ||
+    event.hook_event === "PreCompact";
+}
+
+function overviewFromSignals(prompts: string[], outcomes: string[], tools: string[]): string {
+  const parts: string[] = [];
+  if (prompts[0]) parts.push(`User focus: ${truncateText(compactWhitespace(prompts[0]), 220)}`);
+  if (outcomes[0]) parts.push(`Latest outcome: ${truncateText(compactWhitespace(outcomes.at(-1) ?? outcomes[0]), 220)}`);
+  if (tools.length > 0) parts.push(`Tools used: ${tools.slice(0, 5).join(", ")}`);
+  return parts.length > 0 ? parts.join(" ") : "No high-signal user prompt or assistant outcome has been captured yet.";
+}
+
+function titleFromText(text: string): string {
+  const compact = compactWhitespace(text)
+    .replace(/^please\s+/iu, "")
+    .replace(/^(can you|could you|do you|does this)\s+/iu, "");
+  return truncateText(compact, 88) || "Codex session";
+}
+
+function extractTopics(text: string): string[] {
+  const counts = new Map<string, number>();
+  for (const term of text.toLowerCase().split(/[^\p{L}\p{N}_-]+/u)) {
+    const normalized = term.replace(/^-+|-+$/gu, "");
+    if (normalized.length < 4 || QUERY_STOP_WORDS.has(normalized)) continue;
+    counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([term]) => term)
+    .slice(0, 16);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function compactWhitespace(text: string): string {
+  return text.replace(/\s+/gu, " ").trim();
+}
+
+function truncateText(text: string, maxChars: number): string {
+  const compact = compactWhitespace(text);
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
+}
+
+function shortSourceId(eventId: string): string {
+  return eventId.length > 12 ? eventId.slice(0, 12) : eventId;
 }
 
 function summarizeSessions(events: NormalizedEvent[]): SessionSummary[] {

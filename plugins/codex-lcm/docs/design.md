@@ -25,7 +25,7 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 Storage defaults to `~/.codex-lcm` and can be overridden with `CODEX_LCM_HOME`.
 
 - `events.jsonl`: append-only sanitized raw event log. This is written first and must succeed even if SQLite indexing fails.
-- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `graph_nodes`, and `graph_edges`.
+- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `session_summaries`, `session_summary_fts`, `graph_nodes`, and `graph_edges`.
 - Events include schema version, event ID, timestamp, hook event, session ID, cwd, optional repo root, optional git branch, sanitized payload, redaction metadata, truncation metadata, and a SHA-256 hash of the original stdin.
 
 Raw event capture is lossless for retained sanitized payloads. Privacy and safety controls run before persistence: obvious secrets are redacted, oversized strings/objects are truncated with hashes and byte counts, and binary/image-like blobs are replaced with metadata.
@@ -40,6 +40,13 @@ The DAG layer is deterministic and rebuildable from indexed raw events:
 
 Edge insertion rejects self-edges and recursive back edges, so the derived graph remains acyclic. Graph failures are treated as index failures; the raw JSONL event has already been written and remains recoverable.
 
+The summary layer is also deterministic and rebuildable. It extracts compact
+session-level clues from high-signal events: user prompts, notes, stop messages,
+pre-compact messages, and tool names. A summary stores title, overview, topics,
+key prompts, outcomes, tools, and source event IDs. It does not use an LLM,
+embeddings, or network calls. Its job is to improve ranking and scanning while
+keeping raw events as the evidence layer.
+
 ## Hook Behavior
 
 `codex-lcm hook <event>` reads JSON from stdin and normalizes it. It accepts common Codex/Claude-style keys such as `session_id`, `sessionId`, `cwd`, `tool_name`, `toolName`, `tool_input`, `toolArgs`, `tool_output`, `tool_response`, `prompt`, and `userPrompt`.
@@ -52,9 +59,10 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
 - `lcm_search_sessions`: cross-session search using SQLite FTS, with recent-session fallback for empty queries and relaxed broad-query retry when strict FTS has no hits.
 - `lcm_get_session`: retrieve a session by ID with sanitized raw events; supports `limit` and `cursor` for long sessions.
+- `lcm_get_session_summary`: retrieve the deterministic extractive summary for a session, including topics and source event pointers.
 - `lcm_get_session_graph`: retrieve a bounded DAG slice for a session.
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
-- `lcm_pack_context`: pack matching events, nearby graph context, checkpoints, notes, and recent events into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search only when scoped retrieval is empty.
+- `lcm_pack_context`: pack matching summaries, events, nearby graph context, checkpoints, notes, and recent events into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search when scoped retrieval is empty or only finds low-signal tool chatter.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
 
 The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex when to call LCM and how to avoid loading entire long sessions unnecessarily.
@@ -80,7 +88,7 @@ must not edit `~/.codex/config.toml` or `~/.codex/hooks.json` itself.
 ## Limits
 
 - First version is local only and requires no external APIs.
-- Embeddings are deferred; FTS is the first search backend.
+- Embeddings are deferred; FTS plus deterministic summaries are the first search backend.
 - If SQLite indexing is unavailable, raw JSONL append still works and retrieval falls back to scanning `events.jsonl`; graph retrieval returns a bounded fallback graph from raw events when possible.
 - Hook payload shape is based on verified local installed hook examples and tolerant parsing. Unknown future Codex fields are preserved inside the sanitized payload.
 - Unit and smoke tests use synthetic hook events and direct MCP stdio calls.

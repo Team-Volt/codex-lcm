@@ -19,8 +19,12 @@ still work.
   indexing work.
 - Builds a local SQLite index with FTS search and a derived DAG of sessions,
   turns, events, tool results, and checkpoints.
+- Builds deterministic extractive session summaries with titles, topics, key
+  prompts, outcomes, tools, and source event IDs. These summaries are derived
+  from raw events and can be rebuilt.
 - Serves MCP tools for health checks, current-session lookup, cross-session
-  search, paged session retrieval, graph retrieval, context packing, and notes.
+  search, session summaries, paged session retrieval, graph retrieval, context
+  packing, and notes.
 - Provides a Codex skill that nudges the model to query LCM on resumes,
   compaction recovery, long-running work, and questions about prior sessions.
 
@@ -41,10 +45,14 @@ A typical retrieval flow is:
    resumes an older thread. Search tries exact FTS first, then relaxes broad
    queries so one missing word does not make retrieval look empty.
 3. Pack a bounded context block from matching events, nearby graph context,
-   checkpoints, notes, and recent session tails. If a cwd-scoped pack finds no
+   session summaries, checkpoints, notes, and recent session tails. For moderate
+   and large budgets, summaries appear before raw event blocks so Codex gets the
+   gist first and can still inspect the evidence. If a cwd-scoped pack finds no
    matches, or only finds low-signal tool chatter, it falls back to a bounded
    global search before returning nothing.
-4. Page through long sessions or request a bounded graph slice instead of loading
+4. Use `lcm_get_session_summary` for compact titles, topics, outcomes, and
+   source event IDs before loading raw transcripts.
+5. Page through long sessions or request a bounded graph slice instead of loading
    an entire raw history at once.
 
 This keeps Codex from guessing what happened before while avoiding giant context
@@ -69,7 +77,7 @@ Storage defaults to `~/.codex-lcm`:
 ```text
 ~/.codex-lcm/
   events.jsonl     append-only sanitized raw events
-  index.sqlite     derived SQLite FTS and DAG index
+  index.sqlite     derived SQLite FTS, summary, and DAG index
 ```
 
 `events.jsonl` is the source of truth. The SQLite database is rebuildable and is

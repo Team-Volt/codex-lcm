@@ -65,6 +65,19 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "lcm_get_session_summary",
+    title: "LCM Get Session Summary",
+    description: "Retrieve the deterministic extractive summary for a session, including topics and source event pointers.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+      },
+      required: ["sessionId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "lcm_get_session_graph",
     title: "LCM Get Session Graph",
     description: "Retrieve a bounded DAG slice for a session, including session, turn, event, and checkpoint nodes.",
@@ -158,6 +171,7 @@ function handleMessage(message: JsonRpcMessage, storage: ReturnType<typeof creat
       instructions: [
         "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, and packed context across Codex sessions.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
+        "Use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
         "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
       ].join(" "),
     });
@@ -213,6 +227,10 @@ function callTool(storage: ReturnType<typeof createStorage>, params: Record<stri
         cursor: optionalString(args.cursor),
       });
       return toolResult(`Loaded ${session.events.length} events.`, session);
+    }
+    case "lcm_get_session_summary": {
+      const summary = storage.getSessionMemorySummary(stringArg(args.sessionId, "sessionId"));
+      return toolResult(summary ? `Loaded summary for ${summary.session_id}.` : "No summary found.", { summary });
     }
     case "lcm_get_session_graph": {
       const graph = storage.getSessionGraph(stringArg(args.sessionId, "sessionId"), {
