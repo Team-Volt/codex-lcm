@@ -110,6 +110,10 @@ export type Health = {
 };
 
 const CHECKPOINT_INTERVAL = 50;
+const SUMMARY_EARLY_SIGNAL_LIMIT = 120;
+const SUMMARY_LATEST_SIGNAL_LIMIT = 240;
+const SUMMARY_RECENT_EVENT_LIMIT = 40;
+const SUMMARY_SOURCE_EVENT_LIMIT = 12;
 
 export class LcmStorage {
   readonly config: LcmConfig;
@@ -657,6 +661,8 @@ export class LcmStorage {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_events_session_turn ON events(session_id, turn_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_tool_use ON events(session_id, tool_use_id, hook_event, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_events_session_hook_time ON events(session_id, hook_event, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_events_session_time ON events(session_id, timestamp);
     `);
   }
 
@@ -1037,15 +1043,7 @@ export class LcmStorage {
 
   private rebuildSessionMemorySummary(sessionId: string): void {
     if (!this.db) return;
-    const rows = this.db.prepare(`
-      SELECT raw_json FROM events
-      WHERE session_id = ?1
-      ORDER BY timestamp ASC, rowid ASC
-      LIMIT 1000
-    `).all(sessionId);
-    const events = rows
-      .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
-      .filter((event) => !isCodexLcmToolEvent(event));
+    const events = this.getSummaryEventsForSession(sessionId);
     if (events.length === 0) return;
     const summary = buildSessionMemorySummary(events);
     const summaryText = summarySearchText(summary);
@@ -1087,6 +1085,35 @@ export class LcmStorage {
       INSERT INTO session_summary_fts (session_id, cwd, repo_root, content)
       VALUES (?1, ?2, ?3, ?4)
     `).run(summary.session_id, summary.cwd, summary.repo_root ?? "", summaryText);
+  }
+
+  private getSummaryEventsForSession(sessionId: string): NormalizedEvent[] {
+    if (!this.db) return [];
+    const highSignalFilter = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact')";
+    const earlySignals = this.db.prepare(`
+      SELECT raw_json FROM events
+      WHERE session_id = ?1
+        AND hook_event IN ${highSignalFilter}
+      ORDER BY timestamp ASC, rowid ASC
+      LIMIT ?2
+    `).all(sessionId, SUMMARY_EARLY_SIGNAL_LIMIT);
+    const latestSignals = this.db.prepare(`
+      SELECT raw_json FROM events
+      WHERE session_id = ?1
+        AND hook_event IN ${highSignalFilter}
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT ?2
+    `).all(sessionId, SUMMARY_LATEST_SIGNAL_LIMIT);
+    const recentEvents = this.db.prepare(`
+      SELECT raw_json FROM events
+      WHERE session_id = ?1
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT ?2
+    `).all(sessionId, SUMMARY_RECENT_EVENT_LIMIT);
+    return uniqueEvents([...earlySignals, ...latestSignals, ...recentEvents]
+      .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
+      .filter((event) => !isCodexLcmToolEvent(event)))
+      .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.event_id.localeCompare(b.event_id));
   }
 }
 
@@ -1434,8 +1461,7 @@ function buildSessionMemorySummary(events: NormalizedEvent[]): SessionMemorySumm
   const overview = overviewFromSignals(prompts, outcomes, tools);
   const sourceEventIds = sorted
     .filter((event) => isSummarySourceEvent(event))
-    .map((event) => event.event_id)
-    .slice(0, 12);
+    .map((event) => event.event_id);
   return {
     session_id: sessionId,
     updated_at: latest?.timestamp ?? new Date(0).toISOString(),
@@ -1445,10 +1471,12 @@ function buildSessionMemorySummary(events: NormalizedEvent[]): SessionMemorySumm
     title,
     overview,
     topics,
-    key_prompts: prompts.map(compactWhitespace).map((text) => truncateText(text, 120)).slice(0, 5),
-    outcomes: outcomes.map(compactWhitespace).map((text) => truncateText(text, 120)).slice(0, 5),
+    key_prompts: takeHeadTail(prompts.map(compactWhitespace).map((text) => truncateText(text, 120)), 5, 3),
+    outcomes: outcomes.map(compactWhitespace).map((text) => truncateText(text, 120)).slice(-5),
     tools,
-    source_event_ids: sourceEventIds.length > 0 ? sourceEventIds : sorted.slice(0, 6).map((event) => event.event_id),
+    source_event_ids: sourceEventIds.length > 0
+      ? takeHeadTail(sourceEventIds, SUMMARY_SOURCE_EVENT_LIMIT, Math.ceil(SUMMARY_SOURCE_EVENT_LIMIT / 2))
+      : takeHeadTail(sorted.map((event) => event.event_id), 6, 3),
   };
 }
 
@@ -1512,6 +1540,24 @@ function uniqueStrings(values: string[]): string[] {
     result.push(value);
   }
   return result;
+}
+
+function uniqueEvents(events: NormalizedEvent[]): NormalizedEvent[] {
+  const seen = new Set<string>();
+  const result: NormalizedEvent[] = [];
+  for (const event of events) {
+    if (seen.has(event.event_id)) continue;
+    seen.add(event.event_id);
+    result.push(event);
+  }
+  return result;
+}
+
+function takeHeadTail<T>(values: T[], limit: number, headCount: number): T[] {
+  if (values.length <= limit) return values;
+  const head = values.slice(0, headCount);
+  const tail = values.slice(-(limit - head.length));
+  return [...head, ...tail];
 }
 
 function compactWhitespace(text: string): string {

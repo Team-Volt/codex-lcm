@@ -93,6 +93,12 @@ directly. `lcm_pack_context` includes summaries first for moderate and large
 budgets, but skips them for very tight packs where exact raw matches would be
 crowded out.
 
+Summary rebuilds are bounded for long sessions. Storage reads early high-signal
+events, latest high-signal events, and a short recent tail, then deduplicates the
+sample before extracting topics and outcomes. The summary should capture the
+initial task, recent drift, and the latest result without scanning an entire
+giant transcript on every hook event.
+
 ## DAG Index
 
 The graph index is derived and deterministic. Raw JSONL remains the source of truth.

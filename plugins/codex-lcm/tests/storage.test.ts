@@ -212,6 +212,45 @@ test("search sessions uses extracted summary topics for broad semantic clues", (
   storage.close();
 });
 
+test("session summaries include latest high-signal events in very long sessions", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "long-summary-session";
+  const cwd = "/tmp/long-summary";
+
+  for (let index = 0; index < 1001; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: sessionId,
+        cwd,
+        prompt: index === 0 ? "Initial long session summary topic" : `summary filler prompt ${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: sessionId,
+      cwd,
+      last_assistant_message: "FINAL-LONG-SUMMARY-OUTCOME captured after the first thousand events.",
+    }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 20, 0)),
+  }));
+
+  const summary = storage.getSessionMemorySummary(sessionId);
+
+  assert.ok(summary);
+  assert.equal(summary.updated_at, "2026-06-09T12:20:00.000Z");
+  assert.equal(summary.outcomes.some((outcome) => outcome.includes("FINAL-LONG-SUMMARY-OUTCOME")), true);
+  assert.equal(summary.source_event_ids.length > 0, true);
+
+  storage.close();
+});
+
 test("still appends raw JSONL when SQLite index is unavailable", () => {
   const home = tempHome();
   fs.mkdirSync(path.join(home, "index.sqlite"));

@@ -129,6 +129,10 @@ and it does not replace raw events. It is a compact, rebuildable index that help
 agents find broad "semantic clue" matches before they decide which raw events or
 graph slices to inspect.
 
+For long sessions, summary rebuilds use a bounded sample of early high-signal
+events, latest high-signal events, and recent events. That keeps ingestion fast
+while preserving the initial task framing and the latest outcome.
+
 For long sessions, `lcm_get_session` accepts `limit` and `cursor`, `lcm_get_session_graph` returns bounded graph slices, and `lcm_pack_context` prioritizes matching events plus nearby graph context before adding recent tails. This avoids missing old-but-relevant events just because they are outside the latest event window.
 
 For broad questions, search is intentionally two-pass. Codex LCM tries strict

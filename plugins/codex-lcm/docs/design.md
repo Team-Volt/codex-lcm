@@ -47,6 +47,11 @@ key prompts, outcomes, tools, and source event IDs. It does not use an LLM,
 embeddings, or network calls. Its job is to improve ranking and scanning while
 keeping raw events as the evidence layer.
 
+For long sessions, the summary builder samples early high-signal events, latest
+high-signal events, and recent events. It keeps the first task framing, the
+newest outcomes, and recent tool context without reading the whole session on
+every hook.
+
 ## Hook Behavior
 
 `codex-lcm hook <event>` reads JSON from stdin and normalizes it. It accepts common Codex/Claude-style keys such as `session_id`, `sessionId`, `cwd`, `tool_name`, `toolName`, `tool_input`, `toolArgs`, `tool_output`, `tool_response`, `prompt`, and `userPrompt`.
