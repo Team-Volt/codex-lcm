@@ -203,3 +203,7 @@ The smoke test uses a temporary `CODEX_LCM_HOME`, sends synthetic hook events, s
 - Hook payload compatibility is based on verified local Codex/installed-plugin behavior and tolerant parsing.
 - `codex-lcm install` and `codex-lcm uninstall` are dry-run manual wiring planners. Native plugin install and removal are handled by `codex plugin add` and `codex plugin remove`.
 - `node:sqlite` is used through Node 22 and should be treated as a local runtime dependency.
+
+## License
+
+Codex LCM is released under the MIT License. See `LICENSE` for the full text.
