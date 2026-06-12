@@ -49,7 +49,7 @@ export type SearchSessionArgs = {
   repoRoot?: string;
 };
 
-export type SearchEventArgs = SearchSessionArgs & {
+type SummaryNodeSearchArgs = SearchSessionArgs & {
   sessionIds?: string[];
 };
 
@@ -351,50 +351,6 @@ export class LcmStorage {
     return { session_id: sessionId, nodes, edges };
   }
 
-  searchEvents(args: SearchEventArgs): NormalizedEvent[] {
-    const limit = clampLimit(args.limit, 20);
-    const query = args.query?.trim() ?? "";
-    if (!this.db) {
-      return readRawEvents(this.config.rawLogPath)
-        .filter((event) => !args.cwd || event.cwd === args.cwd)
-        .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
-        .filter((event) => !args.sessionIds?.length || args.sessionIds.includes(event.session_id))
-        .filter((event) => matchesQueryText(JSON.stringify(event), query))
-        .slice(0, limit);
-    }
-    if (query.length === 0) {
-      return this.db.prepare(`
-        SELECT raw_json FROM events
-        WHERE (?1 IS NULL OR cwd = ?1)
-          AND (?2 IS NULL OR repo_root = ?2)
-        ORDER BY timestamp DESC, rowid DESC
-        LIMIT ?3
-      `).all(args.cwd ?? null, args.repoRoot ?? null, limit)
-        .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent);
-    }
-
-    const sessionFilter = args.sessionIds?.length ? new Set(args.sessionIds) : undefined;
-    let rows: unknown[] = [];
-    const statement = this.db.prepare(`
-        SELECT e.raw_json, e.session_id
-        FROM event_fts f
-        JOIN events e ON e.event_id = f.event_id
-        WHERE event_fts MATCH ?1
-          AND (?2 IS NULL OR e.cwd = ?2)
-          AND (?3 IS NULL OR e.repo_root = ?3)
-        ORDER BY bm25(event_fts) ASC, e.timestamp DESC
-        LIMIT ?4
-      `);
-    for (const ftsQuery of toFtsQueries(query)) {
-      rows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 10, 50));
-      if (rows.length > 0) break;
-    }
-    const events = rows
-      .filter((row) => !sessionFilter || sessionFilter.has(String((row as { session_id: string }).session_id)))
-      .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent);
-    return rankEventsForContext(events, query).slice(0, limit);
-  }
-
   private getLatestCheckpoint(sessionId: string): GraphNode | undefined {
     if (!this.db) return undefined;
     const row = this.db.prepare(`
@@ -518,7 +474,7 @@ export class LcmStorage {
       a.node_id.localeCompare(b.node_id));
   }
 
-  private searchSummaryNodes(args: SearchEventArgs): SummaryNode[] {
+  private searchSummaryNodes(args: SummaryNodeSearchArgs): SummaryNode[] {
     const limit = clampLimit(args.limit, 10);
     if (!this.db) return [];
     const query = args.query?.trim() ?? "";
@@ -1590,22 +1546,6 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
       b.lastMatchAt.localeCompare(a.lastMatchAt) ||
       a.firstOrder - b.firstOrder)
     .map((entry) => entry.summary);
-}
-
-function rankEventsForContext(events: NormalizedEvent[], query: string): NormalizedEvent[] {
-  return [...events].sort((a, b) =>
-    eventContextPriority(a) - eventContextPriority(b) ||
-    queryTermHitCount(JSON.stringify(b.payload), query) - queryTermHitCount(JSON.stringify(a.payload), query) ||
-    b.timestamp.localeCompare(a.timestamp));
-}
-
-function eventContextPriority(event: NormalizedEvent): number {
-  if (event.hook_event === "Note") return 0;
-  if (event.hook_event === "UserPromptSubmit") return 1;
-  if (event.hook_event === "PreCompact" || event.hook_event === "Stop") return 2;
-  if (event.hook_event === "SessionStart") return 3;
-  if (event.tool_name) return 5;
-  return 4;
 }
 
 function rowToGraphNode(row: unknown): GraphNode {
