@@ -27,6 +27,7 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_current_session",
       "lcm_search_sessions",
       "lcm_get_session",
+      "lcm_get_session_summary",
       "lcm_get_session_graph",
       "lcm_get_recent_context",
       "lcm_pack_context",
@@ -72,6 +73,15 @@ test("MCP tools search and retrieve synthetic hook data", () => {
       id: 4,
       method: "tools/call",
       params: {
+        name: "lcm_get_session_summary",
+        arguments: { sessionId: "mcp-session" },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/call",
+      params: {
         name: "lcm_get_session_graph",
         arguments: { sessionId: "mcp-session", limit: 20 },
       },
@@ -80,5 +90,7 @@ test("MCP tools search and retrieve synthetic hook data", () => {
 
   assert.equal(responses[1].result.structuredContent.matches[0].session_id, "mcp-session");
   assert.equal(responses[2].result.structuredContent.session.session_id, "mcp-session");
-  assert.equal(responses[3].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
+  assert.equal(responses[3].result.structuredContent.summary.session_id, "mcp-session");
+  assert.match(responses[3].result.structuredContent.summary.title, /searchable MCP payload/u);
+  assert.equal(responses[4].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
 });

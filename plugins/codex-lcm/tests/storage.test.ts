@@ -144,6 +144,113 @@ test("records notes and packs context within a budget", () => {
   storage.close();
 });
 
+test("packs extractive session summaries before raw events", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "summary-session",
+      cwd: "/tmp/summary",
+      prompt: "Improve codex-lcm summarization ranking with topic extraction and provenance.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "summary-session",
+      cwd: "/tmp/summary",
+      last_assistant_message: "Implemented deterministic session summaries, indexed topics, and source event pointers.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:01:00.000Z"),
+  }));
+
+  const packed = storage.packContext({
+    cwd: "/tmp/summary",
+    query: "summarization ranking topic extraction provenance",
+    budgetTokens: 350,
+  });
+
+  const summaryIndex = packed.markdown.indexOf("Session Summary");
+  const rawIndex = packed.markdown.indexOf("UserPromptSubmit");
+  assert.notEqual(summaryIndex, -1);
+  assert.notEqual(rawIndex, -1);
+  assert.equal(summaryIndex < rawIndex, true);
+  assert.match(packed.markdown, /Topics: .*summarization/u);
+  assert.match(packed.markdown, /Sources: /u);
+  assert.equal(packed.sources.some((source) => source.kind === "summary" && source.session_id === "summary-session"), true);
+
+  storage.close();
+});
+
+test("search sessions uses extracted summary topics for broad semantic clues", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "semantic-session",
+      cwd: "/tmp/semantic",
+      prompt: "The retrieval layer should surface compact clue titles across sessions.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  const matches = storage.searchSessions({
+    query: "semantic clue finding compact titles",
+    limit: 5,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["semantic-session"]);
+
+  storage.close();
+});
+
+test("session summaries include latest high-signal events in very long sessions", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "long-summary-session";
+  const cwd = "/tmp/long-summary";
+
+  for (let index = 0; index < 1001; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: sessionId,
+        cwd,
+        prompt: index === 0 ? "Initial long session summary topic" : `summary filler prompt ${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: sessionId,
+      cwd,
+      last_assistant_message: "FINAL-LONG-SUMMARY-OUTCOME captured after the first thousand events.",
+    }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 20, 0)),
+  }));
+
+  const summary = storage.getSessionMemorySummary(sessionId);
+
+  assert.ok(summary);
+  assert.equal(summary.updated_at, "2026-06-09T12:20:00.000Z");
+  assert.equal(summary.outcomes.some((outcome) => outcome.includes("FINAL-LONG-SUMMARY-OUTCOME")), true);
+  assert.equal(summary.source_event_ids.length > 0, true);
+
+  storage.close();
+});
+
 test("still appends raw JSONL when SQLite index is unavailable", () => {
   const home = tempHome();
   fs.mkdirSync(path.join(home, "index.sqlite"));

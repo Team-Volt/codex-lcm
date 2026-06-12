@@ -7,8 +7,9 @@
 3. The payload is normalized into a stable event schema.
 4. Obvious secrets and oversized content are sanitized.
 5. The sanitized event is appended to `events.jsonl`.
-6. SQLite indexing is attempted. This builds session rows, FTS rows, and a derived DAG. Index failure does not undo or block raw append.
-7. `codex-lcm mcp` serves health, search, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
+6. SQLite indexing is attempted. This builds session rows, FTS rows, extractive
+   summaries, and a derived DAG. Index failure does not undo or block raw append.
+7. `codex-lcm mcp` serves health, search, summary, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
 
 ## Plugin Packaging
 
@@ -63,10 +64,40 @@ SQLite tables:
 - `sessions`
 - `events`
 - `event_fts`
+- `session_summaries`
+- `session_summary_fts`
 - `graph_nodes`
 - `graph_edges`
 
 The first version creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
+
+## Summary Index
+
+Session summaries are deterministic and extractive. They are rebuilt from
+sanitized raw events whenever a session is indexed, so they can be deleted and
+recreated without changing the source data.
+
+Each summary records:
+
+- title
+- overview
+- topics
+- key user prompts and notes
+- assistant outcomes from `Stop` and `PreCompact`
+- tool names
+- source event IDs
+
+`session_summary_fts` lets broad topic queries match these compact clues before
+the caller loads raw events. `lcm_get_session_summary` exposes a summary
+directly. `lcm_pack_context` includes summaries first for moderate and large
+budgets, but skips them for very tight packs where exact raw matches would be
+crowded out.
+
+Summary rebuilds are bounded for long sessions. Storage reads early high-signal
+events, latest high-signal events, and a short recent tail, then deduplicates the
+sample before extracting topics and outcomes. The summary should capture the
+initial task, recent drift, and the latest result without scanning an entire
+giant transcript on every hook event.
 
 ## DAG Index
 
@@ -94,12 +125,14 @@ For very long sessions, callers should prefer bounded graph and event access:
 - `lcm_get_session_graph` with a bounded `limit`.
 - `lcm_pack_context`, which searches matching events first, then adds nearby graph context, checkpoints, and recent tails.
 
-Search uses strict SQLite FTS first. If a non-empty query has no strict hits, LCM
-builds a relaxed query from non-stopword terms and retries. Session search ranks
-results by query-term coverage before recency, so a newer shallow hit should not
+Search uses strict SQLite FTS first against summaries and events. If a non-empty
+query has no strict hits, LCM builds a relaxed query from non-stopword terms and
+retries. Summary matches receive extra weight because they represent extracted
+session-level substance rather than incidental raw text. Session search still
+ranks by query-term coverage before recency, so a newer shallow hit should not
 hide an older session with more of the requested substance. For context packing,
-cwd remains the first boundary, but a cwd-scoped query that finds no matches
-or only finds low-signal tool events falls back to a bounded global search before
+cwd remains the first boundary, but a cwd-scoped query that finds no matches or
+only finds low-signal tool events falls back to a bounded global search before
 returning an empty or misleadingly narrow pack.
 
 ## MCP Protocol

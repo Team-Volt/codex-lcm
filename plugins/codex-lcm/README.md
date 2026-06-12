@@ -34,6 +34,7 @@ CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 - `lcm_current_session`
 - `lcm_search_sessions`
 - `lcm_get_session`
+- `lcm_get_session_summary`
 - `lcm_get_session_graph`
 - `lcm_get_recent_context`
 - `lcm_pack_context`
@@ -121,6 +122,17 @@ SQLite stores a derived DAG alongside FTS:
 
 Edges are inserted with a recursive cycle check. The graph is derived from raw events and can be rebuilt; `events.jsonl` remains the source of truth.
 
+SQLite also stores deterministic extractive summaries in `session_summaries` and
+`session_summary_fts`. A summary contains a title, overview, topics, key user
+prompts, outcomes, tools used, and source event IDs. It is not an LLM summary
+and it does not replace raw events. It is a compact, rebuildable index that helps
+agents find broad "semantic clue" matches before they decide which raw events or
+graph slices to inspect.
+
+For long sessions, summary rebuilds use a bounded sample of early high-signal
+events, latest high-signal events, and recent events. That keeps ingestion fast
+while preserving the initial task framing and the latest outcome.
+
 For long sessions, `lcm_get_session` accepts `limit` and `cursor`, `lcm_get_session_graph` returns bounded graph slices, and `lcm_pack_context` prioritizes matching events plus nearby graph context before adding recent tails. This avoids missing old-but-relevant events just because they are outside the latest event window.
 
 For broad questions, search is intentionally two-pass. Codex LCM tries strict
@@ -130,6 +142,9 @@ recency. `lcm_pack_context` keeps cwd scoping when it finds high-signal matches,
 but if a cwd-scoped query is empty or only finds tool chatter, it performs a
 bounded global fallback so broad meta questions do not return empty or
 misleadingly narrow context just because the current directory is too narrow.
+For moderate and larger context budgets, packed context includes matching
+session summaries before raw event blocks. For tight multi-session packs, raw
+evidence wins so exact matches are not crowded out by summaries.
 
 ## Privacy And Safety
 
@@ -154,7 +169,8 @@ The smoke test uses a temporary `CODEX_LCM_HOME`, sends synthetic hook events, s
 ## Known Limitations
 
 - Embeddings are not implemented. Search is SQLite FTS plus raw-log fallback.
-- Checkpoints are structural and extractive; they do not call an LLM or external summarizer.
+- Session summaries are deterministic and extractive; they do not call an LLM or external summarizer.
+- Checkpoints are structural; they track graph/session shape rather than prose summaries.
 - Hook payload compatibility is based on verified local Codex/installed-plugin behavior and tolerant parsing.
 - `codex-lcm install` and `codex-lcm uninstall` are dry-run manual wiring planners. Native plugin install and removal are handled by `codex plugin add` and `codex plugin remove`.
 - `node:sqlite` is used through Node 22 and should be treated as a local runtime dependency.
