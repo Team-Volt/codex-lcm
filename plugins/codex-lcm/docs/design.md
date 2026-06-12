@@ -4,14 +4,14 @@
 
 Build a fresh Codex-native, session-first lossless context memory plugin. It captures Codex session events through hooks, stores sanitized raw events before indexing, and exposes retrieval through a stdio MCP server. Project and git metadata are recorded when available, but session ID and cwd are the primary anchors.
 
-## Verified Local Codex Surfaces
+## Codex Surfaces Verified During Development
 
 - `~/.codex/config.toml` has `features.hooks = true`, `features.memories = true`, `plugins = true`, and existing stdio MCP entries under `[mcp_servers.*]`.
 - `~/.codex/hooks.json` uses Codex lifecycle names `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`.
 - `codex mcp add --help` supports stdio MCP registration with `codex mcp add <name> -- <command>...`.
-- Installed plugins declare `.codex-plugin/plugin.json`, optional `.mcp.json`, and optional hook manifests. The installed AgentMemory Codex hook manifest uses `${CLAUDE_PLUGIN_ROOT}` in command paths.
+- Installed plugins declare `.codex-plugin/plugin.json`, optional `.mcp.json`, and optional hook manifests. Plugin hook manifests use `${CLAUDE_PLUGIN_ROOT}` in command paths so Codex can resolve the installed plugin root.
 - Installed hook scripts read JSON from stdin, tolerate snake_case and camelCase payload fields, and exit cleanly on malformed JSON.
-- Node is `v22.22.3`, can run `.ts` files with type stripping, and exposes `node:sqlite`. This implementation uses no runtime npm dependencies.
+- Node `v22.22.3` can run `.ts` files with type stripping and exposes `node:sqlite`. This implementation uses no runtime npm dependencies.
 
 ## Plugin Shape
 

@@ -28,7 +28,7 @@ still work.
 - Provides a Codex skill that nudges the model to query LCM on resumes,
   compaction recovery, long-running work, and questions about prior sessions.
 
-The first working version is local-only. It does not require external APIs,
+The current release stores data locally. It does not require external APIs,
 hosted services, or embeddings.
 
 ## How Codex Uses It
@@ -98,16 +98,16 @@ operation.
 - Raw sanitized events are kept locally unless the user chooses to copy, export,
   or publish them elsewhere.
 
-## Public Status
-
-This repository is being prepared for public use. The implementation is already
-usable locally, but the public installation and release story is still evolving.
-The current focus is correctness, transparent capture semantics, durable local
-storage, and Codex-native retrieval behavior.
-
 ## Installation
 
-Install from a local checkout with Codex's native plugin flow:
+Install from GitHub with Codex's native plugin flow:
+
+```sh
+codex plugin marketplace add Team-Volt/codex-lcm --ref main
+codex plugin add codex-lcm@codex-lcm
+```
+
+Or install from a local checkout:
 
 ```sh
 codex plugin marketplace add /path/to/codex-lcm
@@ -118,6 +118,23 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 `lcm-recall` skill. You do not need to run `codex-lcm install` after
 `codex plugin add`; that command is only a dry-run manual wiring planner for
 development or compatibility checks.
+
+The first TUI session after install asks you to review and trust the lifecycle
+hooks. That is expected. Hooks capture the session data that LCM indexes.
+
+Remove it with:
+
+```sh
+codex plugin remove codex-lcm@codex-lcm
+```
+
+## Release Status
+
+Codex LCM is a `0.1` developer release. The core flow is implemented and tested:
+native plugin install, hook ingestion, local storage, search, graph retrieval,
+context packing, and the `lcm-recall` skill. The search backend is intentionally
+simple for now: SQLite FTS plus deterministic extractive summaries. Embeddings
+and hosted services are not required.
 
 ## Development
 

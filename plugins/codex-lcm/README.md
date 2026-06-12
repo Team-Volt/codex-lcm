@@ -1,6 +1,6 @@
 # Codex LCM
 
-Codex LCM is a fresh Codex-native lossless context memory plugin. It does not depend on the existing `lcm` tool. It captures sanitized raw Codex hook events, appends them to JSONL first, builds local SQLite FTS plus a derived DAG index, and exposes retrieval through MCP.
+Codex LCM is a Codex-native lossless context memory plugin. It does not depend on the existing `lcm` tool. It captures sanitized raw Codex hook events, appends them to JSONL first, builds local SQLite FTS plus a derived DAG index, and exposes retrieval through MCP.
 
 ## Requirements
 
@@ -8,7 +8,9 @@ Codex LCM is a fresh Codex-native lossless context memory plugin. It does not de
 - Codex CLI/Desktop with MCP and hooks enabled.
 - No runtime npm dependencies and no external APIs.
 
-Verified on this machine with Node `v22.22.3`, Codex plugin manifests using `.codex-plugin/plugin.json`, stdio MCP entries, and hook payloads read as JSON from stdin.
+The test suite has been run with Node `v22.22.3`. The package uses Codex
+plugin manifests with `.codex-plugin/plugin.json`, stdio MCP entries, and hook
+payloads read as JSON from stdin.
 
 ## Commands
 
@@ -46,17 +48,17 @@ Native Codex plugin installation is the primary install path. It wires the MCP
 server, hook manifest, and skill from `.codex-plugin/plugin.json`; no separate
 `codex-lcm install` step is required.
 
-Install as a Codex plugin from this local checkout:
+Install from GitHub:
 
 ```sh
-codex plugin marketplace add /path/to/codex-lcm
+codex plugin marketplace add Team-Volt/codex-lcm --ref main
 codex plugin add codex-lcm@codex-lcm
 ```
 
-From a GitHub marketplace checkout, use the repo source instead:
+Or install as a Codex plugin from a local checkout:
 
 ```sh
-codex plugin marketplace add owner/repo --ref main
+codex plugin marketplace add /path/to/codex-lcm
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -88,8 +90,11 @@ The native Codex plugin files are:
 - `.codex-plugin/plugin.json`
 - `.mcp.json`
 - `hooks/hooks.codex.json`
-- `../../.agents/plugins/marketplace.json`
 - `skills/lcm-recall/SKILL.md`
+
+The repository also includes `.agents/plugins/marketplace.json`, which lets
+Codex treat this checkout as a plugin marketplace source during development or
+local installs.
 
 The `lcm-recall` skill is loaded by native plugin installation and nudges Codex
 to use LCM on resumes, compaction recovery, long-running work, and questions
@@ -186,14 +191,20 @@ Before writing to disk, Codex LCM:
 
 If SQLite is unavailable, raw JSONL append still works and retrieval falls back to scanning `events.jsonl`.
 
-## Smoke Test
+## Testing
 
 ```sh
 npm test
 npm run smoke
+npm --cache /tmp/codex-lcm-npm-cache pack --dry-run
 ```
 
-The smoke test uses a temporary `CODEX_LCM_HOME`, sends synthetic hook events, starts the MCP server over stdio, calls search, graph, and pack-context tools, and cleans up the temporary directory unless `CODEX_LCM_KEEP_SMOKE=1` is set.
+The smoke test uses a temporary `CODEX_LCM_HOME`, sends synthetic hook events,
+starts the MCP server over stdio, calls search, graph, and pack-context tools,
+and cleans up the temporary directory unless `CODEX_LCM_KEEP_SMOKE=1` is set.
+
+Use a temporary npm cache for `npm pack --dry-run` if your global npm cache has
+local permission issues.
 
 ## Known Limitations
 
