@@ -129,6 +129,11 @@ not replace raw events. It is a compact, rebuildable index that helps agents
 find broad "semantic clue" matches before they decide which raw events or graph
 slices to inspect.
 
+Codex-generated suggestion prompts and their JSON suggestion responses stay in
+the raw event log and exact event FTS, but they are not treated as summary
+signal. That keeps generated "try this next" chatter from outranking actual work
+sessions in broad discovery.
+
 The summary-node layer adds a second derived index:
 
 - D0 summary nodes summarize bounded chunks of high-signal events.
@@ -153,13 +158,22 @@ outside the latest event window.
 
 For broad questions, search is intentionally two-pass. Codex LCM tries strict
 SQLite FTS first, then falls back to a relaxed term query when the strict query
-has no hits. Session results are ranked by substantive query-term coverage before
-recency. `lcm_pack_context` keeps cwd scoping when it finds high-signal matches,
-but if a cwd-scoped query is empty it performs a bounded global fallback so broad
-meta questions do not return empty or misleadingly narrow context just because
-the current directory is too narrow. Packed context excludes LCM self-reference
-tool chatter and prefers summary-node source lineage over arbitrary raw tool
-output.
+has no hits. Session results are ordered by discovery confidence first, then raw
+match strength. Each `lcm_search_sessions` result includes a `best_match` clue
+with the match kind, snippet, score, timestamp, and available source metadata.
+It also includes `discovery`, a compact confidence object with `high`, `medium`,
+or `low`, a score, and the reasons behind that ranking. Tiny one-event sessions
+are downranked for broad discovery queries, while exact marker-style searches
+still work. Agents can also pass `excludeCurrentSession` or `excludeSessionIds`
+when they are looking for prior history and the current chat is repeating the
+same terms.
+
+`lcm_pack_context` keeps cwd scoping when it finds high-signal matches, but if a
+cwd-scoped query is empty it performs a bounded global fallback so broad meta
+questions do not return empty or misleadingly narrow context just because the
+current directory is too narrow. Packed context excludes LCM self-reference tool
+chatter and generated suggestion chatter, and prefers summary-node source
+lineage over arbitrary raw tool output.
 
 ## Privacy And Safety
 

@@ -45,6 +45,8 @@ const TOOLS = [
         limit: { type: "number", default: 10 },
         cwd: { type: "string" },
         repoRoot: { type: "string" },
+        excludeCurrentSession: { type: "boolean", default: false },
+        excludeSessionIds: { type: "array", items: { type: "string" } },
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -218,6 +220,8 @@ function callTool(storage: ReturnType<typeof createStorage>, params: Record<stri
         limit: optionalNumber(args.limit),
         cwd: optionalString(args.cwd),
         repoRoot: optionalString(args.repoRoot),
+        excludeCurrentSession: optionalBoolean(args.excludeCurrentSession),
+        excludeSessionIds: optionalStringArray(args.excludeSessionIds),
       });
       return toolResult(`Found ${matches.length} matching sessions.`, { matches });
     }
@@ -301,6 +305,10 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function optionalStringArray(value: unknown): string[] | undefined {

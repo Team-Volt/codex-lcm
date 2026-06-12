@@ -212,6 +212,281 @@ test("search sessions uses extracted summary topics for broad semantic clues", (
   storage.close();
 });
 
+test("search sessions explains the best summary-node match", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "discovery-session",
+      cwd: "/tmp/discovery",
+      prompt: "Improve search session discovery with summary node snippets and source lineage.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "discovery-session",
+      cwd: "/tmp/discovery",
+      last_assistant_message: "Added explainable best-match metadata for session discovery.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:01:00.000Z"),
+  }));
+
+  const [match] = storage.searchSessions({
+    query: "summary node snippets source lineage",
+    limit: 5,
+  });
+
+  assert.equal(match.session_id, "discovery-session");
+  assert.equal(match.best_match?.kind, "summary_node");
+  assert.equal(typeof match.best_match?.score, "number");
+  assert.match(match.best_match?.snippet ?? "", /summary node snippets|source lineage/u);
+  assert.equal(match.best_match?.topics?.includes("summary"), true);
+  assert.ok(match.best_match?.node_id?.startsWith("summary:discovery-session"));
+
+  storage.close();
+});
+
+test("search sessions can exclude the latest cwd session to surface prior history", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const cwd = "/tmp/history-search";
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "prior-history",
+      cwd,
+      prompt: "Rebuild history for summary DAG ranking and source lineage retrieval.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "current-chat",
+      cwd,
+      prompt: "Current chat repeats summary DAG ranking source lineage terms while discussing search.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:05:00.000Z"),
+  }));
+
+  const matches = storage.searchSessions({
+    cwd,
+    query: "summary DAG ranking source lineage",
+    limit: 5,
+    excludeCurrentSession: true,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["prior-history"]);
+  assert.equal(matches[0].best_match?.kind, "summary_node");
+
+  storage.close();
+});
+
+test("search sessions prefer real work over generated suggestion sessions", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const cwd = "/tmp/suggestion-noise";
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "real-work",
+      cwd,
+      prompt: "Implement lossless-claw hermes-lcm style multi-depth summary DAG ranking and retrieval.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "real-work",
+      cwd,
+      last_assistant_message: "Added source-rich summary nodes and tuned lcm_search_sessions discovery ranking.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:01:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "generated-suggestions",
+      cwd,
+      prompt: "# Overview Generate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: /tmp/suggestion-noise\nSuggest lossless-claw hermes-lcm multi-depth summary DAG ranking retrieval follow-up work.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:10:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "generated-suggestions",
+      cwd,
+      last_assistant_message: JSON.stringify({
+        suggestions: [{
+          title: "Tune lossless-claw hermes-lcm ranking",
+          description: "Search session discovery can mention multi-depth summary DAG ranking retrieval.",
+        }],
+      }),
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:11:00.000Z"),
+  }));
+
+  const matches = storage.searchSessions({
+    cwd,
+    query: "lossless-claw hermes-lcm multi-depth summary DAG ranking retrieval",
+    limit: 5,
+  });
+
+  assert.equal(matches[0].session_id, "real-work");
+
+  const auditMatches = storage.searchSessions({
+    cwd,
+    query: "hyperpersonalized suggestions",
+    limit: 5,
+  });
+
+  assert.equal(auditMatches[0].session_id, "generated-suggestions");
+
+  storage.close();
+});
+
+test("search sessions do not surface raw tool chatter as discovery matches", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: "tool-chatter",
+      cwd: "/tmp/tool-chatter",
+      tool_name: "Bash",
+      tool_response: "lossless-claw hermes-lcm multi-depth summary DAG ranking retrieval",
+    }),
+    env: {},
+    now,
+  }));
+
+  const matches = storage.searchSessions({
+    query: "lossless-claw hermes-lcm multi-depth summary DAG ranking retrieval",
+    limit: 5,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), []);
+
+  storage.close();
+});
+
+test("search sessions only surface generated suggestions for explicit suggestion queries", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const cwd = "/tmp/generated-suggestion-only";
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "generated-suggestions-only",
+      cwd,
+      prompt: "# Overview Generate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: /tmp/generated-suggestion-only\nMention lossless-claw hermes-lcm multi-depth summary DAG ranking retrieval.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "generated-suggestions-only",
+      cwd,
+      last_assistant_message: JSON.stringify({
+        suggestions: [{
+          title: "Tune lossless-claw hermes-lcm ranking",
+          description: "Use multi-depth summary DAG ranking retrieval.",
+        }],
+      }),
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:01:00.000Z"),
+  }));
+
+  const broadMatches = storage.searchSessions({
+    cwd,
+    query: "lossless-claw hermes-lcm multi-depth summary DAG ranking retrieval",
+    limit: 5,
+  });
+
+  assert.deepEqual(broadMatches.map((match) => match.session_id), []);
+
+  const auditMatches = storage.searchSessions({
+    cwd,
+    query: "hyperpersonalized suggestions",
+    limit: 5,
+  });
+
+  assert.deepEqual(auditMatches.map((match) => match.session_id), ["generated-suggestions-only"]);
+
+  storage.close();
+});
+
+test("search sessions rank source-rich implementation history over tiny marker sessions", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const cwd = "/tmp/discovery-confidence";
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "implementation-history",
+      cwd,
+      prompt: "Implement summary DAG ranking retrieval with source lineage and confidence scoring.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "implementation-history",
+      cwd,
+      last_assistant_message: "Finished implementation history: source-rich summary nodes, ranking signals, and retrieval verification.",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:01:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "tiny-marker",
+      cwd,
+      prompt: "summary DAG ranking retrieval implementation history marker reply exactly",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:10:00.000Z"),
+  }));
+
+  const matches = storage.searchSessions({
+    cwd,
+    query: "summary DAG ranking retrieval implementation history",
+    limit: 5,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["implementation-history", "tiny-marker"]);
+  assert.equal(matches[0].discovery?.confidence, "high");
+  assert.equal(matches[1].discovery?.confidence, "low");
+  assert.equal((matches[0].discovery?.score ?? 0) > (matches[1].discovery?.score ?? 0), true);
+
+  storage.close();
+});
+
 test("session summary topics prefer signal terms over prompt filler", () => {
   const home = tempHome();
   const storage = createStorage({ home });
