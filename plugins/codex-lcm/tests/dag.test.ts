@@ -159,8 +159,111 @@ test("packs old matching events from long sessions instead of only the recent ta
   });
 
   assert.match(packed.markdown, /needle-old-event architecture decision/u);
-  assert.equal(packed.sources.some((source) => source.kind === "event"), true);
+  assert.equal(packed.sources.some((source) => source.kind === "summary" && source.node_id), true);
   assert.ok(packed.estimated_tokens <= 200);
+
+  storage.close();
+});
+
+test("builds multi-depth summary nodes with source lineage", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "summary-node-session";
+  const cwd = "/tmp/summary-node";
+
+  for (let index = 0; index < 40; index += 1) {
+    ingest(storage, "UserPromptSubmit", {
+      session_id: sessionId,
+      turn_id: `turn-${index}`,
+      cwd,
+      prompt: index === 37
+        ? "SUMMARY-NODE-LATEST retrieval quality decision"
+        : `summary node source prompt ${index}`,
+    }, new Date(Date.UTC(2026, 5, 9, 12, 0, index)).toISOString());
+  }
+
+  const graph = storage.getSessionGraph(sessionId, { limit: 500 });
+  const summaryNodes = graph.nodes.filter((node) => node.kind === "summary");
+  const depths = new Set(summaryNodes.map((node) => Number(node.metadata.depth)));
+
+  assert.equal(summaryNodes.length > 0, true);
+  assert.equal(depths.has(0), true);
+  assert.equal(depths.has(1), true);
+  assert.equal(summaryNodes.some((node) => String(node.label).includes("SUMMARY-NODE-LATEST")), true);
+  assert.equal(graph.edges.some((edge) => edge.kind === "summary_source"), true);
+  for (const node of summaryNodes) {
+    assert.equal(Array.isArray(node.metadata.source_ids), true);
+    assert.match(String(node.metadata.source_type), /events|nodes/u);
+  }
+
+  storage.close();
+});
+
+test("bounded graph slices reserve room for summary nodes in long sessions", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "summary-node-bounded-graph-session";
+  const cwd = "/tmp/summary-node-bounded-graph";
+
+  for (let index = 0; index < 160; index += 1) {
+    ingest(storage, "UserPromptSubmit", {
+      session_id: sessionId,
+      turn_id: `turn-${index}`,
+      cwd,
+      prompt: index === 120
+        ? "BOUNDED-GRAPH-SUMMARY-NODE source lineage marker"
+        : `bounded graph filler ${index}`,
+    }, new Date(Date.UTC(2026, 5, 9, 13, 0, index)).toISOString());
+  }
+
+  const graph = storage.getSessionGraph(sessionId, { limit: 80 });
+  const summaryNodes = graph.nodes.filter((node) => node.kind === "summary");
+
+  assert.equal(summaryNodes.length > 0, true);
+  assert.equal(summaryNodes.some((node) => Number(node.metadata.depth) > 0), true);
+  assert.equal(graph.edges.some((edge) => edge.kind === "summary_source"), true);
+
+  storage.close();
+});
+
+test("pack context expands summary-node sources without raw tool chatter", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "summary-node-pack-session";
+  const cwd = "/tmp/summary-node-pack";
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    prompt: "summary stop words topic extraction user decision",
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "PostToolUse", {
+    session_id: sessionId,
+    turn_id: "turn-1",
+    cwd,
+    tool_name: "update_plan",
+    tool_input: {
+      plan: [
+        {
+          step: "Replace ad hoc query/topic extraction with a smaller principled term/directness helper",
+          status: "in_progress",
+        },
+      ],
+    },
+    tool_response: "Plan updated with summary stop words topic extraction",
+    tool_use_id: "plan-tool",
+  }, "2026-06-09T12:00:01.000Z");
+
+  const packed = storage.packContext({
+    cwd,
+    query: "summary stop words topic extraction",
+    budgetTokens: 500,
+  });
+
+  assert.match(packed.markdown, /Summary Node/u);
+  assert.match(packed.markdown, /summary stop words topic extraction user decision/u);
+  assert.doesNotMatch(packed.markdown, /PostToolUse/u);
+  assert.doesNotMatch(packed.markdown, /update_plan/u);
+  assert.doesNotMatch(packed.markdown, /Plan updated/u);
+  assert.equal(packed.sources.some((source) => source.kind === "summary" && source.node_id), true);
 
   storage.close();
 });
@@ -189,10 +292,8 @@ test("packs direct query matches before adjacent context under tight budgets", (
   });
 
   assert.match(packed.markdown, /tiny-budget-needle direct search match/u);
-  const promptIndex = packed.markdown.indexOf("UserPromptSubmit");
-  const sessionIndex = packed.markdown.indexOf("SessionStart");
-  assert.equal(promptIndex !== -1, true);
-  assert.equal(sessionIndex === -1 || promptIndex < sessionIndex, true);
+  assert.match(packed.markdown, /Summary Node/u);
+  assert.doesNotMatch(packed.markdown, /SessionStart/u);
 
   storage.close();
 });
@@ -249,12 +350,12 @@ test("pack context falls back to global matches when cwd-scoped search is empty"
   });
 
   assert.match(packed.markdown, /codex-lcm retrieval quality plumbing intelligence/u);
-  assert.equal(packed.sources.some((source) => source.kind === "event" && source.session_id === "lcm-meta-session"), true);
+  assert.equal(packed.sources.some((source) => source.kind === "summary" && source.session_id === "lcm-meta-session"), true);
 
   storage.close();
 });
 
-test("pack context ranks matching user prompts before matching tool chatter", () => {
+test("pack context excludes matching tool chatter when summary lineage is available", () => {
   const storage = createStorage({ home: tempHome() });
   const sessionId = "rank-session";
   const cwd = "/tmp/rank";
@@ -283,16 +384,14 @@ test("pack context ranks matching user prompts before matching tool chatter", ()
     budgetTokens: 500,
   });
 
-  const promptIndex = packed.markdown.indexOf("UserPromptSubmit");
-  const toolIndex = packed.markdown.indexOf("PostToolUse");
-  assert.notEqual(promptIndex, -1);
-  assert.notEqual(toolIndex, -1);
-  assert.equal(promptIndex < toolIndex, true);
+  assert.match(packed.markdown, /rank-needle user decision about LCM retrieval quality/u);
+  assert.doesNotMatch(packed.markdown, /PostToolUse/u);
+  assert.doesNotMatch(packed.markdown, /tool-rank/u);
 
   storage.close();
 });
 
-test("pack context supplements scoped tool-only hits with global high-signal matches", () => {
+test("pack context ignores scoped tool-only hits when global high-signal matches exist", () => {
   const storage = createStorage({ home: tempHome() });
 
   ingest(storage, "PostToolUse", {
@@ -318,11 +417,9 @@ test("pack context supplements scoped tool-only hits with global high-signal mat
     budgetTokens: 500,
   });
 
-  const promptIndex = packed.markdown.indexOf("UserPromptSubmit");
-  const toolIndex = packed.markdown.indexOf("PostToolUse");
-  assert.notEqual(promptIndex, -1);
-  assert.notEqual(toolIndex, -1);
-  assert.equal(promptIndex < toolIndex, true);
+  assert.match(packed.markdown, /codex-lcm retrieval quality plumbing intelligence layer user evaluation/u);
+  assert.doesNotMatch(packed.markdown, /PostToolUse/u);
+  assert.doesNotMatch(packed.markdown, /tool-only/u);
 
   storage.close();
 });

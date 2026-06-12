@@ -47,13 +47,22 @@ try {
       id: 2,
       method: "tools/call",
       params: {
+        name: "lcm_health",
+        arguments: {},
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
         name: "lcm_search_sessions",
         arguments: { query: "searchable", limit: 5 },
       },
     },
     {
       jsonrpc: "2.0",
-      id: 3,
+      id: 4,
       method: "tools/call",
       params: {
         name: "lcm_pack_context",
@@ -62,7 +71,7 @@ try {
     },
     {
       jsonrpc: "2.0",
-      id: 4,
+      id: 5,
       method: "tools/call",
       params: {
         name: "lcm_get_session_summary",
@@ -71,7 +80,7 @@ try {
     },
     {
       jsonrpc: "2.0",
-      id: 5,
+      id: 6,
       method: "tools/call",
       params: {
         name: "lcm_get_session_graph",
@@ -80,7 +89,7 @@ try {
     },
     {
       jsonrpc: "2.0",
-      id: 6,
+      id: 7,
       method: "tools/call",
       params: {
         name: "lcm_pack_context",
@@ -89,13 +98,16 @@ try {
     },
   ]);
 
-  assert.equal(responses[1].result.structuredContent.matches[0].session_id, "smoke-session");
-  assert.match(responses[2].result.structuredContent.markdown, /smoke searchable context/u);
-  assert.doesNotMatch(responses[2].result.structuredContent.markdown, /mcp__codex_lcm__/u);
-  assert.equal(responses[3].result.structuredContent.summary.session_id, "smoke-session");
-  assert.match(responses[3].result.structuredContent.summary.overview, /Smoke verified extractive summaries/u);
-  assert.equal(responses[4].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
-  assert.match(responses[5].result.structuredContent.markdown, /smoke-old-dag-marker/u);
+  assert.equal(responses[1].result.structuredContent.health.summary_node_count > 0, true);
+  assert.equal(responses[2].result.structuredContent.matches[0].session_id, "smoke-session");
+  assert.match(responses[3].result.structuredContent.markdown, /smoke searchable context/u);
+  assert.doesNotMatch(responses[3].result.structuredContent.markdown, /mcp__codex_lcm__/u);
+  assert.equal(responses[4].result.structuredContent.summary.session_id, "smoke-session");
+  assert.match(responses[4].result.structuredContent.summary.overview, /Smoke verified extractive summaries/u);
+  assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
+  assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "summary"), true);
+  assert.equal(responses[5].result.structuredContent.edges.some((edge: { kind: string }) => edge.kind === "summary_source"), true);
+  assert.match(responses[6].result.structuredContent.markdown, /smoke-old-dag-marker/u);
   assert.doesNotMatch(fs.readFileSync(path.join(home, "events.jsonl"), "utf8"), /sk-proj-secret-value/u);
 
   process.stdout.write(`Smoke test passed with CODEX_LCM_HOME=${home}\n`);

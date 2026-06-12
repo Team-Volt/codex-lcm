@@ -66,6 +66,8 @@ SQLite tables:
 - `event_fts`
 - `session_summaries`
 - `session_summary_fts`
+- `summary_nodes`
+- `summary_node_fts`
 - `graph_nodes`
 - `graph_edges`
 
@@ -84,14 +86,23 @@ Each summary records:
 - topics
 - key user prompts and notes
 - assistant outcomes from `Stop` and `PreCompact`
-- tool names
 - source event IDs
 
 `session_summary_fts` lets broad topic queries match these compact clues before
 the caller loads raw events. `lcm_get_session_summary` exposes a summary
-directly. `lcm_pack_context` includes summaries first for moderate and large
-budgets, but skips them for very tight packs where exact raw matches would be
-crowded out.
+directly.
+
+`summary_nodes` stores a multi-depth summary DAG. D0 nodes summarize bounded
+chunks of high-signal source events. D1 and deeper nodes summarize lower-depth
+summary nodes. Each node stores depth, source type, source IDs, source event IDs,
+topic terms, token estimates, and a deterministic node ID derived from its
+lineage. `summary_node_fts` indexes the node text and topics.
+
+`lcm_pack_context` searches summary nodes first, ranks direct lower-depth hits
+ahead of broad higher-depth hits, and then expands only the selected source
+lineage. For tight budgets it uses a compact summary-node form so the matched
+source text is not crowded out by metadata. Raw events remain available through
+`lcm_get_session`.
 
 Summary rebuilds are bounded for long sessions. Storage reads early high-signal
 events, latest high-signal events, and a short recent tail, then deduplicates the
@@ -109,6 +120,7 @@ Node kinds:
 - `turn`: one per session/turn ID when hook payloads include `turn_id`.
 - `event`: one per stored raw event.
 - `checkpoint`: structural checkpoint nodes created on `PreCompact` and every 50 indexed events.
+- `summary`: derived summary nodes at D0, D1, and deeper levels.
 
 Edge kinds:
 
@@ -116,6 +128,7 @@ Edge kinds:
 - `next`: previous event to next event within the same session.
 - `tool_result`: matching `PreToolUse` to `PostToolUse` with the same `tool_use_id`.
 - `checkpoint`: session to checkpoint.
+- `summary_source`: summary node to source event node or lower-depth summary node.
 
 Before inserting an edge, storage runs a recursive reachability check from the prospective child to the prospective parent. If the parent is already reachable from the child, the edge is rejected because it would create a cycle.
 
@@ -123,17 +136,17 @@ For very long sessions, callers should prefer bounded graph and event access:
 
 - `lcm_get_session` with `limit` and `cursor`.
 - `lcm_get_session_graph` with a bounded `limit`.
-- `lcm_pack_context`, which searches matching events first, then adds nearby graph context, checkpoints, and recent tails.
+- `lcm_pack_context`, which searches summary nodes first and expands bounded source lineage.
 
-Search uses strict SQLite FTS first against summaries and events. If a non-empty
-query has no strict hits, LCM builds a relaxed query from non-stopword terms and
-retries. Summary matches receive extra weight because they represent extracted
-session-level substance rather than incidental raw text. Session search still
-ranks by query-term coverage before recency, so a newer shallow hit should not
-hide an older session with more of the requested substance. For context packing,
-cwd remains the first boundary, but a cwd-scoped query that finds no matches or
-only finds low-signal tool events falls back to a bounded global search before
-returning an empty or misleadingly narrow pack.
+Search uses strict SQLite FTS first against summary nodes, session summaries,
+and events. If a non-empty query has no strict hits, LCM builds a relaxed query
+from signal terms and retries. Summary-node matches receive extra weight because
+they represent extracted session substance rather than incidental raw text.
+Session search still ranks by query-term coverage before recency, so a newer
+shallow hit should not hide an older session with more of the requested
+substance. For context packing, cwd remains the first boundary, but an empty
+cwd-scoped query falls back to bounded global search before returning an empty
+or misleadingly narrow pack.
 
 ## MCP Protocol
 

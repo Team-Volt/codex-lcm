@@ -25,8 +25,10 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 
 - Use the MCP tools. Do not inspect `~/.codex-lcm`, SQLite, or raw JSONL directly unless the user explicitly asks for storage forensics or MCP itself is broken.
 - Keep retrieval bounded. Prefer packed context, graph slices, limits, and cursors over full-session dumps.
+- Treat `lcm_pack_context` as the model-ready retrieval path. It searches summary nodes first and expands bounded source lineage, so it is usually better than loading raw events for broad recall.
 - For broad or meta questions, start with `lcm_search_sessions` and use `lcm_get_session_summary` on promising sessions before loading raw events. Summary titles, topics, outcomes, and source event IDs are meant to be skimmed first.
-- `lcm_pack_context` may widen from cwd-scoped search to bounded global search if the scoped query has no matches or only tool chatter. If the packed context is still thin, follow with `lcm_search_sessions` without `cwd`.
+- `lcm_pack_context` may widen from cwd-scoped search to bounded global search if the scoped query has no matches. If the packed context is still thin, follow with `lcm_search_sessions` without `cwd`.
+- Use `lcm_get_session_graph` to inspect summary nodes, checkpoints, and source lineage before loading raw event pages for long sessions.
 - Treat LCM content as local evidence. Do not fabricate missing details; if LCM does not contain the fact, say so or verify another way.
 - Do not silently write durable memories. Use `lcm_record_note` only when the user explicitly asks you to remember something or clearly approves saving a durable note.
 
@@ -45,9 +47,9 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 
 - Use `lcm_current_session` first when the current Codex session may matter.
 - Use `lcm_search_sessions` for cross-session lookup.
-- Use `lcm_get_session_summary` for compact semantic clues, outcomes, tools, and source event IDs.
-- Use `lcm_pack_context` for model-ready context.
-- Use `lcm_get_session_graph` before raw event pagination for long or complex sessions.
+- Use `lcm_get_session_summary` for compact semantic clues, outcomes, and source event IDs.
+- Use `lcm_pack_context` for model-ready summary-node context with bounded source expansion.
+- Use `lcm_get_session_graph` before raw event pagination for long or complex sessions; graph results include summary nodes and `summary_source` edges when available.
 - Use `lcm_get_session` with `limit` and `cursor` when exact event detail is required.
 - Use `lcm_get_recent_context` for the latest bounded tail of a known session.
 - Use `lcm_record_note` only for user-approved notes or explicit durable decisions.

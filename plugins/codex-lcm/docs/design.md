@@ -25,7 +25,7 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 Storage defaults to `~/.codex-lcm` and can be overridden with `CODEX_LCM_HOME`.
 
 - `events.jsonl`: append-only sanitized raw event log. This is written first and must succeed even if SQLite indexing fails.
-- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `session_summaries`, `session_summary_fts`, `graph_nodes`, and `graph_edges`.
+- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `session_summaries`, `session_summary_fts`, `summary_nodes`, `summary_node_fts`, `graph_nodes`, and `graph_edges`.
 - Events include schema version, event ID, timestamp, hook event, session ID, cwd, optional repo root, optional git branch, sanitized payload, redaction metadata, truncation metadata, and a SHA-256 hash of the original stdin.
 
 Raw event capture is lossless for retained sanitized payloads. Privacy and safety controls run before persistence: obvious secrets are redacted, oversized strings/objects are truncated with hashes and byte counts, and binary/image-like blobs are replaced with metadata.
@@ -36,21 +36,23 @@ The DAG layer is deterministic and rebuildable from indexed raw events:
 - Turn nodes group events with the same `turn_id`.
 - Event nodes reference raw event IDs.
 - Checkpoint nodes summarize structure at `PreCompact` and every 50 indexed events.
-- Edges are typed as `contains`, `next`, `tool_result`, or `checkpoint`.
+- Summary nodes summarize high-signal event chunks and lower-depth summary nodes.
+- Edges are typed as `contains`, `next`, `tool_result`, `checkpoint`, or `summary_source`.
 
 Edge insertion rejects self-edges and recursive back edges, so the derived graph remains acyclic. Graph failures are treated as index failures; the raw JSONL event has already been written and remains recoverable.
 
 The summary layer is also deterministic and rebuildable. It extracts compact
 session-level clues from high-signal events: user prompts, notes, stop messages,
-pre-compact messages, and tool names. A summary stores title, overview, topics,
-key prompts, outcomes, tools, and source event IDs. It does not use an LLM,
-embeddings, or network calls. Its job is to improve ranking and scanning while
-keeping raw events as the evidence layer.
+and pre-compact messages. Session summaries store title, overview, topics, key
+prompts, outcomes, and source event IDs. Summary nodes form a multi-depth DAG:
+D0 nodes summarize bounded high-signal event chunks, and D1+ nodes summarize
+lower-depth summary nodes. No LLM, embeddings, or network calls are required.
+The job is ranking and context packing; raw events stay the evidence layer.
 
-For long sessions, the summary builder samples early high-signal events, latest
-high-signal events, and recent events. It keeps the first task framing, the
-newest outcomes, and recent tool context without reading the whole session on
-every hook.
+For long sessions, the session-summary builder samples early high-signal events,
+latest high-signal events, and recent events. Summary nodes are chunked and
+fanned out into deeper nodes so retrieval can search compact text and expand the
+matched lineage instead of scanning or packing an entire long transcript.
 
 ## Hook Behavior
 
@@ -60,14 +62,14 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 
 ## MCP Tools
 
-- `lcm_health`: report storage paths, index status, event count, session count, and current configuration.
+- `lcm_health`: report storage paths, index status, event count, session count, summary-node count, and current configuration.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
 - `lcm_search_sessions`: cross-session search using SQLite FTS, with recent-session fallback for empty queries and relaxed broad-query retry when strict FTS has no hits.
 - `lcm_get_session`: retrieve a session by ID with sanitized raw events; supports `limit` and `cursor` for long sessions.
 - `lcm_get_session_summary`: retrieve the deterministic extractive summary for a session, including topics and source event pointers.
-- `lcm_get_session_graph`: retrieve a bounded DAG slice for a session.
+- `lcm_get_session_graph`: retrieve a bounded DAG slice for a session, including summary nodes when present.
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
-- `lcm_pack_context`: pack matching summaries, events, nearby graph context, checkpoints, notes, and recent events into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search when scoped retrieval is empty or only finds low-signal tool chatter.
+- `lcm_pack_context`: pack matching summary nodes and bounded source lineage into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search when scoped retrieval is empty.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
 
 The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex when to call LCM and how to avoid loading entire long sessions unnecessarily.

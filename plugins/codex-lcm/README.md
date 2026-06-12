@@ -124,27 +124,42 @@ Edges are inserted with a recursive cycle check. The graph is derived from raw e
 
 SQLite also stores deterministic extractive summaries in `session_summaries` and
 `session_summary_fts`. A summary contains a title, overview, topics, key user
-prompts, outcomes, tools used, and source event IDs. It is not an LLM summary
-and it does not replace raw events. It is a compact, rebuildable index that helps
-agents find broad "semantic clue" matches before they decide which raw events or
-graph slices to inspect.
+prompts, outcomes, and source event IDs. It is not an LLM summary and it does
+not replace raw events. It is a compact, rebuildable index that helps agents
+find broad "semantic clue" matches before they decide which raw events or graph
+slices to inspect.
+
+The summary-node layer adds a second derived index:
+
+- D0 summary nodes summarize bounded chunks of high-signal events.
+- D1 and deeper summary nodes summarize lower-depth summary nodes.
+- `summary_source` edges connect summary nodes back to their child nodes or raw event nodes.
+- `summary_node_fts` lets retrieval search the summary DAG before falling back to raw event FTS.
+
+This mirrors the lossless-context pattern used by systems such as lossless-claw
+and Hermes LCM: search compact summary nodes first, then expand the selected
+source lineage under the caller's token budget. Raw transcript events remain
+available through `lcm_get_session`.
 
 For long sessions, summary rebuilds use a bounded sample of early high-signal
 events, latest high-signal events, and recent events. That keeps ingestion fast
 while preserving the initial task framing and the latest outcome.
 
-For long sessions, `lcm_get_session` accepts `limit` and `cursor`, `lcm_get_session_graph` returns bounded graph slices, and `lcm_pack_context` prioritizes matching events plus nearby graph context before adding recent tails. This avoids missing old-but-relevant events just because they are outside the latest event window.
+For long sessions, `lcm_get_session` accepts `limit` and `cursor`,
+`lcm_get_session_graph` returns bounded graph slices including summary nodes,
+and `lcm_pack_context` prioritizes matching summary nodes plus bounded source
+expansion. This avoids missing old-but-relevant events just because they are
+outside the latest event window.
 
 For broad questions, search is intentionally two-pass. Codex LCM tries strict
 SQLite FTS first, then falls back to a relaxed term query when the strict query
 has no hits. Session results are ranked by substantive query-term coverage before
 recency. `lcm_pack_context` keeps cwd scoping when it finds high-signal matches,
-but if a cwd-scoped query is empty or only finds tool chatter, it performs a
-bounded global fallback so broad meta questions do not return empty or
-misleadingly narrow context just because the current directory is too narrow.
-For moderate and larger context budgets, packed context includes matching
-session summaries before raw event blocks. For tight multi-session packs, raw
-evidence wins so exact matches are not crowded out by summaries.
+but if a cwd-scoped query is empty it performs a bounded global fallback so broad
+meta questions do not return empty or misleadingly narrow context just because
+the current directory is too narrow. Packed context excludes LCM self-reference
+tool chatter and prefers summary-node source lineage over arbitrary raw tool
+output.
 
 ## Privacy And Safety
 

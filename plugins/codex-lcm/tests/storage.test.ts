@@ -144,7 +144,7 @@ test("records notes and packs context within a budget", () => {
   storage.close();
 });
 
-test("packs extractive session summaries before raw events", () => {
+test("packs summary nodes before bounded source events", () => {
   const home = tempHome();
   const storage = createStorage({ home });
 
@@ -175,13 +175,13 @@ test("packs extractive session summaries before raw events", () => {
     budgetTokens: 350,
   });
 
-  const summaryIndex = packed.markdown.indexOf("Session Summary");
-  const rawIndex = packed.markdown.indexOf("UserPromptSubmit");
+  const summaryIndex = packed.markdown.indexOf("Summary Node");
+  const sourceIndex = packed.markdown.indexOf("Source Events");
   assert.notEqual(summaryIndex, -1);
-  assert.notEqual(rawIndex, -1);
-  assert.equal(summaryIndex < rawIndex, true);
+  assert.notEqual(sourceIndex, -1);
+  assert.equal(summaryIndex < sourceIndex, true);
   assert.match(packed.markdown, /Topics: .*summarization/u);
-  assert.match(packed.markdown, /Sources: /u);
+  assert.match(packed.markdown, /UserPromptSubmit/u);
   assert.equal(packed.sources.some((source) => source.kind === "summary" && source.session_id === "summary-session"), true);
 
   storage.close();
@@ -208,6 +208,71 @@ test("search sessions uses extracted summary topics for broad semantic clues", (
   });
 
   assert.deepEqual(matches.map((match) => match.session_id), ["semantic-session"]);
+
+  storage.close();
+});
+
+test("session summary topics prefer signal terms over prompt filler", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "topic-quality-session",
+      cwd: "/tmp/topic-quality",
+      prompt: "What is the summary stop words in the code? Why is that there? Is that kind of hacky? If so, improve it.",
+    }),
+    env: {},
+    now,
+  }));
+
+  const summary = storage.getSessionMemorySummary("topic-quality-session");
+
+  assert.ok(summary);
+  assert.deepEqual(summary.topics.slice(0, 5), ["summary", "stop", "words", "code", "hacky"]);
+  assert.equal(summary.topics.includes("that"), false);
+  assert.equal(summary.topics.includes("there"), false);
+
+  storage.close();
+});
+
+test("packed summaries expose latest matching prompts in long sessions", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "summary-tail-session";
+  const cwd = "/tmp/summary-tail";
+
+  for (let index = 0; index < 8; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: sessionId,
+        cwd,
+        prompt: index === 7
+          ? "LATEST-TAIL-PROMPT improve codex-lcm retrieval summaries"
+          : `older prompt ${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+
+  const summary = storage.getSessionMemorySummary(sessionId);
+  assert.ok(summary);
+  assert.deepEqual(summary.topics.slice(0, 2), ["latest-tail-prompt", "codex-lcm"]);
+
+  const packed = storage.packContext({
+    cwd,
+    query: "LATEST-TAIL-PROMPT retrieval summaries",
+    budgetTokens: 320,
+  });
+
+  const latestPromptIndex = packed.markdown.indexOf("LATEST-TAIL-PROMPT");
+  const rawEventIndex = packed.markdown.indexOf("UserPromptSubmit");
+  assert.notEqual(latestPromptIndex, -1);
+  assert.notEqual(rawEventIndex, -1);
+  assert.equal(latestPromptIndex < rawEventIndex, true);
 
   storage.close();
 });
