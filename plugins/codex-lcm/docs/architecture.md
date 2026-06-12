@@ -71,7 +71,7 @@ SQLite tables:
 - `graph_nodes`
 - `graph_edges`
 
-The first version creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
+Codex LCM creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
 
 ## Summary Index
 

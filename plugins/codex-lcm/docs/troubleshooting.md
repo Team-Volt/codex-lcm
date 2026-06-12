@@ -49,7 +49,10 @@ For native plugin installs, Codex discovers hooks through `.codex-plugin/plugin.
 "hooks": "./hooks/hooks.codex.json"
 ```
 
-The local plugin-creator validator bundled with this Codex build currently rejects the `hooks` field, but the live Codex CLI/TUI and the installed AgentMemory plugin both use that field for plugin-owned hook discovery. If hooks do not prompt for review after install, verify that the field is still present.
+Some plugin validation tools may lag the live Codex plugin schema and complain
+about the `hooks` field. The live Codex CLI/TUI uses this field for plugin-owned
+hook discovery. If hooks do not prompt for review after install, verify that the
+field is still present.
 
 ## Skill Does Not Appear
 
@@ -78,11 +81,13 @@ If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and
 
 The implementation uses Node 22's `node:sqlite`. Test and smoke scripts run with `--no-warnings` so experimental runtime warnings do not interfere with MCP stdout parsing.
 
-## Plugin Validation
+## Plugin Validation And Tests
 
-The local plugin-creator validator may require Python dependencies such as PyYAML. If it is unavailable, validate the JSON files directly and run:
+The plugin-creator validator may require Python dependencies such as PyYAML. If
+it is unavailable, validate the JSON files directly and run:
 
 ```sh
 npm test
 npm run smoke
+npm --cache /tmp/codex-lcm-npm-cache pack --dry-run
 ```
