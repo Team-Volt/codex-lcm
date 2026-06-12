@@ -94,3 +94,49 @@ test("MCP tools search and retrieve synthetic hook data", () => {
   assert.match(responses[3].result.structuredContent.summary.title, /searchable MCP payload/u);
   assert.equal(responses[4].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
 });
+
+test("MCP search sessions exposes best-match metadata and current-session exclusion", () => {
+  const home = tempHome();
+  const cwd = "/tmp/mcp-discovery";
+  assert.equal(runCli(["hook", "UserPromptSubmit"], {
+    input: JSON.stringify({
+      session_id: "mcp-prior",
+      cwd,
+      prompt: "Prior summary DAG ranking source lineage implementation history.",
+    }),
+    env: { CODEX_LCM_HOME: home },
+  }).status, 0);
+  assert.equal(runCli(["hook", "UserPromptSubmit"], {
+    input: JSON.stringify({
+      session_id: "mcp-current",
+      cwd,
+      prompt: "Current chat repeats summary DAG ranking source lineage search terms.",
+    }),
+    env: { CODEX_LCM_HOME: home },
+  }).status, 0);
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_search_sessions",
+        arguments: {
+          cwd,
+          query: "summary DAG ranking source lineage",
+          limit: 5,
+          excludeCurrentSession: true,
+        },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const matches = responses[1].result.structuredContent.matches;
+  assert.deepEqual(matches.map((match: { session_id: string }) => match.session_id), ["mcp-prior"]);
+  assert.equal(matches[0].best_match.kind, "summary_node");
+  assert.match(matches[0].best_match.snippet, /summary DAG ranking source lineage/u);
+  assert.equal(["high", "medium", "low"].includes(matches[0].discovery.confidence), true);
+  assert.equal(typeof matches[0].discovery.score, "number");
+});

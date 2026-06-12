@@ -38,8 +38,8 @@ export type SessionMemorySummary = {
   source_event_ids: string[];
 };
 
-export const SUMMARY_ALGORITHM_VERSION = 2;
-export const SUMMARY_NODE_VERSION = 1;
+export const SUMMARY_ALGORITHM_VERSION = 3;
+export const SUMMARY_NODE_VERSION = 2;
 export const SUMMARY_NODE_CHUNK_SIZE = 8;
 export const SUMMARY_NODE_FANOUT = 4;
 export const SUMMARY_NODE_MAX_DEPTH = 8;
@@ -379,10 +379,34 @@ export function eventSignalText(event: NormalizedEvent): string {
 }
 
 export function isSummarySourceEvent(event: NormalizedEvent): boolean {
+  if (isGeneratedSuggestionEvent(event)) return false;
   return event.hook_event === "UserPromptSubmit" ||
     event.hook_event === "Note" ||
     event.hook_event === "Stop" ||
     event.hook_event === "PreCompact";
+}
+
+export function isGeneratedSuggestionEvent(event: NormalizedEvent): boolean {
+  const signal = eventSignalText(event);
+  if (event.hook_event === "UserPromptSubmit") {
+    return /^#\s*overview\s+generate\s+0\s+to\s+3\s+hyperpersonalized\s+suggestions\s+for\s+what\s+this\s+user\s+can\s+do\s+with\s+codex\b/iu.test(signal);
+  }
+  if (event.hook_event === "Stop") {
+    return isSuggestionJson(signal);
+  }
+  return false;
+}
+
+function isSuggestionJson(text: string): boolean {
+  if (!text.trimStart().startsWith("{")) return false;
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const record = parsed as Record<string, unknown>;
+    return Array.isArray(record.suggestions) && Object.keys(record).every((key) => key === "suggestions");
+  } catch {
+    return false;
+  }
 }
 
 export function takeHeadTail<T>(values: T[], limit: number, headCount: number): T[] {

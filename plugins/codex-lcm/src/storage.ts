@@ -17,6 +17,7 @@ import {
   buildSessionMemorySummary,
   estimateTokenCount,
   eventSignalText,
+  isGeneratedSuggestionEvent,
   isSummarySourceEvent,
   matchesQueryText,
   queryTermHitCount,
@@ -47,6 +48,8 @@ export type SearchSessionArgs = {
   limit?: number;
   cwd?: string;
   repoRoot?: string;
+  excludeCurrentSession?: boolean;
+  excludeSessionIds?: string[];
 };
 
 type SummaryNodeSearchArgs = SearchSessionArgs & {
@@ -62,6 +65,27 @@ export type SessionSummary = {
   git_branch?: string;
   event_count: number;
   match_count?: number;
+  best_match?: SessionSearchMatch;
+  discovery?: SessionDiscovery;
+};
+
+export type SessionSearchMatch = {
+  kind: "summary_node" | "session_summary" | "event";
+  snippet: string;
+  timestamp: string;
+  score: number;
+  node_id?: string;
+  event_id?: string;
+  depth?: number;
+  topics?: string[];
+  source_event_count?: number;
+  source_token_count?: number;
+};
+
+export type SessionDiscovery = {
+  confidence: "high" | "medium" | "low";
+  score: number;
+  reasons: string[];
 };
 
 export type SessionDetail = {
@@ -189,16 +213,20 @@ export class LcmStorage {
 
   searchSessions(args: SearchSessionArgs): SessionSummary[] {
     const limit = clampLimit(args.limit, 10);
+    const excludedSessionIds = this.excludedSearchSessionIds(args);
     if (!this.db) {
       const query = args.query?.trim() ?? "";
       return summarizeSessions(readRawEvents(this.config.rawLogPath)
         .filter((event) => !args.cwd || event.cwd === args.cwd)
         .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
+        .filter((event) => !excludedSessionIds.has(event.session_id))
+        .filter((event) => isSearchDiscoveryEvent(event, query))
         .filter((event) => matchesQueryText(JSON.stringify(event), query)))
         .slice(0, limit);
     }
     const query = args.query?.trim() ?? "";
     if (query.length === 0) {
+      const searchLimit = excludedSessionIds.size > 0 ? Math.max(limit * 4, 20) : limit;
       return this.db.prepare(`
         SELECT session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count
         FROM sessions
@@ -206,25 +234,32 @@ export class LcmStorage {
           AND (?2 IS NULL OR repo_root = ?2)
         ORDER BY last_seen DESC
         LIMIT ?3
-      `).all(args.cwd ?? null, args.repoRoot ?? null, limit).map(rowToSessionSummary);
+      `).all(args.cwd ?? null, args.repoRoot ?? null, searchLimit)
+        .map(rowToSessionSummary)
+        .filter((session) => !excludedSessionIds.has(session.session_id))
+        .slice(0, limit);
     }
 
     let rows: unknown[] = [];
     const eventStatement = this.db.prepare(`
         SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
-               e.raw_json AS match_text, e.timestamp AS match_timestamp, 1 AS match_weight
+               e.raw_json AS match_text, e.timestamp AS match_timestamp, 1 AS match_weight,
+               'event' AS match_kind, e.event_id AS match_event_id
         FROM event_fts f
         JOIN events e ON e.event_id = f.event_id
         JOIN sessions s ON s.session_id = e.session_id
         WHERE event_fts MATCH ?1
           AND (?2 IS NULL OR s.cwd = ?2)
           AND (?3 IS NULL OR s.repo_root = ?3)
+          AND e.hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact')
         ORDER BY bm25(event_fts) ASC, e.timestamp DESC
         LIMIT ?4
       `);
     const summaryStatement = this.db.prepare(`
         SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
-               ss.summary_text AS match_text, ss.updated_at AS match_timestamp, 3 AS match_weight
+               ss.summary_text AS match_text, ss.updated_at AS match_timestamp, 3 AS match_weight,
+               'session_summary' AS match_kind, ss.topics_json AS match_topics_json,
+               ss.source_event_ids_json AS match_source_event_ids_json
         FROM session_summary_fts f
         JOIN session_summaries ss ON ss.session_id = f.session_id
         JOIN sessions s ON s.session_id = ss.session_id
@@ -236,7 +271,11 @@ export class LcmStorage {
       `);
     const summaryNodeStatement = this.db.prepare(`
         SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
-               n.summary_text AS match_text, n.latest_at AS match_timestamp, 4 AS match_weight
+               n.summary_text AS match_text, n.latest_at AS match_timestamp, 4 AS match_weight,
+               'summary_node' AS match_kind, n.node_id AS match_node_id, n.depth AS match_depth,
+               n.topics_json AS match_topics_json,
+               n.source_event_ids_json AS match_source_event_ids_json,
+               n.source_token_count AS match_source_token_count
         FROM summary_node_fts f
         JOIN summary_nodes n ON n.node_id = f.node_id
         JOIN sessions s ON s.session_id = n.session_id
@@ -246,15 +285,26 @@ export class LcmStorage {
         ORDER BY bm25(summary_node_fts) ASC, n.depth DESC, n.latest_at DESC
         LIMIT ?4
       `);
+    searchLoop:
     for (const ftsQuery of toFtsQueries(query)) {
-      rows = summaryNodeStatement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
-      if (rows.length > 0) break;
-      rows = summaryStatement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
-      if (rows.length > 0) break;
-      rows = eventStatement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
-      if (rows.length > 0) break;
+      for (const statement of [summaryNodeStatement, summaryStatement, eventStatement]) {
+        const candidateRows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
+        rows = candidateRows
+          .filter((row) => !excludedSessionIds.has(String((row as { session_id: string }).session_id)))
+          .filter((row) => isSearchDiscoveryRow(row, query));
+        if (rows.length > 0) break searchLoop;
+      }
     }
     return rankSessionRows(rows, query).slice(0, limit);
+  }
+
+  private excludedSearchSessionIds(args: SearchSessionArgs): Set<string> {
+    const excluded = new Set(args.excludeSessionIds?.filter((sessionId) => sessionId.trim().length > 0) ?? []);
+    if (args.excludeCurrentSession) {
+      const currentSession = this.getCurrentSession({ cwd: args.cwd, repoRoot: args.repoRoot });
+      if (currentSession) excluded.add(currentSession.session_id);
+    }
+    return excluded;
   }
 
   getCurrentSession(args: { sessionId?: string; cwd?: string; repoRoot?: string } = {}): SessionSummary | undefined {
@@ -1375,7 +1425,8 @@ export class LcmStorage {
     `).all(sessionId);
     return rows
       .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
-      .filter((event) => !isCodexLcmToolEvent(event));
+      .filter((event) => !isCodexLcmToolEvent(event))
+      .filter(isSummarySourceEvent);
   }
 
   private getSummaryEventsForSession(sessionId: string): NormalizedEvent[] {
@@ -1403,7 +1454,8 @@ export class LcmStorage {
     `).all(sessionId, SUMMARY_RECENT_EVENT_LIMIT);
     return uniqueEvents([...earlySignals, ...latestSignals, ...recentEvents]
       .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
-      .filter((event) => !isCodexLcmToolEvent(event)))
+      .filter((event) => !isCodexLcmToolEvent(event))
+      .filter((event) => !isGeneratedSuggestionEvent(event)))
       .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.event_id.localeCompare(b.event_id));
   }
 }
@@ -1517,6 +1569,7 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
     matchCount: number;
     lastMatchAt: string;
     firstOrder: number;
+    bestMatch?: SessionSearchMatch;
   }>();
   rows.forEach((row, order) => {
     const record = row as Record<string, unknown>;
@@ -1524,28 +1577,222 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
     const matchAt = String(record.match_timestamp ?? record.last_seen ?? "");
     const matchText = typeof record.match_text === "string" ? record.match_text : "";
     const weight = typeof record.match_weight === "number" ? record.match_weight : 1;
+    const rowScore = queryTermHitCount(matchText, query) * weight;
+    const bestMatch = rowToSessionSearchMatch(record, query, rowScore);
     const existing = sessions.get(sessionId);
     if (!existing) {
       sessions.set(sessionId, {
         summary: rowToSessionSummary(row),
-        score: queryTermHitCount(matchText, query) * weight,
+        score: rowScore,
         matchCount: 1,
         lastMatchAt: matchAt,
         firstOrder: order,
+        bestMatch,
       });
       return;
     }
-    existing.score += queryTermHitCount(matchText, query) * weight;
+    existing.score += rowScore;
     existing.matchCount += 1;
     if (matchAt > existing.lastMatchAt) existing.lastMatchAt = matchAt;
+    if (bestMatch && (!existing.bestMatch || compareSearchMatches(bestMatch, existing.bestMatch) < 0)) {
+      existing.bestMatch = bestMatch;
+    }
   });
   return [...sessions.values()]
+    .map((entry) => ({
+      ...entry,
+      discovery: sessionDiscovery(entry, query),
+    }))
     .sort((a, b) =>
+      b.discovery.score - a.discovery.score ||
       b.score - a.score ||
       b.matchCount - a.matchCount ||
       b.lastMatchAt.localeCompare(a.lastMatchAt) ||
       a.firstOrder - b.firstOrder)
-    .map((entry) => entry.summary);
+    .map((entry) => ({
+      ...entry.summary,
+      match_count: entry.matchCount,
+      ...(entry.bestMatch ? { best_match: entry.bestMatch } : {}),
+      discovery: entry.discovery,
+    }));
+}
+
+function sessionDiscovery(entry: {
+  summary: SessionSummary;
+  score: number;
+  matchCount: number;
+  bestMatch?: SessionSearchMatch;
+}, query: string): SessionDiscovery {
+  let score = entry.score;
+  const reasons: string[] = [];
+  const match = entry.bestMatch;
+
+  if (match?.kind === "summary_node") {
+    score += 10;
+    reasons.push("summary-node match");
+  } else if (match?.kind === "session_summary") {
+    score += 6;
+    reasons.push("session-summary match");
+  } else if (match?.kind === "event") {
+    reasons.push("raw-event match");
+  }
+
+  const sourceEventCount = match?.source_event_count ?? 0;
+  if (sourceEventCount >= 4) {
+    score += 12;
+    reasons.push("source-rich summary");
+  } else if (sourceEventCount >= 2) {
+    score += 6;
+    reasons.push("multiple source events");
+  }
+
+  const sourceTokenCount = match?.source_token_count ?? 0;
+  if (sourceTokenCount >= 600) {
+    score += 8;
+    reasons.push("substantive source text");
+  } else if (sourceTokenCount >= 160) {
+    score += 4;
+    reasons.push("nontrivial source text");
+  }
+
+  if (entry.summary.event_count >= 8) {
+    score += 8;
+    reasons.push("longer session");
+  } else if (entry.summary.event_count >= 3) {
+    score += 4;
+    reasons.push("multi-event session");
+  } else if (entry.summary.event_count >= 2) {
+    score += 2;
+    reasons.push("prompt-outcome session");
+  }
+
+  if (entry.matchCount >= 2) {
+    score += Math.min(entry.matchCount, 4) * 2;
+    reasons.push("multiple matches");
+  }
+
+  if (isBroadDiscoveryQuery(query) && entry.summary.event_count <= 1) {
+    score -= 24;
+    reasons.push("tiny session penalty");
+  }
+
+  const confidence = score >= 34 ? "high" : score >= 18 ? "medium" : "low";
+  return {
+    confidence,
+    score,
+    reasons,
+  };
+}
+
+function isSearchDiscoveryRow(row: unknown, query: string): boolean {
+  const record = row as Record<string, unknown>;
+  if (searchMatchKind(record.match_kind) !== "event") return true;
+  if (typeof record.match_text !== "string") return true;
+  try {
+    return isSearchDiscoveryEvent(JSON.parse(record.match_text) as NormalizedEvent, query);
+  } catch {
+    return true;
+  }
+}
+
+function isSearchDiscoveryEvent(event: NormalizedEvent, query: string): boolean {
+  if (isGeneratedSuggestionEvent(event)) return isExplicitSuggestionQuery(query);
+  return isSummarySourceEvent(event);
+}
+
+function isExplicitSuggestionQuery(query: string): boolean {
+  return /\b(hyperpersonalized|suggestion|suggestions)\b/iu.test(query);
+}
+
+function isBroadDiscoveryQuery(query: string): boolean {
+  return discoveryQueryTermCount(query) >= 4;
+}
+
+function discoveryQueryTermCount(query: string): number {
+  const terms = new Set<string>();
+  for (const term of query.toLowerCase().split(/[^\p{L}\p{N}_-]+/u)) {
+    const normalized = term.replace(/^-+|-+$/gu, "");
+    if (normalized.length >= 3 || /[-_]/u.test(normalized) || /\d/u.test(normalized)) {
+      terms.add(normalized);
+    }
+  }
+  return terms.size;
+}
+
+function rowToSessionSearchMatch(record: Record<string, unknown>, query: string, score: number): SessionSearchMatch | undefined {
+  const kind = searchMatchKind(record.match_kind);
+  if (!kind) return undefined;
+  const text = searchMatchText(kind, record.match_text);
+  const snippet = bestMatchSnippet(text, query);
+  if (snippet.length === 0) return undefined;
+  const topics = parseStringArray(record.match_topics_json);
+  const sourceEventCount = parseStringArray(record.match_source_event_ids_json).length;
+  const sourceTokenCount = Number(record.match_source_token_count ?? 0);
+  return {
+    kind,
+    snippet,
+    timestamp: String(record.match_timestamp ?? ""),
+    score,
+    ...(typeof record.match_node_id === "string" && record.match_node_id.length > 0 ? { node_id: record.match_node_id } : {}),
+    ...(typeof record.match_event_id === "string" && record.match_event_id.length > 0 ? { event_id: record.match_event_id } : {}),
+    ...(record.match_depth !== undefined ? { depth: Number(record.match_depth) } : {}),
+    ...(topics.length > 0 ? { topics: topics.slice(0, 12) } : {}),
+    ...(sourceEventCount > 0 ? { source_event_count: sourceEventCount } : {}),
+    ...(sourceTokenCount > 0 ? { source_token_count: sourceTokenCount } : {}),
+  };
+}
+
+function searchMatchKind(value: unknown): SessionSearchMatch["kind"] | undefined {
+  if (value === "summary_node" || value === "session_summary" || value === "event") return value;
+  return undefined;
+}
+
+function searchMatchText(kind: SessionSearchMatch["kind"], value: unknown): string {
+  if (typeof value !== "string") return "";
+  if (kind !== "event") return value;
+  try {
+    const event = JSON.parse(value) as NormalizedEvent;
+    return eventSignalText(event) || `${event.hook_event}: ${JSON.stringify(event.payload)}`;
+  } catch {
+    return value;
+  }
+}
+
+function compareSearchMatches(a: SessionSearchMatch, b: SessionSearchMatch): number {
+  return b.score - a.score ||
+    searchMatchKindWeight(b.kind) - searchMatchKindWeight(a.kind) ||
+    b.timestamp.localeCompare(a.timestamp);
+}
+
+function searchMatchKindWeight(kind: SessionSearchMatch["kind"]): number {
+  if (kind === "summary_node") return 3;
+  if (kind === "session_summary") return 2;
+  return 1;
+}
+
+function bestMatchSnippet(text: string, query: string, maxChars = 220): string {
+  const compactText = compactWhitespace(text);
+  if (compactText.length === 0) return "";
+  const scoredLines = text.split(/\r?\n/u)
+    .map(compactWhitespace)
+    .filter((line) => line.length > 0)
+    .map((line, index) => ({ line, index, hits: queryTermHitCount(line, query) }));
+  const candidates = scoredLines.some((line) => line.hits > 0 && !line.line.startsWith("Topics:"))
+    ? scoredLines.filter((line) => line.hits > 0 && !line.line.startsWith("Topics:"))
+    : scoredLines;
+  const bestLine = candidates
+    .sort((a, b) => b.hits - a.hits || a.index - b.index)[0]?.line ?? compactText;
+  return truncateSnippet(bestLine, maxChars);
+}
+
+function truncateSnippet(text: string, maxChars: number): string {
+  const compact = compactWhitespace(text);
+  if (compact.length <= maxChars) return compact;
+  return `${compact.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function compactWhitespace(text: string): string {
+  return text.replace(/\s+/gu, " ").trim();
 }
 
 function rowToGraphNode(row: unknown): GraphNode {

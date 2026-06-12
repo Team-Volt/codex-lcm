@@ -48,6 +48,9 @@ prompts, outcomes, and source event IDs. Summary nodes form a multi-depth DAG:
 D0 nodes summarize bounded high-signal event chunks, and D1+ nodes summarize
 lower-depth summary nodes. No LLM, embeddings, or network calls are required.
 The job is ranking and context packing; raw events stay the evidence layer.
+Codex-generated suggestion prompts and their JSON suggestion responses remain
+raw events, but they are skipped by summaries and summary nodes so broad search
+does not confuse generated next-step ideas with user-directed work.
 
 For long sessions, the session-summary builder samples early high-signal events,
 latest high-signal events, and recent events. Summary nodes are chunked and
@@ -64,7 +67,11 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 
 - `lcm_health`: report storage paths, index status, event count, session count, summary-node count, and current configuration.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
-- `lcm_search_sessions`: cross-session search using SQLite FTS, with recent-session fallback for empty queries and relaxed broad-query retry when strict FTS has no hits.
+- `lcm_search_sessions`: cross-session discovery using SQLite FTS. Results
+  include a compact `best_match` clue and source kind, support recent-session
+  fallback for empty queries, use relaxed broad-query retry when strict FTS has
+  no hits, include `discovery` confidence metadata for ranking quality, and
+  accept current-session exclusion options for prior-history searches.
 - `lcm_get_session`: retrieve a session by ID with sanitized raw events; supports `limit` and `cursor` for long sessions.
 - `lcm_get_session_summary`: retrieve the deterministic extractive summary for a session, including topics and source event pointers.
 - `lcm_get_session_graph`: retrieve a bounded DAG slice for a session, including summary nodes when present.
