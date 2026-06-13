@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/codex-lcm\" hook SessionStart",
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook SessionStart",
             "statusMessage": "codex-lcm: recording session start"
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/codex-lcm\" hook UserPromptSubmit"
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook UserPromptSubmit"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/codex-lcm\" hook PreToolUse"
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook PreToolUse"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/codex-lcm\" hook PostToolUse"
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook PostToolUse"
           }
         ]
       }
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/codex-lcm\" hook PreCompact"
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook PreCompact"
           }
         ]
       }
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/codex-lcm\" hook Stop"
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook Stop"
           }
         ]
       }
