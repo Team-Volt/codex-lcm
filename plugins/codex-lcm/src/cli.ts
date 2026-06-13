@@ -44,6 +44,15 @@ export async function main(argv: string[]): Promise<void> {
     }
     return;
   }
+  if (command === "stats") {
+    const storage = createStorage({ config: loadConfig() });
+    try {
+      printObjectOrText(storage.stats(), rest);
+    } finally {
+      storage.close();
+    }
+    return;
+  }
   throw new Error(`Unknown command: ${command}`);
 }
 
@@ -77,6 +86,7 @@ Commands:
   codex-lcm install --dry-run [--json]   Print manual MCP/hook wiring plan
   codex-lcm status [--json]
   codex-lcm health [--json]
+  codex-lcm stats [--json]
   codex-lcm uninstall --dry-run [--json] Print manual cleanup plan
 `);
 }

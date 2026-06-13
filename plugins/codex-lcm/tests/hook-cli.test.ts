@@ -60,3 +60,33 @@ test("hook command captures git metadata as optional session metadata", () => {
   assert.equal(fs.realpathSync(event.repo_root ?? ""), fs.realpathSync(repo));
   assert.equal(event.git_branch, "feature/test");
 });
+
+test("stats command reports aggregate summary depth and graph counts", () => {
+  const home = tempHome();
+  for (let index = 0; index < 9; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "cli-stats-session",
+        cwd: "/tmp/cli-stats",
+        prompt: `cli stats high signal prompt ${index}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assertCliOk(hook);
+  }
+
+  const result = runCli(["stats", "--json"], {
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assertCliOk(result);
+  const stats = JSON.parse(result.stdout);
+  assert.equal(stats.event_count, 9);
+  assert.equal(stats.summary_node_count, 3);
+  assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
+  assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
+  assert.equal(stats.sessions_with_summary_nodes, 1);
+  assert.equal(stats.max_summary_depth, 1);
+  assert.equal(stats.graph_nodes_by_kind.event, 9);
+  assert.equal(stats.graph_edges_by_kind.contains, 9);
+});

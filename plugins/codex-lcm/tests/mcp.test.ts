@@ -24,6 +24,7 @@ test("MCP server initializes and lists LCM tools", () => {
     responses[1].result.tools.map((tool: { name: string }) => tool.name),
     [
       "lcm_health",
+      "lcm_stats",
       "lcm_current_session",
       "lcm_search_sessions",
       "lcm_get_session",
@@ -34,6 +35,42 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_record_note",
     ],
   );
+});
+
+test("MCP stats reports aggregate summary depth and graph counts", () => {
+  const home = tempHome();
+  const cwd = "/tmp/mcp-stats";
+  for (let index = 0; index < 9; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "mcp-stats-session",
+        cwd,
+        prompt: `mcp stats high signal prompt ${index}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assert.equal(hook.status, 0, hook.stderr);
+  }
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "lcm_stats", arguments: {} },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const stats = responses[1].result.structuredContent.stats;
+  assert.equal(stats.event_count, 9);
+  assert.equal(stats.summary_node_count, 3);
+  assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
+  assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
+  assert.equal(stats.sessions_with_summary_nodes, 1);
+  assert.equal(stats.max_summary_depth, 1);
+  assert.equal(stats.graph_nodes_by_kind.event, 9);
+  assert.equal(stats.graph_edges_by_kind.contains, 9);
 });
 
 test("MCP tools search and retrieve synthetic hook data", () => {

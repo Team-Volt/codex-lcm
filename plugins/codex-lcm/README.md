@@ -21,6 +21,7 @@ node bin/codex-lcm hook UserPromptSubmit
 node bin/codex-lcm install --dry-run  # optional manual wiring plan
 node bin/codex-lcm status
 node bin/codex-lcm health
+node bin/codex-lcm stats
 node bin/codex-lcm uninstall --dry-run  # optional manual cleanup plan
 ```
 
@@ -33,6 +34,7 @@ CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 ## MCP Tools
 
 - `lcm_health`
+- `lcm_stats`
 - `lcm_current_session`
 - `lcm_search_sessions`
 - `lcm_get_session`
@@ -63,6 +65,17 @@ codex plugin add codex-lcm@codex-lcm
 ```
 
 The first TUI session after install asks you to review and trust the hooks. That review is expected because Codex hooks can run outside the sandbox after you trust them.
+
+To update an existing GitHub install:
+
+```sh
+codex plugin marketplace upgrade codex-lcm
+codex plugin add codex-lcm@codex-lcm
+```
+
+Restart Codex Desktop or start a fresh Codex CLI/TUI session after updating.
+Long-running clients keep the old plugin cache until they restart. If the update
+changes hook command text, Codex may ask you to review and trust the hooks again.
 
 To remove the native plugin, use Codex's plugin manager:
 
@@ -150,6 +163,11 @@ This mirrors the lossless-context pattern used by systems such as lossless-claw
 and Hermes LCM: search compact summary nodes first, then expand the selected
 source lineage under the caller's token budget. Raw transcript events remain
 available through `lcm_get_session`.
+
+Use `lcm_stats` or `node bin/codex-lcm stats --json` to inspect aggregate index
+shape without reading raw transcript text. The stats output includes summary
+nodes by depth, summary source types, graph node and edge counts, freshness
+timestamps, max summary depth, and the number of sessions with summary nodes.
 
 For long sessions, summary rebuilds use a bounded sample of early high-signal
 events, latest high-signal events, and recent events. That keeps ingestion fast

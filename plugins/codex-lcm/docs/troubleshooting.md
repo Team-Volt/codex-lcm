@@ -73,9 +73,12 @@ Use a temporary home to isolate issues:
 ```sh
 CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm hook UserPromptSubmit
 CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm health --json
+CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm stats --json
 ```
 
 If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and falls back to raw-log scanning.
+Use `stats --json` when you need aggregate summary-depth, graph-count, and
+freshness checks without opening the SQLite database directly.
 
 ## Node Warnings
 

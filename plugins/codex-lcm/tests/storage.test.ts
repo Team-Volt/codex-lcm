@@ -38,6 +38,31 @@ test("appends JSONL and indexes searchable cross-session events", () => {
   storage.close();
 });
 
+test("stats reports aggregate summary and graph shape without raw content", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  ingestStatsFixture(storage);
+
+  const stats = storage.stats();
+
+  assert.equal(stats.event_count, 9);
+  assert.equal(stats.session_count, 1);
+  assert.equal(stats.summary_count, 1);
+  assert.equal(stats.summary_node_count, 3);
+  assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
+  assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
+  assert.equal(stats.sessions_with_summary_nodes, 1);
+  assert.equal(stats.max_summary_depth, 1);
+  assert.equal(stats.latest_event_at, "2026-06-09T12:00:08.000Z");
+  assert.equal(stats.latest_summary_node_at, "2026-06-09T12:00:08.000Z");
+  assert.equal(stats.graph_nodes_by_kind.event, 9);
+  assert.equal(stats.graph_nodes_by_kind.session, 1);
+  assert.equal(stats.graph_edges_by_kind.contains, 9);
+  assert.equal("raw_json" in stats, false);
+
+  storage.close();
+});
+
 test("search sessions relaxes broad queries when strict FTS has no match", () => {
   const home = tempHome();
   const storage = createStorage({ home });
@@ -609,3 +634,18 @@ test("still appends raw JSONL when SQLite index is unavailable", () => {
 
   storage.close();
 });
+
+function ingestStatsFixture(storage: ReturnType<typeof createStorage>): void {
+  for (let index = 0; index < 9; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: "stats-session",
+        cwd: "/tmp/stats",
+        prompt: `stats fixture high signal prompt ${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+}

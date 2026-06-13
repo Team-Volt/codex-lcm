@@ -24,6 +24,7 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 ## Retrieval Rules
 
 - Use the MCP tools. Do not inspect `~/.codex-lcm`, SQLite, or raw JSONL directly unless the user explicitly asks for storage forensics or MCP itself is broken.
+- Use `lcm_stats` for aggregate storage, summary-depth, graph-count, and freshness questions. It is the normal path for "how many summaries/nodes?" checks.
 - Keep retrieval bounded. Prefer packed context, graph slices, limits, and cursors over full-session dumps.
 - Treat `lcm_pack_context` as the model-ready retrieval path. It searches summary nodes first and expands bounded source lineage, so it is usually better than loading raw events for broad recall.
 - For broad or meta questions, start with `lcm_search_sessions` and use each result's `best_match` clue before loading raw events. Summary titles, topics, outcomes, source event IDs, and best-match snippets are meant to be skimmed first.
@@ -49,6 +50,7 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 ## Tool Hints
 
 - Use `lcm_current_session` first when the current Codex session may matter.
+- Use `lcm_stats` when checking whether LCM is building summaries, summary nodes, graph nodes, and graph edges as expected.
 - Use `lcm_search_sessions` for cross-session lookup; inspect `discovery.confidence`, `discovery.reasons`, `best_match.kind`, `best_match.snippet`, and `best_match.topics` to decide which sessions deserve deeper retrieval.
 - Use `lcm_get_session_summary` for compact semantic clues, outcomes, and source event IDs.
 - Use `lcm_pack_context` for model-ready summary-node context with bounded source expansion.
