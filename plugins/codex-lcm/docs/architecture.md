@@ -9,7 +9,7 @@
 5. The sanitized event is appended to `events.jsonl`.
 6. SQLite indexing is attempted. This builds session rows, FTS rows, extractive
    summaries, and a derived DAG. Index failure does not undo or block raw append.
-7. `codex-lcm mcp` serves health, search, summary, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
+7. `codex-lcm mcp` serves health, stats, search, summary, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
 
 ## Plugin Packaging
 

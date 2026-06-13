@@ -22,7 +22,7 @@ still work.
 - Builds deterministic extractive session summaries with titles, topics, key
   prompts, outcomes, tools, and source event IDs. These summaries are derived
   from raw events and can be rebuilt.
-- Serves MCP tools for health checks, current-session lookup, cross-session
+- Serves MCP tools for health and stats checks, current-session lookup, cross-session
   search, session summaries, paged session retrieval, graph retrieval, context
   packing, and notes.
 - Provides a Codex skill that nudges the model to query LCM on resumes,
@@ -122,6 +122,17 @@ development or compatibility checks.
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
+Update an existing GitHub install with:
+
+```sh
+codex plugin marketplace upgrade codex-lcm
+codex plugin add codex-lcm@codex-lcm
+```
+
+Then restart Codex Desktop or open a new Codex CLI/TUI session so the refreshed
+plugin cache, MCP server, hooks, and skill are loaded. If a release changes hook
+commands, Codex may ask you to review and trust the updated hooks again.
+
 Remove it with:
 
 ```sh
@@ -155,6 +166,7 @@ Useful local commands:
 ```sh
 node bin/codex-lcm --help
 node bin/codex-lcm health --json
+node bin/codex-lcm stats --json
 node bin/codex-lcm status --json
 ```
 

@@ -21,6 +21,13 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "lcm_stats",
+    title: "LCM Stats",
+    description: "Report aggregate LCM index shape, summary depths, graph counts, and freshness without raw transcript text.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "lcm_current_session",
     title: "LCM Current Session",
     description: "Find the current or latest known session by session ID, cwd, or repo root.",
@@ -205,6 +212,13 @@ function callTool(storage: ReturnType<typeof createStorage>, params: Record<stri
     case "lcm_health": {
       const health = storage.health();
       return toolResult(`Codex LCM has ${health.event_count} events across ${health.session_count} sessions.`, { health });
+    }
+    case "lcm_stats": {
+      const stats = storage.stats();
+      return toolResult(
+        `Codex LCM has ${stats.event_count} events, ${stats.summary_node_count ?? 0} summary nodes, and ${stats.graph_node_count ?? 0} graph nodes.`,
+        { stats },
+      );
     }
     case "lcm_current_session": {
       const session = storage.getCurrentSession({

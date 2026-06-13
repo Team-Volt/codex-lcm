@@ -151,6 +151,17 @@ export type Health = {
   summary_node_count?: number;
 };
 
+export type LcmStats = Health & {
+  summary_nodes_by_depth: Record<string, number>;
+  summary_nodes_by_source_type: Record<string, number>;
+  graph_nodes_by_kind: Record<string, number>;
+  graph_edges_by_kind: Record<string, number>;
+  sessions_with_summary_nodes: number;
+  max_summary_depth: number | null;
+  latest_event_at: string | null;
+  latest_summary_node_at: string | null;
+};
+
 const CHECKPOINT_INTERVAL = 50;
 const SUMMARY_EARLY_SIGNAL_LIMIT = 120;
 const SUMMARY_LATEST_SIGNAL_LIMIT = 240;
@@ -208,6 +219,55 @@ export class LcmStorage {
         summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
         summary_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM summary_nodes")),
       } : {}),
+    };
+  }
+
+  stats(): LcmStats {
+    const health = this.health();
+    if (!this.db) {
+      return {
+        ...health,
+        summary_nodes_by_depth: {},
+        summary_nodes_by_source_type: {},
+        graph_nodes_by_kind: {},
+        graph_edges_by_kind: {},
+        sessions_with_summary_nodes: 0,
+        max_summary_depth: null,
+        latest_event_at: null,
+        latest_summary_node_at: null,
+      };
+    }
+
+    return {
+      ...health,
+      summary_nodes_by_depth: this.countMap(`
+        SELECT depth AS key, COUNT(*) AS count
+        FROM summary_nodes
+        GROUP BY depth
+        ORDER BY depth
+      `),
+      summary_nodes_by_source_type: this.countMap(`
+        SELECT source_type AS key, COUNT(*) AS count
+        FROM summary_nodes
+        GROUP BY source_type
+        ORDER BY source_type
+      `),
+      graph_nodes_by_kind: this.countMap(`
+        SELECT kind AS key, COUNT(*) AS count
+        FROM graph_nodes
+        GROUP BY kind
+        ORDER BY kind
+      `),
+      graph_edges_by_kind: this.countMap(`
+        SELECT kind AS key, COUNT(*) AS count
+        FROM graph_edges
+        GROUP BY kind
+        ORDER BY kind
+      `),
+      sessions_with_summary_nodes: Number(this.scalar("SELECT COUNT(DISTINCT session_id) AS count FROM summary_nodes")),
+      max_summary_depth: this.optionalNumberScalar("SELECT MAX(depth) AS value FROM summary_nodes"),
+      latest_event_at: this.optionalStringScalar("SELECT MAX(timestamp) AS value FROM events"),
+      latest_summary_node_at: this.optionalStringScalar("SELECT MAX(latest_at) AS value FROM summary_nodes"),
     };
   }
 
@@ -1289,6 +1349,24 @@ export class LcmStorage {
     if (!this.db) return 0;
     const row = this.db.prepare(sql).get() as { count: number };
     return row.count;
+  }
+
+  private optionalNumberScalar(sql: string): number | null {
+    if (!this.db) return null;
+    const row = this.db.prepare(sql).get() as { value?: unknown };
+    return typeof row.value === "number" ? row.value : null;
+  }
+
+  private optionalStringScalar(sql: string): string | null {
+    if (!this.db) return null;
+    const row = this.db.prepare(sql).get() as { value?: unknown };
+    return typeof row.value === "string" && row.value.length > 0 ? row.value : null;
+  }
+
+  private countMap(sql: string): Record<string, number> {
+    if (!this.db) return {};
+    const rows = this.db.prepare(sql).all() as Array<{ key: unknown; count: unknown }>;
+    return Object.fromEntries(rows.map((row) => [String(row.key), Number(row.count)]));
   }
 
   private rebuildSessionMemorySummary(sessionId: string): void {
