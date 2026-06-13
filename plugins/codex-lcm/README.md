@@ -66,12 +66,26 @@ codex plugin add codex-lcm@codex-lcm
 
 The first TUI session after install asks you to review and trust the hooks. That review is expected because Codex hooks can run outside the sandbox after you trust them.
 
-To update an existing GitHub install:
+To update a local checkout install:
+
+```sh
+git -C /path/to/codex-lcm pull --ff-only
+codex plugin add codex-lcm@codex-lcm
+```
+
+To update an existing GitHub marketplace install:
 
 ```sh
 codex plugin marketplace upgrade codex-lcm
 codex plugin add codex-lcm@codex-lcm
 ```
+
+If Codex reports that `codex-lcm` is not configured as a Git marketplace, it is
+using your local checkout as the marketplace. Skip `marketplace upgrade` and run
+`codex plugin add codex-lcm@codex-lcm` after updating that checkout. The cache
+directory can keep the same version-looking suffix after a local refresh; verify
+with `codex plugin list`, `codex-lcm stats --json`, or the `lcm_stats` MCP tool
+after restart.
 
 Restart Codex Desktop or start a fresh Codex CLI/TUI session after updating.
 Long-running clients keep the old plugin cache until they restart. If the update

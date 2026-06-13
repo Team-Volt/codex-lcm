@@ -66,6 +66,27 @@ The installed skill is `lcm-recall`. The `codex-lcm install --dry-run` command
 does not copy or install skills; it only reports where the skill lives in the
 plugin package.
 
+## Marketplace Upgrade Says It Is Not A Git Marketplace
+
+`codex plugin marketplace upgrade` refreshes configured Git marketplace
+snapshots. If your marketplace was added from a local checkout, for example:
+
+```sh
+codex plugin marketplace add /path/to/codex-lcm
+```
+
+then update the checkout yourself and refresh the installed plugin cache:
+
+```sh
+git -C /path/to/codex-lcm pull --ff-only
+codex plugin add codex-lcm@codex-lcm
+```
+
+After that, restart Codex Desktop or start a fresh Codex CLI/TUI session. The
+installed cache path may still contain the same version suffix after a local
+refresh, so verify behavior with `codex plugin list`, `codex-lcm stats --json`,
+or the `lcm_stats` MCP tool instead of reading the cache directory name.
+
 ## Storage Problems
 
 Use a temporary home to isolate issues:

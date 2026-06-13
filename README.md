@@ -122,12 +122,27 @@ development or compatibility checks.
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Update an existing GitHub install with:
+Update a local checkout install by pulling the checkout, then asking Codex to
+refresh the installed plugin cache:
+
+```sh
+git -C /path/to/codex-lcm pull --ff-only
+codex plugin add codex-lcm@codex-lcm
+```
+
+Update an existing GitHub marketplace install with:
 
 ```sh
 codex plugin marketplace upgrade codex-lcm
 codex plugin add codex-lcm@codex-lcm
 ```
+
+If `codex plugin marketplace upgrade codex-lcm` says the marketplace is not
+configured as a Git marketplace, your `codex-lcm` marketplace is path-backed.
+Use the local-checkout update command above instead. The cache directory may
+keep the same version suffix after a local refresh; use `codex plugin list`,
+`codex-lcm stats --json`, or the `lcm_stats` MCP tool after restart to verify
+the loaded code.
 
 Then restart Codex Desktop or open a new Codex CLI/TUI session so the refreshed
 plugin cache, MCP server, hooks, and skill are loaded. If a release changes hook
