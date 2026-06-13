@@ -59,6 +59,8 @@ test("hook manifest registers all required Codex lifecycle hooks", () => {
   assert.deepEqual(Object.keys(manifest.hooks), events);
   for (const event of events) {
     const command = manifest.hooks[event][0].hooks[0].command;
+    assert.match(command, /\$\{PLUGIN_ROOT\}/u);
+    assert.doesNotMatch(command, /CLAUDE_PLUGIN_ROOT/u);
     assert.match(command, new RegExp(`codex-lcm" hook ${event}`, "u"));
   }
 });
