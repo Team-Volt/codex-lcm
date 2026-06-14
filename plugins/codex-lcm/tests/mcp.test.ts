@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { runCli, runMcp, tempHome } from "./helpers.ts";
+import { clearDerivedSummaries, runCli, runMcp, tempHome } from "./helpers.ts";
 
 test("MCP server initializes and lists LCM tools", () => {
   const home = tempHome();
@@ -72,6 +72,39 @@ test("MCP stats reports aggregate summary depth and graph counts", () => {
   assert.equal(stats.max_summary_depth, 1);
   assert.equal(stats.graph_nodes_by_kind.event, 9);
   assert.equal(stats.graph_edges_by_kind.contains, 9);
+});
+
+test("MCP stats does not rebuild derived summaries", () => {
+  const home = tempHome();
+  const cwd = "/tmp/mcp-readonly-stats";
+  for (let index = 0; index < 9; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "mcp-readonly-stats-session",
+        cwd,
+        prompt: `mcp readonly stats high signal prompt ${index}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assert.equal(hook.status, 0, hook.stderr);
+  }
+  clearDerivedSummaries(home);
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "lcm_stats", arguments: {} },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const stats = responses[1].result.structuredContent.stats;
+  assert.equal(stats.event_count, 9);
+  assert.equal(stats.summary_count, 0);
+  assert.equal(stats.summary_node_count, 0);
+  assert.equal(stats.index_error, undefined);
 });
 
 test("MCP tools search and retrieve synthetic hook data", () => {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 
@@ -47,4 +48,18 @@ export function runMcp(requests: unknown[], env: NodeJS.ProcessEnv = {}) {
     .split(/\r?\n/u)
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line));
+}
+
+export function clearDerivedSummaries(home: string): void {
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  try {
+    db.exec(`
+      DELETE FROM summary_node_fts;
+      DELETE FROM summary_nodes;
+      DELETE FROM session_summary_fts;
+      DELETE FROM session_summaries;
+    `);
+  } finally {
+    db.close();
+  }
 }

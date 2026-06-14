@@ -41,6 +41,7 @@ export type { SessionMemorySummary, SummaryNode, SummarySourceType } from "./sum
 export type StorageOptions = {
   home?: string;
   config?: LcmConfig;
+  readOnly?: boolean;
 };
 
 export type SearchSessionArgs = {
@@ -172,15 +173,24 @@ export class LcmStorage {
   readonly config: LcmConfig;
   private db?: DatabaseSync;
   private indexError?: string;
+  private readonly readOnly: boolean;
 
   constructor(options: StorageOptions = {}) {
     this.config = options.config ?? loadConfig({ home: options.home });
-    fs.mkdirSync(this.config.home, { recursive: true, mode: 0o700 });
+    this.readOnly = options.readOnly ?? false;
+    if (!this.readOnly) {
+      fs.mkdirSync(this.config.home, { recursive: true, mode: 0o700 });
+    }
+    if (this.readOnly && !fs.existsSync(this.config.indexPath)) {
+      return;
+    }
     try {
-      this.db = new DatabaseSync(this.config.indexPath);
-      this.initialize();
-      this.backfillGraph();
-      this.backfillSessionMemorySummaries();
+      this.db = new DatabaseSync(this.config.indexPath, this.readOnly ? { readOnly: true } : {});
+      if (!this.readOnly) {
+        this.initialize();
+        this.backfillGraph();
+        this.backfillSessionMemorySummaries();
+      }
     } catch (error) {
       this.db = undefined;
       this.indexError = error instanceof Error ? error.message : String(error);
@@ -192,6 +202,9 @@ export class LcmStorage {
   }
 
   ingest(event: NormalizedEvent): void {
+    if (this.readOnly) {
+      throw new Error("Cannot ingest events with read-only storage.");
+    }
     fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
     fs.appendFileSync(this.config.rawLogPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
     if (!this.db) return;

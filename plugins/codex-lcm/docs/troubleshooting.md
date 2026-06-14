@@ -101,6 +101,9 @@ If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and
 Use `stats --json` when you need aggregate hook-event, summary-depth,
 graph-count, and freshness checks without opening the SQLite database directly.
 For compaction hook verification, check `hook_event_counts.PreCompact`.
+`health` and `stats` open the index read-only. If derived summaries need to be
+rebuilt after an upgrade, the next normal hook ingestion or `lcm_record_note`
+write will run maintenance.
 
 ## Node Warnings
 

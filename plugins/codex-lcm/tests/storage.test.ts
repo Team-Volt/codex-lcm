@@ -5,7 +5,7 @@ import test from "node:test";
 
 import { normalizeHookEvent } from "../src/events.ts";
 import { createStorage } from "../src/storage.ts";
-import { tempHome } from "./helpers.ts";
+import { clearDerivedSummaries, tempHome } from "./helpers.ts";
 
 const now = () => new Date("2026-06-09T12:00:00.000Z");
 
@@ -62,6 +62,25 @@ test("stats reports aggregate summary and graph shape without raw content", () =
   assert.equal("raw_json" in stats, false);
 
   storage.close();
+});
+
+test("read-only storage opens do not rebuild derived indexes", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  ingestStatsFixture(storage);
+  storage.close();
+
+  clearDerivedSummaries(home);
+
+  const readOnlyStorage = createStorage({ home, readOnly: true });
+  const stats = readOnlyStorage.stats();
+
+  assert.equal(stats.event_count, 9);
+  assert.equal(stats.summary_count, 0);
+  assert.equal(stats.summary_node_count, 0);
+  assert.equal(stats.index_error, undefined);
+
+  readOnlyStorage.close();
 });
 
 test("search sessions relaxes broad queries when strict FTS has no match", () => {

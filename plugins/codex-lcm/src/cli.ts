@@ -36,7 +36,7 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "health") {
-    const storage = createStorage({ config: loadConfig() });
+    const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
       printObjectOrText(storage.health(), rest);
     } finally {
@@ -45,7 +45,7 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "stats") {
-    const storage = createStorage({ config: loadConfig() });
+    const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
       printObjectOrText(storage.stats(), rest);
     } finally {

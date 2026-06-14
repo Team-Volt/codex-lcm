@@ -48,6 +48,33 @@ test("accepts camelCase session and tool keys", () => {
   assert.deepEqual(event.payload.toolResult, { textResultForLlm: "hello" });
 });
 
+test("uses only Codex session environment fallback keys", () => {
+  const codexEvent = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      cwd: "/tmp/cwd",
+      prompt: "env session fallback",
+    }),
+    env: { CODEX_SESSION_ID: "codex-env-session" },
+    now: fixedNow,
+  });
+
+  assert.equal(codexEvent.session_id, "codex-env-session");
+
+  const nonCodexEvent = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      cwd: "/tmp/cwd",
+      prompt: "non-codex env fallback",
+    }),
+    env: { CLAUDE_SESSION_ID: "claude-env-session" },
+    now: fixedNow,
+  });
+
+  assert.notEqual(nonCodexEvent.session_id, "claude-env-session");
+  assert.equal(nonCodexEvent.session_id.startsWith("unknown-"), true);
+});
+
 test("malformed stdin becomes a sanitized parse-error event instead of throwing", () => {
   const event = normalizeHookEvent({
     hookEvent: "SessionStart",
