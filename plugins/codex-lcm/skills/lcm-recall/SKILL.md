@@ -24,7 +24,7 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 ## Retrieval Rules
 
 - Use the MCP tools. Do not inspect `~/.codex-lcm`, SQLite, or raw JSONL directly unless the user explicitly asks for storage forensics or MCP itself is broken.
-- Use `lcm_stats` for aggregate storage, hook-event, summary-depth, graph-count, and freshness questions. It is the normal path for "how many summaries/nodes?" and "did PreCompact fire?" checks.
+- Use `lcm_stats` for aggregate storage, hook-event, summary-depth, graph-count, and freshness questions. It is the normal path for "how many summaries/nodes?" and "did PreCompact/PostCompact fire?" checks.
 - Keep retrieval bounded. Prefer packed context, graph slices, limits, and cursors over full-session dumps.
 - For standard LCM recall, use `lcm_grep` to find candidates, `lcm_describe` to inspect session or summary-node lineage, and `lcm_expand` to expand a chosen summary node into bounded source evidence.
 - Treat `lcm_pack_context` as the model-ready retrieval path. It searches summary nodes first and expands bounded source lineage, so it is usually better than loading raw events for broad recall.

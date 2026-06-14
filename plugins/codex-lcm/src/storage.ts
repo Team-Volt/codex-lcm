@@ -354,7 +354,7 @@ export class LcmStorage {
         WHERE event_fts MATCH ?1
           AND (?2 IS NULL OR s.cwd = ?2)
           AND (?3 IS NULL OR s.repo_root = ?3)
-          AND e.hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact')
+          AND e.hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')
         ORDER BY bm25(event_fts) ASC, e.timestamp DESC
         LIMIT ?4
       `);
@@ -1598,7 +1598,7 @@ export class LcmStorage {
     const rows = this.db.prepare(`
       SELECT raw_json FROM events
       WHERE session_id = ?1
-        AND hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact')
+        AND hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')
       ORDER BY timestamp ASC, rowid ASC
     `).all(sessionId);
     return rows
@@ -1609,7 +1609,7 @@ export class LcmStorage {
 
   private getSummaryEventsForSession(sessionId: string): NormalizedEvent[] {
     if (!this.db) return [];
-    const highSignalFilter = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact')";
+    const highSignalFilter = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
     const earlySignals = this.db.prepare(`
       SELECT raw_json FROM events
       WHERE session_id = ?1

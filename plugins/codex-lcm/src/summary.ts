@@ -330,7 +330,7 @@ export function buildSessionMemorySummary(events: NormalizedEvent[]): SessionMem
     .map(eventSignalText)
     .filter((text) => text.length > 0);
   const outcomes = sorted
-    .filter((event) => event.hook_event === "Stop" || event.hook_event === "PreCompact")
+    .filter((event) => event.hook_event === "Stop" || event.hook_event === "PreCompact" || event.hook_event === "PostCompact")
     .map(eventSignalText)
     .filter((text) => text.length > 0);
   const tools = uniqueStrings(sorted
@@ -372,7 +372,7 @@ export function eventSignalText(event: NormalizedEvent): string {
   if (event.hook_event === "Stop") {
     return stringField(event.payload.last_assistant_message) || stringField(event.payload.summary) || "";
   }
-  if (event.hook_event === "PreCompact") {
+  if (event.hook_event === "PreCompact" || event.hook_event === "PostCompact") {
     return stringField(event.payload.summary) || stringField(event.payload.reason) || "";
   }
   return "";
@@ -380,6 +380,9 @@ export function eventSignalText(event: NormalizedEvent): string {
 
 export function isSummarySourceEvent(event: NormalizedEvent): boolean {
   if (isGeneratedSuggestionEvent(event)) return false;
+  if (event.hook_event === "PostCompact") {
+    return compactWhitespace(eventSignalText(event)).length > 0;
+  }
   return event.hook_event === "UserPromptSubmit" ||
     event.hook_event === "Note" ||
     event.hook_event === "Stop" ||
