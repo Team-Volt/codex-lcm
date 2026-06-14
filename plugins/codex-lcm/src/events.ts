@@ -74,7 +74,6 @@ export function normalizeHookEvent(args: NormalizeHookEventArgs): NormalizedEven
     stringValue(payloadObject.conversation_id) ||
     stringValue(payloadObject.conversationId) ||
     env.CODEX_SESSION_ID ||
-    env.CLAUDE_SESSION_ID ||
     fallbackSessionId(args.hookEvent, cwd, rawHash);
   const sanitized = sanitizeForStorage(payloadObject, limits);
 

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { assertCliOk, readJsonl, runCli, tempHome } from "./helpers.ts";
+import { assertCliOk, clearDerivedSummaries, readJsonl, runCli, tempHome } from "./helpers.ts";
 
 test("hook command ingests a synthetic projectless prompt event", () => {
   const home = tempHome();
@@ -90,4 +90,31 @@ test("stats command reports aggregate summary depth and graph counts", () => {
   assert.equal(stats.max_summary_depth, 1);
   assert.equal(stats.graph_nodes_by_kind.event, 9);
   assert.equal(stats.graph_edges_by_kind.contains, 9);
+});
+
+test("stats command does not rebuild derived summaries", () => {
+  const home = tempHome();
+  for (let index = 0; index < 9; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "cli-readonly-stats-session",
+        cwd: "/tmp/cli-readonly-stats",
+        prompt: `cli readonly stats high signal prompt ${index}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assertCliOk(hook);
+  }
+  clearDerivedSummaries(home);
+
+  const result = runCli(["stats", "--json"], {
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assertCliOk(result);
+  const stats = JSON.parse(result.stdout);
+  assert.equal(stats.event_count, 9);
+  assert.equal(stats.summary_count, 0);
+  assert.equal(stats.summary_node_count, 0);
+  assert.equal(stats.index_error, undefined);
 });

@@ -339,12 +339,12 @@ test("pack context falls back to global matches when cwd-scoped search is empty"
   ingest(storage, "UserPromptSubmit", {
     session_id: "lcm-meta-session",
     turn_id: "turn-1",
-    cwd: "/Users/djr/Projects/codex-lcm",
+    cwd: "/tmp/projects/codex-lcm",
     prompt: "codex-lcm retrieval quality plumbing intelligence layer assessment",
   }, "2026-06-09T12:00:00.000Z");
 
   const packed = storage.packContext({
-    cwd: "/Users/djr",
+    cwd: "/tmp/general-chat",
     query: "codex-lcm retrieval quality plumbing intelligence layer",
     budgetTokens: 300,
   });
@@ -396,7 +396,7 @@ test("pack context ignores scoped tool-only hits when global high-signal matches
 
   ingest(storage, "PostToolUse", {
     session_id: "tool-only-session",
-    cwd: "/Users/djr",
+    cwd: "/tmp/general-chat",
     tool_name: "Bash",
     tool_input: {
       command: "sed hooks.json",
@@ -407,12 +407,12 @@ test("pack context ignores scoped tool-only hits when global high-signal matches
   ingest(storage, "UserPromptSubmit", {
     session_id: "global-high-signal-session",
     turn_id: "turn-1",
-    cwd: "/Users/djr/Projects/codex-lcm",
+    cwd: "/tmp/projects/codex-lcm",
     prompt: "codex-lcm retrieval quality plumbing intelligence layer user evaluation",
   }, "2026-06-09T12:00:01.000Z");
 
   const packed = storage.packContext({
-    cwd: "/Users/djr",
+    cwd: "/tmp/general-chat",
     query: "codex-lcm retrieval quality plumbing intelligence layer",
     budgetTokens: 500,
   });

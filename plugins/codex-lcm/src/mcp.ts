@@ -148,7 +148,6 @@ const TOOLS = [
 ];
 
 export function startMcpServer(): void {
-  const storage = createStorage();
   const lines = readline.createInterface({
     input: process.stdin,
     crlfDelay: Infinity,
@@ -162,15 +161,11 @@ export function startMcpServer(): void {
     } catch {
       return;
     }
-    handleMessage(message, storage);
-  });
-
-  lines.on("close", () => {
-    storage.close();
+    handleMessage(message);
   });
 }
 
-function handleMessage(message: JsonRpcMessage, storage: ReturnType<typeof createStorage>): void {
+function handleMessage(message: JsonRpcMessage): void {
   const { id, method, params } = message;
   if (method === "initialize") {
     sendResult(id, {
@@ -196,7 +191,7 @@ function handleMessage(message: JsonRpcMessage, storage: ReturnType<typeof creat
   }
   if (method === "tools/call") {
     try {
-      sendResult(id, callTool(storage, params ?? {}));
+      sendResult(id, callTool(params ?? {}));
     } catch (error) {
       sendError(id, -32602, error instanceof Error ? error.message : String(error));
     }
@@ -205,85 +200,90 @@ function handleMessage(message: JsonRpcMessage, storage: ReturnType<typeof creat
   if (id !== undefined) sendError(id, -32601, `Method not found: ${method ?? ""}`);
 }
 
-function callTool(storage: ReturnType<typeof createStorage>, params: Record<string, unknown>) {
+function callTool(params: Record<string, unknown>) {
   const name = stringArg(params.name, "name");
   const args = isRecord(params.arguments) ? params.arguments : {};
-  switch (name) {
-    case "lcm_health": {
-      const health = storage.health();
-      return toolResult(`Codex LCM has ${health.event_count} events across ${health.session_count} sessions.`, { health });
+  const storage = createStorage({ readOnly: name !== "lcm_record_note" });
+  try {
+    switch (name) {
+      case "lcm_health": {
+        const health = storage.health();
+        return toolResult(`Codex LCM has ${health.event_count} events across ${health.session_count} sessions.`, { health });
+      }
+      case "lcm_stats": {
+        const stats = storage.stats();
+        return toolResult(
+          `Codex LCM has ${stats.event_count} events, ${stats.summary_node_count ?? 0} summary nodes, and ${stats.graph_node_count ?? 0} graph nodes.`,
+          { stats },
+        );
+      }
+      case "lcm_current_session": {
+        const session = storage.getCurrentSession({
+          sessionId: optionalString(args.sessionId),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+        });
+        return toolResult(session ? `Current session: ${session.session_id}` : "No matching session found.", { session });
+      }
+      case "lcm_search_sessions": {
+        const matches = storage.searchSessions({
+          query: optionalString(args.query),
+          limit: optionalNumber(args.limit),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          excludeCurrentSession: optionalBoolean(args.excludeCurrentSession),
+          excludeSessionIds: optionalStringArray(args.excludeSessionIds),
+        });
+        return toolResult(`Found ${matches.length} matching sessions.`, { matches });
+      }
+      case "lcm_get_session": {
+        const session = storage.getSession(stringArg(args.sessionId, "sessionId"), {
+          limit: optionalNumber(args.limit),
+          cursor: optionalString(args.cursor),
+        });
+        return toolResult(`Loaded ${session.events.length} events.`, session);
+      }
+      case "lcm_get_session_summary": {
+        const summary = storage.getSessionMemorySummary(stringArg(args.sessionId, "sessionId"));
+        return toolResult(summary ? `Loaded summary for ${summary.session_id}.` : "No summary found.", { summary });
+      }
+      case "lcm_get_session_graph": {
+        const graph = storage.getSessionGraph(stringArg(args.sessionId, "sessionId"), {
+          limit: optionalNumber(args.limit),
+        });
+        return toolResult(`Loaded graph with ${graph.nodes.length} nodes and ${graph.edges.length} edges.`, graph);
+      }
+      case "lcm_get_recent_context": {
+        const context = storage.getRecentContext({
+          sessionId: optionalString(args.sessionId),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          limit: optionalNumber(args.limit),
+        });
+        return toolResult(`Loaded ${context.events.length} recent events.`, context);
+      }
+      case "lcm_pack_context": {
+        const packed = storage.packContext({
+          query: optionalString(args.query),
+          sessionIds: optionalStringArray(args.sessionIds),
+          budgetTokens: optionalNumber(args.budgetTokens),
+          cwd: optionalString(args.cwd),
+        });
+        return toolResult(packed.markdown, packed);
+      }
+      case "lcm_record_note": {
+        const event = storage.recordNote({
+          sessionId: stringArg(args.sessionId, "sessionId"),
+          cwd: stringArg(args.cwd, "cwd"),
+          text: stringArg(args.text, "text"),
+        });
+        return toolResult(`Recorded note for ${event.session_id}.`, { event });
+      }
+      default:
+        throw new Error(`Unknown tool: ${name}`);
     }
-    case "lcm_stats": {
-      const stats = storage.stats();
-      return toolResult(
-        `Codex LCM has ${stats.event_count} events, ${stats.summary_node_count ?? 0} summary nodes, and ${stats.graph_node_count ?? 0} graph nodes.`,
-        { stats },
-      );
-    }
-    case "lcm_current_session": {
-      const session = storage.getCurrentSession({
-        sessionId: optionalString(args.sessionId),
-        cwd: optionalString(args.cwd),
-        repoRoot: optionalString(args.repoRoot),
-      });
-      return toolResult(session ? `Current session: ${session.session_id}` : "No matching session found.", { session });
-    }
-    case "lcm_search_sessions": {
-      const matches = storage.searchSessions({
-        query: optionalString(args.query),
-        limit: optionalNumber(args.limit),
-        cwd: optionalString(args.cwd),
-        repoRoot: optionalString(args.repoRoot),
-        excludeCurrentSession: optionalBoolean(args.excludeCurrentSession),
-        excludeSessionIds: optionalStringArray(args.excludeSessionIds),
-      });
-      return toolResult(`Found ${matches.length} matching sessions.`, { matches });
-    }
-    case "lcm_get_session": {
-      const session = storage.getSession(stringArg(args.sessionId, "sessionId"), {
-        limit: optionalNumber(args.limit),
-        cursor: optionalString(args.cursor),
-      });
-      return toolResult(`Loaded ${session.events.length} events.`, session);
-    }
-    case "lcm_get_session_summary": {
-      const summary = storage.getSessionMemorySummary(stringArg(args.sessionId, "sessionId"));
-      return toolResult(summary ? `Loaded summary for ${summary.session_id}.` : "No summary found.", { summary });
-    }
-    case "lcm_get_session_graph": {
-      const graph = storage.getSessionGraph(stringArg(args.sessionId, "sessionId"), {
-        limit: optionalNumber(args.limit),
-      });
-      return toolResult(`Loaded graph with ${graph.nodes.length} nodes and ${graph.edges.length} edges.`, graph);
-    }
-    case "lcm_get_recent_context": {
-      const context = storage.getRecentContext({
-        sessionId: optionalString(args.sessionId),
-        cwd: optionalString(args.cwd),
-        repoRoot: optionalString(args.repoRoot),
-        limit: optionalNumber(args.limit),
-      });
-      return toolResult(`Loaded ${context.events.length} recent events.`, context);
-    }
-    case "lcm_pack_context": {
-      const packed = storage.packContext({
-        query: optionalString(args.query),
-        sessionIds: optionalStringArray(args.sessionIds),
-        budgetTokens: optionalNumber(args.budgetTokens),
-        cwd: optionalString(args.cwd),
-      });
-      return toolResult(packed.markdown, packed);
-    }
-    case "lcm_record_note": {
-      const event = storage.recordNote({
-        sessionId: stringArg(args.sessionId, "sessionId"),
-        cwd: stringArg(args.cwd, "cwd"),
-        text: stringArg(args.text, "text"),
-      });
-      return toolResult(`Recorded note for ${event.session_id}.`, { event });
-    }
-    default:
-      throw new Error(`Unknown tool: ${name}`);
+  } finally {
+    storage.close();
   }
 }
 

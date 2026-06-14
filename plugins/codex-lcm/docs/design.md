@@ -9,7 +9,7 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 - `~/.codex/config.toml` has `features.hooks = true`, `features.memories = true`, `plugins = true`, and existing stdio MCP entries under `[mcp_servers.*]`.
 - `~/.codex/hooks.json` uses Codex lifecycle names `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`.
 - `codex mcp add --help` supports stdio MCP registration with `codex mcp add <name> -- <command>...`.
-- Installed plugins declare `.codex-plugin/plugin.json`, optional `.mcp.json`, and optional hook manifests. Codex injects `${PLUGIN_ROOT}` for plugin hook commands so hooks can resolve the installed plugin root. Codex also injects `${CLAUDE_PLUGIN_ROOT}` as a compatibility alias for older shared plugin manifests, but Codex LCM uses `${PLUGIN_ROOT}`.
+- Installed plugins declare `.codex-plugin/plugin.json`, optional `.mcp.json`, and optional hook manifests. Codex injects `${PLUGIN_ROOT}` for plugin hook commands so hooks can resolve the installed plugin root.
 - Installed hook scripts read JSON from stdin, tolerate snake_case and camelCase payload fields, and exit cleanly on malformed JSON.
 - Node `v22.22.3` can run `.ts` files with type stripping and exposes `node:sqlite`. This implementation uses no runtime npm dependencies.
 
@@ -59,7 +59,7 @@ matched lineage instead of scanning or packing an entire long transcript.
 
 ## Hook Behavior
 
-`codex-lcm hook <event>` reads JSON from stdin and normalizes it. It accepts common Codex/Claude-style keys such as `session_id`, `sessionId`, `cwd`, `tool_name`, `toolName`, `tool_input`, `toolArgs`, `tool_output`, `tool_response`, `prompt`, and `userPrompt`.
+`codex-lcm hook <event>` reads JSON from stdin and normalizes it. It accepts common Codex hook keys in snake_case or camelCase, including `session_id`, `sessionId`, `cwd`, `tool_name`, `toolName`, `tool_input`, `toolArgs`, `tool_output`, `tool_response`, `prompt`, and `userPrompt`.
 
 The hook path is synchronous only long enough to sanitize, append JSONL, and attempt local indexing. Index failures are swallowed after a diagnostic line to stderr so Codex turns are not blocked by the indexer.
 

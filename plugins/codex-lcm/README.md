@@ -150,7 +150,8 @@ SQLite stores a derived DAG alongside FTS:
 - Turn nodes group events with the same `turn_id`.
 - Event nodes point back to raw event IDs.
 - Checkpoint nodes are created on `PreCompact` and every 50 indexed events.
-- Typed edges include `contains`, `next`, `tool_result`, and `checkpoint`.
+- Typed edges include `contains`, `next`, `tool_result`, `checkpoint`, and
+  `summary_source`.
 
 Edges are inserted with a recursive cycle check. The graph is derived from raw events and can be rebuilt; `events.jsonl` remains the source of truth.
 
@@ -183,7 +184,9 @@ shape without reading raw transcript text. The stats output includes summary
 nodes by depth, summary source types, hook-event counts, graph node and edge
 counts, freshness timestamps, max summary depth, and the number of sessions with
 summary nodes. Check `hook_event_counts.PreCompact` when verifying that Codex
-compaction hooks are being captured.
+compaction hooks are being captured. Health and stats diagnostics open the index
+read-only; normal hook ingestion and note writes perform derived-index
+maintenance.
 
 For long sessions, summary rebuilds use a bounded sample of early high-signal
 events, latest high-signal events, and recent events. That keeps ingestion fast

@@ -18,7 +18,7 @@ still work.
 - Writes sanitized raw events to an append-only JSONL log before doing any
   indexing work.
 - Builds a local SQLite index with FTS search and a derived DAG of sessions,
-  turns, events, tool results, and checkpoints.
+  turns, events, tool results, checkpoints, and summary-source lineage.
 - Builds deterministic extractive session summaries with titles, topics, key
   prompts, outcomes, tools, and source event IDs. These summaries are derived
   from raw events and can be rebuilt.
@@ -44,12 +44,12 @@ A typical retrieval flow is:
 2. Search across sessions when the user asks about prior work or when the task
    resumes an older thread. Search tries exact FTS first, then relaxes broad
    queries so one missing word does not make retrieval look empty.
-3. Pack a bounded context block from matching events, nearby graph context,
-   session summaries, checkpoints, notes, and recent session tails. For moderate
-   and large budgets, summaries appear before raw event blocks so Codex gets the
-   gist first and can still inspect the evidence. If a cwd-scoped pack finds no
-   matches, or only finds low-signal tool chatter, it falls back to a bounded
-   global search before returning nothing.
+3. Pack a bounded context block from matching summary nodes and their source
+   lineage first, then add session summaries, checkpoints, notes, and recent
+   session tails as the budget allows. Codex gets the gist first, then the
+   evidence. If a cwd-scoped pack finds no matches, or only finds low-signal
+   tool chatter, it falls back to a bounded global search before returning
+   nothing.
 4. Use `lcm_get_session_summary` for compact titles, topics, outcomes, and
    source event IDs before loading raw transcripts.
 5. Page through long sessions or request a bounded graph slice instead of loading
