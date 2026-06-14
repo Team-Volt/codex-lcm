@@ -98,11 +98,21 @@ summary nodes. Each node stores depth, source type, source IDs, source event IDs
 topic terms, token estimates, and a deterministic node ID derived from its
 lineage. `summary_node_fts` indexes the node text and topics.
 
-`lcm_pack_context` searches summary nodes first, ranks direct lower-depth hits
-ahead of broad higher-depth hits, and then expands only the selected source
-lineage. For tight budgets it uses a compact summary-node form so the matched
-source text is not crowded out by metadata. Raw events remain available through
-`lcm_get_session`.
+The standard retrieval flow is deliberately small:
+
+1. `lcm_grep` finds likely sessions by searching summary nodes, session
+   summaries, and high-signal raw events.
+2. `lcm_describe` inspects a session or summary node without loading a full
+   transcript.
+3. `lcm_expand` expands one selected summary node into bounded source summary
+   nodes and source events.
+
+`lcm_pack_context` uses the same underlying summary-node lineage, but packages
+the result as model-ready Markdown. It searches summary nodes first, ranks
+direct lower-depth hits ahead of broad higher-depth hits, and expands only the
+selected source lineage. For tight budgets it uses a compact summary-node form
+so the matched source text is not crowded out by metadata. Raw events remain
+available through `lcm_get_session`.
 
 Summary rebuilds are bounded for long sessions. Storage reads early high-signal
 events, latest high-signal events, and a short recent tail, then deduplicates the
@@ -134,6 +144,7 @@ Before inserting an edge, storage runs a recursive reachability check from the p
 
 For very long sessions, callers should prefer bounded graph and event access:
 
+- `lcm_grep`, `lcm_describe`, and `lcm_expand` for discovery and source-backed expansion.
 - `lcm_get_session` with `limit` and `cursor`.
 - `lcm_get_session_graph` with a bounded `limit`.
 - `lcm_pack_context`, which searches summary nodes first and expands bounded source lineage.

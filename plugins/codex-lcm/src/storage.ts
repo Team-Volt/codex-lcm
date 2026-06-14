@@ -106,6 +106,28 @@ export type PackedContext = {
   sources: Array<{ kind: "event" | "note" | "checkpoint" | "summary"; session_id: string; event_id?: string; node_id?: string; timestamp: string }>;
 };
 
+export type LcmDescription =
+  | {
+    target: "session";
+    session: SessionSummary | undefined;
+    summary: SessionMemorySummary | undefined;
+    summary_nodes: SummaryNode[];
+  }
+  | {
+    target: "summary_node";
+    node: SummaryNode;
+    source_nodes: SummaryNode[];
+    source_event_count: number;
+  };
+
+export type LcmExpansion = {
+  target: "summary_node";
+  node: SummaryNode;
+  source_nodes: SummaryNode[];
+  source_events: NormalizedEvent[];
+  markdown: string;
+};
+
 export type GraphNode = {
   node_id: string;
   kind: "session" | "turn" | "event" | "checkpoint" | "summary";
@@ -561,6 +583,54 @@ export class LcmStorage {
     `).all(sessionId, clampLimit(limit, 200, 2_000)).map(rowToSummaryNode);
   }
 
+  describeMemory(args: { sessionId?: string; nodeId?: string; limit?: number }): LcmDescription {
+    if (args.nodeId) {
+      const node = this.getSummaryNode(args.nodeId);
+      if (!node) throw new Error(`Summary node not found: ${args.nodeId}`);
+      return {
+        target: "summary_node",
+        node,
+        source_nodes: this.getSourceSummaryNodes(node, args.limit),
+        source_event_count: node.source_event_ids.length,
+      };
+    }
+
+    if (!args.sessionId) throw new Error("sessionId or nodeId is required.");
+    const session = this.getSessionSummary(args.sessionId);
+    const summary = this.getSessionMemorySummary(args.sessionId);
+    const summaryNodes = this.getSummaryNodesForSession(args.sessionId, clampLimit(args.limit, 50, 500));
+    if (!session && !summary && summaryNodes.length === 0) {
+      throw new Error(`Session not found: ${args.sessionId}`);
+    }
+    return {
+      target: "session",
+      session,
+      summary,
+      summary_nodes: summaryNodes,
+    };
+  }
+
+  expandMemory(args: { nodeId: string; query?: string; limit?: number }): LcmExpansion {
+    const node = this.getSummaryNode(args.nodeId);
+    if (!node) throw new Error(`Summary node not found: ${args.nodeId}`);
+    const sourceNodes = this.getSourceSummaryNodes(node, args.limit);
+    const sourceEvents = this.getSummaryNodeSourceEvents(node, args.query, args.limit);
+    const markdown = [
+      summaryNodeToMarkdown(node),
+      summaryNodeExpansionToMarkdown(node, {
+        sourceNodes,
+        sourceEvents,
+      }),
+    ].filter(Boolean).join("\n");
+    return {
+      target: "summary_node",
+      node,
+      source_nodes: sourceNodes,
+      source_events: sourceEvents,
+      markdown,
+    };
+  }
+
   private getTopSummaryNodesForSession(sessionId: string, limit = 3): SummaryNode[] {
     const nodes = this.getSummaryNodesForSession(sessionId, 2_000);
     if (nodes.length === 0) return [];
@@ -660,6 +730,13 @@ export class LcmStorage {
       WHERE node_id = ?1
     `).get(nodeId);
     return row ? rowToSummaryNode(row) : undefined;
+  }
+
+  private getSourceSummaryNodes(node: SummaryNode, limit = 4): SummaryNode[] {
+    if (node.source_type !== "nodes") return [];
+    return node.source_ids
+      .flatMap((nodeId) => this.getSummaryNode(nodeId) ?? [])
+      .slice(0, clampLimit(limit, 4, 50));
   }
 
   private getSummaryNodeSourceEvents(

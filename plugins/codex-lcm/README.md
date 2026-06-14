@@ -33,6 +33,15 @@ CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 
 ## MCP Tools
 
+Standard recall workflow:
+
+- `lcm_grep`: find relevant sessions by searching summary nodes, session summaries, and high-signal events.
+- `lcm_describe`: inspect a session or summary node, including depth, source IDs, and lineage metadata.
+- `lcm_expand`: expand one summary node into bounded source summary nodes and high-signal source events.
+- `lcm_pack_context`: pack relevant summary-node context into a model-ready Markdown block.
+
+Diagnostics and lower-level tools:
+
 - `lcm_health`
 - `lcm_stats`
 - `lcm_current_session`
@@ -41,7 +50,6 @@ CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 - `lcm_get_session_summary`
 - `lcm_get_session_graph`
 - `lcm_get_recent_context`
-- `lcm_pack_context`
 - `lcm_record_note`
 
 ## Installing
@@ -237,8 +245,9 @@ npm --cache /tmp/codex-lcm-npm-cache pack --dry-run
 ```
 
 The smoke test uses a temporary `CODEX_LCM_HOME`, sends synthetic hook events,
-starts the MCP server over stdio, calls search, graph, and pack-context tools,
-and cleans up the temporary directory unless `CODEX_LCM_KEEP_SMOKE=1` is set.
+starts the MCP server over stdio, calls grep/describe/expand, graph, and
+pack-context tools, and cleans up the temporary directory unless
+`CODEX_LCM_KEEP_SMOKE=1` is set.
 
 Use a temporary npm cache for `npm pack --dry-run` if your global npm cache has
 local permission issues.

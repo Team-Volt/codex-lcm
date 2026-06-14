@@ -67,6 +67,9 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 
 - `lcm_health`: report storage paths, index status, event count, session count, summary-node count, and current configuration.
 - `lcm_stats`: report aggregate index shape, hook-event counts, summary nodes by depth, graph node and edge counts, freshness timestamps, max summary depth, and sessions with summary nodes without returning raw transcript text.
+- `lcm_grep`: standard discovery entry point. It searches summary nodes, session summaries, and high-signal raw events, then returns session-level matches with best-match and discovery metadata.
+- `lcm_describe`: inspect a session or summary node before loading raw content. Session descriptions include the deterministic summary and bounded summary-node list; node descriptions include depth and source lineage metadata.
+- `lcm_expand`: expand a selected summary node into bounded source summary nodes and high-signal source events. This is deterministic evidence expansion, not agent-driven answer synthesis.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
 - `lcm_search_sessions`: cross-session discovery using SQLite FTS. Results
   include a compact `best_match` clue and source kind, support recent-session
@@ -79,6 +82,12 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
 - `lcm_pack_context`: pack matching summary nodes and bounded source lineage into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search when scoped retrieval is empty.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
+
+The standard agent path is `lcm_grep` -> `lcm_describe` -> `lcm_expand`.
+`lcm_pack_context` remains the Codex-specific shortcut when the caller wants a
+ready-to-use context block. The plugin does not expose `lcm_expand_query`
+because the MCP server does not spawn a reasoning agent; callers should expand
+evidence and answer in the host model.
 
 The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex when to call LCM and how to avoid loading entire long sessions unnecessarily.
 

@@ -31,6 +31,9 @@ test("plugin includes a Codex skill that nudges agents to use LCM", () => {
   const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
 
   assert.match(skill, /^---\nname: lcm-recall/mu);
+  assert.match(skill, /lcm_grep/u);
+  assert.match(skill, /lcm_describe/u);
+  assert.match(skill, /lcm_expand/u);
   assert.match(skill, /lcm_current_session/u);
   assert.match(skill, /lcm_search_sessions/u);
   assert.match(skill, /lcm_pack_context/u);
