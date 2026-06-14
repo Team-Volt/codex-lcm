@@ -22,9 +22,10 @@ still work.
 - Builds deterministic extractive session summaries with titles, topics, key
   prompts, outcomes, tools, and source event IDs. These summaries are derived
   from raw events and can be rebuilt.
-- Serves MCP tools for health and stats checks, current-session lookup, cross-session
-  search, session summaries, paged session retrieval, graph retrieval, context
-  packing, and notes.
+- Serves MCP tools for the standard LCM flow: grep for candidates, describe
+  sessions or summary nodes, expand source-backed evidence, pack model-ready
+  context, check health/stats, page long sessions, inspect graphs, and record
+  approved notes.
 - Provides a Codex skill that nudges the model to query LCM on resumes,
   compaction recovery, long-running work, and questions about prior sessions.
 
@@ -41,17 +42,13 @@ Codex uses LCM through two surfaces:
 A typical retrieval flow is:
 
 1. Locate the current or latest relevant session by cwd, repo root, or session ID.
-2. Search across sessions when the user asks about prior work or when the task
-   resumes an older thread. Search tries exact FTS first, then relaxes broad
-   queries so one missing word does not make retrieval look empty.
-3. Pack a bounded context block from matching summary nodes and their source
-   lineage first, then add session summaries, checkpoints, notes, and recent
-   session tails as the budget allows. Codex gets the gist first, then the
-   evidence. If a cwd-scoped pack finds no matches, or only finds low-signal
-   tool chatter, it falls back to a bounded global search before returning
-   nothing.
-4. Use `lcm_get_session_summary` for compact titles, topics, outcomes, and
-   source event IDs before loading raw transcripts.
+2. Use `lcm_grep` to search across summary nodes, session summaries, and
+   high-signal events. Search tries exact FTS first, then relaxes broad queries
+   so one missing word does not make retrieval look empty.
+3. Use `lcm_describe` on a promising session or summary node to inspect the
+   summary, depth, source IDs, and lineage before loading more.
+4. Use `lcm_expand` on a chosen summary node when you need source-backed
+   evidence, or `lcm_pack_context` when Codex needs a ready-to-use context block.
 5. Page through long sessions or request a bounded graph slice instead of loading
    an entire raw history at once.
 

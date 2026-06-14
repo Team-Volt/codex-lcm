@@ -96,6 +96,24 @@ try {
         arguments: { query: "smoke-old-dag-marker", budgetTokens: 160 },
       },
     },
+    {
+      jsonrpc: "2.0",
+      id: 8,
+      method: "tools/call",
+      params: {
+        name: "lcm_grep",
+        arguments: { query: "smoke searchable context", limit: 5 },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 9,
+      method: "tools/call",
+      params: {
+        name: "lcm_describe",
+        arguments: { sessionId: "smoke-session", limit: 20 },
+      },
+    },
   ]);
 
   assert.equal(responses[1].result.structuredContent.health.summary_node_count > 0, true);
@@ -108,6 +126,23 @@ try {
   assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "summary"), true);
   assert.equal(responses[5].result.structuredContent.edges.some((edge: { kind: string }) => edge.kind === "summary_source"), true);
   assert.match(responses[6].result.structuredContent.markdown, /smoke-old-dag-marker/u);
+  assert.equal(responses[7].result.structuredContent.matches[0].session_id, "smoke-session");
+  assert.equal(responses[8].result.structuredContent.description.target, "session");
+  const nodeId = responses[8].result.structuredContent.description.summary_nodes[0].node_id;
+  const expansionResponses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_expand",
+        arguments: { nodeId, query: "smoke searchable context", limit: 4 },
+      },
+    },
+  ]);
+  assert.equal(expansionResponses[1].result.structuredContent.expansion.node.node_id, nodeId);
+  assert.match(expansionResponses[1].result.structuredContent.expansion.markdown, /smoke searchable context/u);
   assert.doesNotMatch(fs.readFileSync(path.join(home, "events.jsonl"), "utf8"), /sk-proj-secret-value/u);
 
   process.stdout.write(`Smoke test passed with CODEX_LCM_HOME=${home}\n`);

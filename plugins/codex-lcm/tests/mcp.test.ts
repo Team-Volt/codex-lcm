@@ -25,6 +25,9 @@ test("MCP server initializes and lists LCM tools", () => {
     [
       "lcm_health",
       "lcm_stats",
+      "lcm_grep",
+      "lcm_describe",
+      "lcm_expand",
       "lcm_current_session",
       "lcm_search_sessions",
       "lcm_get_session",
@@ -210,4 +213,93 @@ test("MCP search sessions exposes best-match metadata and current-session exclus
   assert.match(matches[0].best_match.snippet, /summary DAG ranking source lineage/u);
   assert.equal(["high", "medium", "low"].includes(matches[0].discovery.confidence), true);
   assert.equal(typeof matches[0].discovery.score, "number");
+});
+
+test("MCP standard LCM verbs grep, describe, and expand summary-node evidence", () => {
+  const home = tempHome();
+  const cwd = "/tmp/mcp-standard-verbs";
+  for (let index = 0; index < 9; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "mcp-standard-verbs-session",
+        cwd,
+        prompt: `canonical alias evidence prompt ${index}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assert.equal(hook.status, 0, hook.stderr);
+  }
+
+  const discoveryResponses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_grep",
+        arguments: { query: "canonical alias evidence", cwd, limit: 3 },
+      },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "lcm_describe",
+        arguments: { sessionId: "mcp-standard-verbs-session", limit: 20 },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const matches = discoveryResponses[1].result.structuredContent.matches;
+  assert.equal(matches[0].session_id, "mcp-standard-verbs-session");
+  assert.equal(matches[0].best_match.kind, "summary_node");
+
+  const description = discoveryResponses[2].result.structuredContent.description;
+  assert.equal(description.target, "session");
+  assert.equal(description.session.session_id, "mcp-standard-verbs-session");
+  assert.equal(description.summary.session_id, "mcp-standard-verbs-session");
+  assert.equal(description.summary_nodes.length > 0, true);
+
+  const nodeId = description.summary_nodes.find((node: { depth: number }) => node.depth === 0)?.node_id ??
+    description.summary_nodes[0].node_id;
+
+  const expansionResponses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_expand",
+        arguments: { nodeId, query: "canonical alias evidence", limit: 4 },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const expansion = expansionResponses[1].result.structuredContent.expansion;
+  assert.equal(expansion.target, "summary_node");
+  assert.equal(expansion.node.node_id, nodeId);
+  assert.equal(expansion.source_events.length > 0, true);
+  assert.match(expansion.markdown, /canonical alias evidence/u);
+});
+
+test("MCP describe reports missing sessions instead of fabricating descriptions", () => {
+  const home = tempHome();
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_describe",
+        arguments: { sessionId: "missing-session" },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  assert.equal(responses[1].error.code, -32602);
+  assert.match(responses[1].error.message, /Session not found: missing-session/u);
 });

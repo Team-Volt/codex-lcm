@@ -28,6 +28,52 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "lcm_grep",
+    title: "LCM Grep",
+    description: "Find relevant sessions by searching summary nodes, session summaries, and high-signal raw events.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "number", default: 10 },
+        cwd: { type: "string" },
+        repoRoot: { type: "string" },
+        excludeCurrentSession: { type: "boolean", default: false },
+        excludeSessionIds: { type: "array", items: { type: "string" } },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "lcm_describe",
+    title: "LCM Describe",
+    description: "Inspect a session or summary node, including summary-node depth and source lineage metadata.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        nodeId: { type: "string" },
+        limit: { type: "number", default: 50 },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "lcm_expand",
+    title: "LCM Expand",
+    description: "Expand one summary node into bounded source summary nodes and high-signal source events.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        nodeId: { type: "string" },
+        query: { type: "string" },
+        limit: { type: "number", default: 4 },
+      },
+      required: ["nodeId"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "lcm_current_session",
     title: "LCM Current Session",
     description: "Find the current or latest known session by session ID, cwd, or repo root.",
@@ -174,8 +220,9 @@ function handleMessage(message: JsonRpcMessage): void {
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions: [
         "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, summary nodes, and packed context across Codex sessions.",
+        "Use lcm_grep, lcm_describe, and lcm_expand for the standard LCM discovery-inspection-expansion workflow.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
-        "Use lcm_pack_context for summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
+        "Use lcm_pack_context for model-ready summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
         "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
       ].join(" "),
     });
@@ -216,6 +263,36 @@ function callTool(params: Record<string, unknown>) {
           `Codex LCM has ${stats.event_count} events, ${stats.summary_node_count ?? 0} summary nodes, and ${stats.graph_node_count ?? 0} graph nodes.`,
           { stats },
         );
+      }
+      case "lcm_grep": {
+        const matches = storage.searchSessions({
+          query: optionalString(args.query),
+          limit: optionalNumber(args.limit),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          excludeCurrentSession: optionalBoolean(args.excludeCurrentSession),
+          excludeSessionIds: optionalStringArray(args.excludeSessionIds),
+        });
+        return toolResult(`Found ${matches.length} LCM matches.`, { matches });
+      }
+      case "lcm_describe": {
+        const description = storage.describeMemory({
+          sessionId: optionalString(args.sessionId),
+          nodeId: optionalString(args.nodeId),
+          limit: optionalNumber(args.limit),
+        });
+        const target = description.target === "session"
+          ? description.session?.session_id ?? args.sessionId
+          : description.node.node_id;
+        return toolResult(`Described ${description.target} ${target}.`, { description });
+      }
+      case "lcm_expand": {
+        const expansion = storage.expandMemory({
+          nodeId: stringArg(args.nodeId, "nodeId"),
+          query: optionalString(args.query),
+          limit: optionalNumber(args.limit),
+        });
+        return toolResult(expansion.markdown, { expansion });
       }
       case "lcm_current_session": {
         const session = storage.getCurrentSession({
