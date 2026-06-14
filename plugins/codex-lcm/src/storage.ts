@@ -1046,7 +1046,9 @@ export class LcmStorage {
       const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
       const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
       this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
-      this.rebuildSessionMemorySummary(event.session_id);
+      if (isSummarySourceEvent(event)) {
+        this.rebuildSessionMemorySummary(event.session_id);
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       try {

@@ -83,6 +83,70 @@ test("read-only storage opens do not rebuild derived indexes", () => {
   readOnlyStorage.close();
 });
 
+test("tool chatter does not rebuild session summaries until a landmark event", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "summary-refresh-session",
+      cwd: "/tmp/summary-refresh",
+      prompt: "initial summary source",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  const initialSummary = storage.getSessionMemorySummary("summary-refresh-session");
+  assert.equal(initialSummary?.updated_at, "2026-06-09T12:00:00.000Z");
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PreToolUse",
+    rawInput: JSON.stringify({
+      session_id: "summary-refresh-session",
+      cwd: "/tmp/summary-refresh",
+      tool_name: "Bash",
+      tool_use_id: "tool-1",
+      tool_input: { command: "echo performance" },
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: "summary-refresh-session",
+      cwd: "/tmp/summary-refresh",
+      tool_name: "Bash",
+      tool_use_id: "tool-1",
+      tool_response: { output: "performance" },
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:02.000Z"),
+  }));
+
+  const unchangedSummary = storage.getSessionMemorySummary("summary-refresh-session");
+  assert.equal(unchangedSummary?.updated_at, "2026-06-09T12:00:00.000Z");
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "summary-refresh-session",
+      cwd: "/tmp/summary-refresh",
+      last_assistant_message: "finished performance work",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:03.000Z"),
+  }));
+
+  const refreshedSummary = storage.getSessionMemorySummary("summary-refresh-session");
+  assert.equal(refreshedSummary?.updated_at, "2026-06-09T12:00:03.000Z");
+  assert.deepEqual(refreshedSummary?.tools, ["Bash"]);
+
+  storage.close();
+});
+
 test("search sessions relaxes broad queries when strict FTS has no match", () => {
   const home = tempHome();
   const storage = createStorage({ home });
