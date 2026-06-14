@@ -66,7 +66,7 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 ## MCP Tools
 
 - `lcm_health`: report storage paths, index status, event count, session count, summary-node count, and current configuration.
-- `lcm_stats`: report aggregate index shape, summary nodes by depth, graph node and edge counts, freshness timestamps, max summary depth, and sessions with summary nodes without returning raw transcript text.
+- `lcm_stats`: report aggregate index shape, hook-event counts, summary nodes by depth, graph node and edge counts, freshness timestamps, max summary depth, and sessions with summary nodes without returning raw transcript text.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
 - `lcm_search_sessions`: cross-session discovery using SQLite FTS. Results
   include a compact `best_match` clue and source kind, support recent-session

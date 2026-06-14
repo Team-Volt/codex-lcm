@@ -98,8 +98,9 @@ CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm stats --json
 ```
 
 If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and falls back to raw-log scanning.
-Use `stats --json` when you need aggregate summary-depth, graph-count, and
-freshness checks without opening the SQLite database directly.
+Use `stats --json` when you need aggregate hook-event, summary-depth,
+graph-count, and freshness checks without opening the SQLite database directly.
+For compaction hook verification, check `hook_event_counts.PreCompact`.
 
 ## Node Warnings
 

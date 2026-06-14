@@ -49,6 +49,7 @@ test("stats reports aggregate summary and graph shape without raw content", () =
   assert.equal(stats.session_count, 1);
   assert.equal(stats.summary_count, 1);
   assert.equal(stats.summary_node_count, 3);
+  assert.deepEqual(stats.hook_event_counts, { PreCompact: 1, UserPromptSubmit: 8 });
   assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
   assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
   assert.equal(stats.sessions_with_summary_nodes, 1);
@@ -636,7 +637,7 @@ test("still appends raw JSONL when SQLite index is unavailable", () => {
 });
 
 function ingestStatsFixture(storage: ReturnType<typeof createStorage>): void {
-  for (let index = 0; index < 9; index += 1) {
+  for (let index = 0; index < 8; index += 1) {
     storage.ingest(normalizeHookEvent({
       hookEvent: "UserPromptSubmit",
       rawInput: JSON.stringify({
@@ -648,4 +649,15 @@ function ingestStatsFixture(storage: ReturnType<typeof createStorage>): void {
       now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
     }));
   }
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PreCompact",
+    rawInput: JSON.stringify({
+      session_id: "stats-session",
+      cwd: "/tmp/stats",
+      trigger: "auto",
+      reason: "stats fixture compact marker",
+    }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, 8)),
+  }));
 }
