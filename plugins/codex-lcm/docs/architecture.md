@@ -17,7 +17,7 @@ Codex LCM is packaged as a native Codex plugin. The manifest at
 `.codex-plugin/plugin.json` declares:
 
 - `mcpServers`: points to `.mcp.json`, which starts `node ./bin/codex-lcm mcp`.
-- `hooks`: points to `hooks/hooks.codex.json`, which registers the six lifecycle hooks.
+- `hooks`: points to `hooks/hooks.codex.json`, which registers the lifecycle hooks.
 - `skills`: points to `skills/`, which exposes `lcm-recall`.
 
 After `codex plugin add codex-lcm@codex-lcm`, these plugin-owned resources are
@@ -85,7 +85,7 @@ Each summary records:
 - overview
 - topics
 - key user prompts and notes
-- assistant outcomes from `Stop` and `PreCompact`
+- assistant outcomes from `Stop` plus compaction signals from `PreCompact` and `PostCompact`
 - source event IDs
 
 `session_summary_fts` lets broad topic queries match these compact clues before

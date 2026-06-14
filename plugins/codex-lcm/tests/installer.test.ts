@@ -17,6 +17,7 @@ test("install dry-run reports MCP and hook wiring without modifying Codex home",
   assert.match(planned.skills.recall_skill, /lcm-recall\/SKILL\.md$/u);
   assert.equal(planned.hooks.SessionStart[0].hooks[0].type, "command");
   assert.match(planned.hooks.SessionStart[0].hooks[0].command, /codex-lcm" hook SessionStart/u);
+  assert.match(planned.hooks.PostCompact[0].hooks[0].command, /codex-lcm" hook PostCompact/u);
   assert.equal(fs.existsSync(path.join(codexHome, "hooks.json")), false);
 });
 

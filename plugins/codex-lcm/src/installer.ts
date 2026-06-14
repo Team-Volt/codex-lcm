@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { codexHome, pluginRoot } from "./config.ts";
 
-const HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "Stop"];
+const HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop"];
 
 export type InstallerOptions = {
   codexHome?: string;

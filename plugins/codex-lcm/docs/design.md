@@ -7,7 +7,7 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 ## Codex Surfaces Verified During Development
 
 - `~/.codex/config.toml` has `features.hooks = true`, `features.memories = true`, `plugins = true`, and existing stdio MCP entries under `[mcp_servers.*]`.
-- `~/.codex/hooks.json` uses Codex lifecycle names `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`.
+- Native hook manifests use Codex lifecycle names `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop`. The global `~/.codex/hooks.json` file may stay empty when hooks come from installed plugins.
 - `codex mcp add --help` supports stdio MCP registration with `codex mcp add <name> -- <command>...`.
 - Installed plugins declare `.codex-plugin/plugin.json`, optional `.mcp.json`, and optional hook manifests. Codex injects `${PLUGIN_ROOT}` for plugin hook commands so hooks can resolve the installed plugin root.
 - Installed hook scripts read JSON from stdin, tolerate snake_case and camelCase payload fields, and exit cleanly on malformed JSON.
@@ -17,7 +17,7 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 
 - `.codex-plugin/plugin.json` declares plugin metadata and points to `.mcp.json` plus `hooks/hooks.codex.json`.
 - `.mcp.json` registers a stdio MCP server command: `node ./bin/codex-lcm mcp`.
-- `hooks/hooks.codex.json` registers the six requested lifecycle events and calls `node "${PLUGIN_ROOT}/bin/codex-lcm" hook <event>`.
+- `hooks/hooks.codex.json` registers the supported lifecycle events and calls `node "${PLUGIN_ROOT}/bin/codex-lcm" hook <event>`.
 - `bin/codex-lcm` is the CLI entrypoint for both plugin use and local development.
 
 ## Data Model
@@ -43,7 +43,8 @@ Edge insertion rejects self-edges and recursive back edges, so the derived graph
 
 The summary layer is also deterministic and rebuildable. It extracts compact
 session-level clues from high-signal events: user prompts, notes, stop messages,
-and pre-compact messages. Session summaries store title, overview, topics, key
+pre-compaction checkpoints, and post-compaction messages that include a `summary`
+or `reason`. Session summaries store title, overview, topics, key
 prompts, outcomes, and source event IDs. Summary nodes form a multi-depth DAG:
 D0 nodes summarize bounded high-signal event chunks, and D1+ nodes summarize
 lower-depth summary nodes. No LLM, embeddings, or network calls are required.
@@ -59,7 +60,7 @@ matched lineage instead of scanning or packing an entire long transcript.
 
 ## Hook Behavior
 
-`codex-lcm hook <event>` reads JSON from stdin and normalizes it. It accepts common Codex hook keys in snake_case or camelCase, including `session_id`, `sessionId`, `cwd`, `tool_name`, `toolName`, `tool_input`, `toolArgs`, `tool_output`, `tool_response`, `prompt`, and `userPrompt`.
+`codex-lcm hook <event>` reads JSON from stdin and normalizes it. It accepts common Codex hook keys in snake_case or camelCase, including `session_id`, `sessionId`, `cwd`, `tool_name`, `toolName`, `tool_input`, `toolArgs`, `tool_output`, `tool_response`, `prompt`, and `userPrompt`. For compaction, `PreCompact` remains the structural checkpoint and `PostCompact` records the completion marker plus any compacted summary payload Codex provides.
 
 The hook path is synchronous only long enough to sanitize, append JSONL, and attempt local indexing. Index failures are swallowed after a diagnostic line to stderr so Codex turns are not blocked by the indexer.
 

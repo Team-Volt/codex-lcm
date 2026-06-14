@@ -147,6 +147,130 @@ test("tool chatter does not rebuild session summaries until a landmark event", (
   storage.close();
 });
 
+test("post-compaction payloads refresh session summaries as high-signal outcomes", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "postcompact-session",
+      cwd: "/tmp/postcompact",
+      prompt: "track the compaction recovery path",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostCompact",
+    rawInput: JSON.stringify({
+      session_id: "postcompact-session",
+      cwd: "/tmp/postcompact",
+      trigger: "auto",
+      summary: "context compacted and ready for bounded LCM recall",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  }));
+
+  const summary = storage.getSessionMemorySummary("postcompact-session");
+  assert.equal(summary?.updated_at, "2026-06-09T12:00:01.000Z");
+  assert.match(summary?.overview ?? "", /bounded LCM recall/u);
+  assert.equal(summary?.source_event_ids.length, 2);
+  assert.deepEqual(storage.stats().hook_event_counts, { PostCompact: 1, UserPromptSubmit: 1 });
+
+  storage.close();
+});
+
+test("post-compaction reason text is a summary signal fallback", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostCompact",
+    rawInput: JSON.stringify({
+      session_id: "postcompact-reason-session",
+      cwd: "/tmp/postcompact-reason",
+      trigger: "manual",
+      reason: "manual compaction finished after context got tight",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  const summary = storage.getSessionMemorySummary("postcompact-reason-session");
+  assert.match(summary?.overview ?? "", /context got tight/u);
+  assert.deepEqual(summary?.outcomes, ["manual compaction finished after context got tight"]);
+
+  storage.close();
+});
+
+test("empty post-compaction events do not refresh derived summaries", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "empty-postcompact-session",
+      cwd: "/tmp/empty-postcompact",
+      prompt: "initial compaction setup",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostCompact",
+    rawInput: JSON.stringify({
+      session_id: "empty-postcompact-session",
+      cwd: "/tmp/empty-postcompact",
+      trigger: "auto",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  }));
+
+  const summary = storage.getSessionMemorySummary("empty-postcompact-session");
+  assert.equal(summary?.updated_at, "2026-06-09T12:00:00.000Z");
+  assert.deepEqual(summary?.source_event_ids.length, 1);
+  assert.deepEqual(storage.stats().hook_event_counts, { PostCompact: 1, UserPromptSubmit: 1 });
+
+  storage.close();
+});
+
+test("post-compaction does not create checkpoint nodes", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PreCompact",
+    rawInput: JSON.stringify({
+      session_id: "compact-checkpoint-session",
+      cwd: "/tmp/compact-checkpoint",
+      reason: "before compact",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostCompact",
+    rawInput: JSON.stringify({
+      session_id: "compact-checkpoint-session",
+      cwd: "/tmp/compact-checkpoint",
+      summary: "after compact",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  }));
+
+  const graph = storage.getSessionGraph("compact-checkpoint-session", { limit: 20 });
+  assert.equal(graph.nodes.filter((node) => node.kind === "checkpoint").length, 1);
+  assert.deepEqual(storage.stats().hook_event_counts, { PostCompact: 1, PreCompact: 1 });
+
+  storage.close();
+});
+
 test("search sessions relaxes broad queries when strict FTS has no match", () => {
   const home = tempHome();
   const storage = createStorage({ home });

@@ -144,6 +144,7 @@ Hooks capture the JSON payload Codex sends on stdin for:
 - `PreToolUse`
 - `PostToolUse`
 - `PreCompact`
+- `PostCompact`
 - `Stop`
 
 Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes.
@@ -187,14 +188,20 @@ and Hermes LCM: search compact summary nodes first, then expand the selected
 source lineage under the caller's token budget. Raw transcript events remain
 available through `lcm_get_session`.
 
+`PreCompact` marks the checkpoint before Codex rewrites the visible context.
+`PostCompact` records the completion marker and any compacted summary payload
+Codex provides, so later recall can tell that compaction finished.
+Only `PostCompact` events with a `summary` or `reason` are promoted into session
+summary text; empty completion markers are still stored and counted.
+
 Use `lcm_stats` or `node bin/codex-lcm stats --json` to inspect aggregate index
 shape without reading raw transcript text. The stats output includes summary
 nodes by depth, summary source types, hook-event counts, graph node and edge
 counts, freshness timestamps, max summary depth, and the number of sessions with
-summary nodes. Check `hook_event_counts.PreCompact` when verifying that Codex
-compaction hooks are being captured. Health and stats diagnostics open the index
-read-only; normal hook ingestion and note writes perform derived-index
-maintenance.
+summary nodes. Check `hook_event_counts.PreCompact` and
+`hook_event_counts.PostCompact` when verifying that Codex compaction hooks are
+being captured. Health and stats diagnostics open the index read-only; normal
+hook ingestion and note writes perform derived-index maintenance.
 
 For long sessions, summary rebuilds use a bounded sample of early high-signal
 events, latest high-signal events, and recent events. That keeps ingestion fast

@@ -39,9 +39,9 @@ node bin/codex-lcm install --dry-run --json
 ```
 
 The dry run prints commands for `SessionStart`, `UserPromptSubmit`,
-`PreToolUse`, `PostToolUse`, `PreCompact`, and `Stop`. This tool is not needed
-after native plugin installation and does not edit `~/.codex/hooks.json`
-automatically.
+`PreToolUse`, `PostToolUse`, `PreCompact`, `PostCompact`, and `Stop`. This
+tool is not needed after native plugin installation and does not edit
+`~/.codex/hooks.json` automatically.
 
 For native plugin installs, Codex discovers hooks through `.codex-plugin/plugin.json`:
 
@@ -100,7 +100,8 @@ CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm stats --json
 If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and falls back to raw-log scanning.
 Use `stats --json` when you need aggregate hook-event, summary-depth,
 graph-count, and freshness checks without opening the SQLite database directly.
-For compaction hook verification, check `hook_event_counts.PreCompact`.
+For compaction hook verification, check `hook_event_counts.PreCompact` and
+`hook_event_counts.PostCompact`.
 `health` and `stats` open the index read-only. If derived summaries need to be
 rebuilt after an upgrade, the next normal hook ingestion or `lcm_record_note`
 write will run maintenance.
