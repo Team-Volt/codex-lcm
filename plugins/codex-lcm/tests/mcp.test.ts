@@ -65,6 +65,7 @@ test("MCP stats reports aggregate summary depth and graph counts", () => {
   const stats = responses[1].result.structuredContent.stats;
   assert.equal(stats.event_count, 9);
   assert.equal(stats.summary_node_count, 3);
+  assert.deepEqual(stats.hook_event_counts, { UserPromptSubmit: 9 });
   assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
   assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
   assert.equal(stats.sessions_with_summary_nodes, 1);

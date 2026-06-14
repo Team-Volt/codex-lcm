@@ -185,6 +185,9 @@ node bin/codex-lcm stats --json
 node bin/codex-lcm status --json
 ```
 
+`stats --json` includes `hook_event_counts`, so `PreCompact` capture can be
+checked without opening raw logs or SQLite.
+
 For deeper implementation notes, see:
 
 - `plugins/codex-lcm/README.md`

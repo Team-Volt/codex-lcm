@@ -152,6 +152,7 @@ export type Health = {
 };
 
 export type LcmStats = Health & {
+  hook_event_counts: Record<string, number>;
   summary_nodes_by_depth: Record<string, number>;
   summary_nodes_by_source_type: Record<string, number>;
   graph_nodes_by_kind: Record<string, number>;
@@ -227,6 +228,7 @@ export class LcmStorage {
     if (!this.db) {
       return {
         ...health,
+        hook_event_counts: countEventsByHook(readRawEvents(this.config.rawLogPath)),
         summary_nodes_by_depth: {},
         summary_nodes_by_source_type: {},
         graph_nodes_by_kind: {},
@@ -240,6 +242,12 @@ export class LcmStorage {
 
     return {
       ...health,
+      hook_event_counts: this.countMap(`
+        SELECT hook_event AS key, COUNT(*) AS count
+        FROM events
+        GROUP BY hook_event
+        ORDER BY hook_event
+      `),
       summary_nodes_by_depth: this.countMap(`
         SELECT depth AS key, COUNT(*) AS count
         FROM summary_nodes
@@ -1984,6 +1992,14 @@ function readRawEvents(rawLogPath: string): NormalizedEvent[] {
         return [];
       }
     });
+}
+
+function countEventsByHook(events: NormalizedEvent[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const event of events) {
+    counts[event.hook_event] = (counts[event.hook_event] ?? 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
 }
 
 function uniqueEvents(events: NormalizedEvent[]): NormalizedEvent[] {

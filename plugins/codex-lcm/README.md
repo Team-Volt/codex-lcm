@@ -180,8 +180,10 @@ available through `lcm_get_session`.
 
 Use `lcm_stats` or `node bin/codex-lcm stats --json` to inspect aggregate index
 shape without reading raw transcript text. The stats output includes summary
-nodes by depth, summary source types, graph node and edge counts, freshness
-timestamps, max summary depth, and the number of sessions with summary nodes.
+nodes by depth, summary source types, hook-event counts, graph node and edge
+counts, freshness timestamps, max summary depth, and the number of sessions with
+summary nodes. Check `hook_event_counts.PreCompact` when verifying that Codex
+compaction hooks are being captured.
 
 For long sessions, summary rebuilds use a bounded sample of early high-signal
 events, latest high-signal events, and recent events. That keeps ingestion fast
