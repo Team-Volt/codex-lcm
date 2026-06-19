@@ -243,6 +243,13 @@ export class LcmStorage {
     this.db?.close();
   }
 
+  hasEvent(eventId: string): boolean {
+    if (this.db) {
+      return this.db.prepare("SELECT 1 FROM events WHERE event_id = ?1 LIMIT 1").get(eventId) !== undefined;
+    }
+    return readRawEvents(this.config.rawLogPath).some((event) => event.event_id === eventId);
+  }
+
   ingest(event: NormalizedEvent): void {
     if (this.readOnly) {
       throw new Error("Cannot ingest events with read-only storage.");
@@ -258,23 +265,47 @@ export class LcmStorage {
   }
 
   health(): Health {
-    const rawEvents = this.db ? undefined : readRawEvents(this.config.rawLogPath);
+    if (!this.db) return this.rawHealth();
+    try {
+      return {
+        home: this.config.home,
+        raw_log_path: this.config.rawLogPath,
+        index_path: this.config.indexPath,
+        raw_log_exists: fs.existsSync(this.config.rawLogPath),
+        index_exists: fs.existsSync(this.config.indexPath),
+        index_available: true,
+        ...(this.indexError ? { index_error: this.indexError } : {}),
+        event_count: Number(this.scalar("SELECT COUNT(*) AS count FROM events")),
+        session_count: Number(this.scalar("SELECT COUNT(*) AS count FROM sessions")),
+        graph_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_nodes")),
+        graph_edge_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_edges")),
+        summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
+        summary_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM summary_nodes")),
+      };
+    } catch (error) {
+      this.indexError = error instanceof Error ? error.message : String(error);
+      try {
+        this.db.close();
+      } catch {
+        // Ignore close errors while degrading to raw JSONL health.
+      }
+      this.db = undefined;
+      return this.rawHealth();
+    }
+  }
+
+  private rawHealth(): Health {
+    const rawEvents = readRawEvents(this.config.rawLogPath);
     return {
       home: this.config.home,
       raw_log_path: this.config.rawLogPath,
       index_path: this.config.indexPath,
       raw_log_exists: fs.existsSync(this.config.rawLogPath),
       index_exists: fs.existsSync(this.config.indexPath),
-      index_available: this.db !== undefined,
+      index_available: false,
       ...(this.indexError ? { index_error: this.indexError } : {}),
-      event_count: this.db ? Number(this.scalar("SELECT COUNT(*) AS count FROM events")) : rawEvents?.length ?? 0,
-      session_count: this.db ? Number(this.scalar("SELECT COUNT(*) AS count FROM sessions")) : summarizeSessions(rawEvents ?? []).length,
-      ...(this.db ? {
-        graph_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_nodes")),
-        graph_edge_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_edges")),
-        summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
-        summary_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM summary_nodes")),
-      } : {}),
+      event_count: rawEvents.length,
+      session_count: summarizeSessions(rawEvents).length,
     };
   }
 

@@ -1,4 +1,6 @@
 import { DEFAULT_LIMITS, loadConfig, pluginRoot } from "./config.ts";
+import { importCodexSessions } from "./codex-import.ts";
+import { buildDoctorReport } from "./doctor.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
 import { planInstall, planUninstall, readStatus } from "./installer.ts";
@@ -33,6 +35,31 @@ export async function main(argv: string[]): Promise<void> {
   }
   if (command === "status") {
     printObjectOrText(readStatus({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }), rest);
+    return;
+  }
+  if (command === "doctor") {
+    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    try {
+      printObjectOrText(buildDoctorReport({
+        status: readStatus({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }),
+        health: storage.health(),
+      }), rest);
+    } finally {
+      storage.close();
+    }
+    return;
+  }
+  if (command === "import-codex-sessions") {
+    const dryRun = rest.includes("--dry-run");
+    const storage = createStorage({ config: loadConfig(), readOnly: dryRun });
+    try {
+      printObjectOrText(importCodexSessions(storage, {
+        from: optionValue(rest, "--from"),
+        dryRun,
+      }), rest);
+    } finally {
+      storage.close();
+    }
     return;
   }
   if (command === "health") {
@@ -85,8 +112,10 @@ Commands:
   codex-lcm hook <event>
   codex-lcm install --dry-run [--json]   Print manual MCP/hook wiring plan
   codex-lcm status [--json]
+  codex-lcm doctor [--json]              Diagnose install, storage, and capture state
   codex-lcm health [--json]
   codex-lcm stats [--json]
+  codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--json]
   codex-lcm uninstall --dry-run [--json] Print manual cleanup plan
 `);
 }
