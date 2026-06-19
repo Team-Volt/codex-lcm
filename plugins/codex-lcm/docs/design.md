@@ -81,14 +81,16 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 - `lcm_get_session_summary`: retrieve the deterministic extractive summary for a session, including topics and source event pointers.
 - `lcm_get_session_graph`: retrieve a bounded DAG slice for a session, including summary nodes when present.
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
+- `lcm_expand_query`: search matching summary nodes, recursively expand source lineage, and return bounded evidence for a focused query. It is deterministic retrieval, not LLM synthesis. The default budget is 2000 tokens. Pass `overview: true` to prefer higher-depth, source-rich nodes for broad lineage queries. `sourceLimit` is per matched node/source expansion. If no evidence matches, the Markdown says so; if a tight budget truncates output, it reserves room for a focused source-event excerpt when available.
 - `lcm_pack_context`: pack matching summary nodes and bounded source lineage into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search when scoped retrieval is empty.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
 
 The standard agent path is `lcm_grep` -> `lcm_describe` -> `lcm_expand`.
 `lcm_pack_context` remains the Codex-specific shortcut when the caller wants a
-ready-to-use context block. The plugin does not expose `lcm_expand_query`
-because the MCP server does not spawn a reasoning agent; callers should expand
-evidence and answer in the host model.
+ready-to-use context block. `lcm_expand_query` is the shortcut for a focused
+question where the caller wants recursive evidence without manually choosing a
+summary node first; `overview: true` changes that shortcut into a broad lineage
+view.
 
 The plugin also provides `skills/lcm-recall/SKILL.md`. That skill tells Codex when to call LCM and how to avoid loading entire long sessions unnecessarily.
 

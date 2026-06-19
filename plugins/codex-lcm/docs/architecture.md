@@ -107,6 +107,14 @@ The standard retrieval flow is deliberately small:
 3. `lcm_expand` expands one selected summary node into bounded source summary
    nodes and source events.
 
+`lcm_expand_query` is the query-first expansion path. It searches matching
+summary nodes, recursively follows summary-node source lineage, and returns
+focused source events plus summary-node evidence under a caller-supplied token
+budget. By default it keeps direct query matches competitive; with
+`overview: true`, it favors higher-depth, source-rich summary nodes for broad
+lineage views. `sourceLimit` bounds source events or source summary nodes per
+matched node/source expansion, not total returned evidence.
+
 `lcm_pack_context` uses the same underlying summary-node lineage, but packages
 the result as model-ready Markdown. It searches summary nodes first, ranks
 direct lower-depth hits ahead of broad higher-depth hits, and expands only the
@@ -145,6 +153,7 @@ Before inserting an edge, storage runs a recursive reachability check from the p
 For very long sessions, callers should prefer bounded graph and event access:
 
 - `lcm_grep`, `lcm_describe`, and `lcm_expand` for discovery and source-backed expansion.
+- `lcm_expand_query` for focused recursive evidence expansion without manually choosing a node first.
 - `lcm_get_session` with `limit` and `cursor`.
 - `lcm_get_session_graph` with a bounded `limit`.
 - `lcm_pack_context`, which searches summary nodes first and expands bounded source lineage.

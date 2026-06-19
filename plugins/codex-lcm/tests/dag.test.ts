@@ -424,6 +424,140 @@ test("pack context ignores scoped tool-only hits when global high-signal matches
   storage.close();
 });
 
+test("expand query recursively descends summary-node source lineage under budget", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "recursive-query-session";
+  const cwd = "/tmp/recursive-query";
+
+  for (let index = 0; index < 40; index += 1) {
+    ingest(storage, "UserPromptSubmit", {
+      session_id: sessionId,
+      turn_id: `turn-${index}`,
+      cwd,
+      prompt: index === 3
+        ? "recursive-evidence-needle source lineage decision"
+        : `recursive evidence filler ${index}`,
+    }, new Date(Date.UTC(2026, 5, 9, 14, 0, index)).toISOString());
+  }
+
+  const expansion = storage.expandQuery({
+    query: "recursive-evidence-needle source lineage",
+    cwd,
+    budgetTokens: 450,
+    limit: 2,
+    sourceLimit: 4,
+  });
+
+  assert.match(expansion.markdown, /recursive-evidence-needle source lineage decision/u);
+  assert.equal(expansion.query, "recursive-evidence-needle source lineage");
+  assert.equal(expansion.estimated_tokens <= 450, true);
+  assert.equal(expansion.nodes.some((node) => node.depth > 0), true);
+  assert.equal(expansion.nodes.some((node) => node.depth === 0), true);
+  assert.equal(expansion.sources.some((source) => source.kind === "summary" && source.node_id), true);
+  assert.equal(expansion.sources.some((source) => source.kind === "event" && source.event_id), true);
+
+  storage.close();
+});
+
+test("expand query reports no matching evidence in markdown", () => {
+  const storage = createStorage({ home: tempHome() });
+
+  const expansion = storage.expandQuery({
+    query: "no-such-expand-query-needle",
+    cwd: "/tmp/no-match-expand-query",
+    budgetTokens: 200,
+  });
+
+  assert.equal(expansion.nodes.length, 0);
+  assert.equal(expansion.events.length, 0);
+  assert.equal(expansion.sources.length, 0);
+  assert.match(expansion.markdown, /No matching evidence found\./u);
+
+  storage.close();
+});
+
+test("expand query reserves markdown space for a focused event under tiny budgets", () => {
+  const storage = createStorage({ home: tempHome() });
+  const cwd = "/tmp/tiny-expand-query";
+  const query = "tiny-event-needle focused event context extra terms that make the query header consume budget";
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "tiny-expand-query-session",
+    turn_id: "turn-1",
+    cwd,
+    prompt: `${"long filler ".repeat(40)}${query} survives tiny markdown budget`,
+  }, "2026-06-09T15:00:00.000Z");
+
+  const expansion = storage.expandQuery({
+    query,
+    cwd,
+    budgetTokens: 32,
+    sourceLimit: 1,
+  });
+
+  assert.equal(expansion.events.some((event) => JSON.stringify(event.payload).includes("tiny-event-needle")), true);
+  assert.match(expansion.markdown, /tiny-event-needle focused event/u);
+  assert.equal(expansion.estimated_tokens > 32, true);
+  assert.equal(expansion.estimated_tokens <= 80, true);
+
+  storage.close();
+});
+
+test("expand query reports when budget is too small for evidence markdown", () => {
+  const storage = createStorage({ home: tempHome() });
+  const cwd = "/tmp/too-small-expand-query";
+  const query = `tiny-budget-overflow-needle ${"query filler ".repeat(40)}`;
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "too-small-expand-query-session",
+    turn_id: "turn-1",
+    cwd,
+    prompt: `${query} focused event exists but cannot fit`,
+  }, "2026-06-09T15:01:00.000Z");
+
+  const expansion = storage.expandQuery({
+    query,
+    cwd,
+    budgetTokens: 32,
+    sourceLimit: 1,
+  });
+
+  assert.equal(expansion.events.some((event) => JSON.stringify(event.payload).includes("tiny-budget-overflow-needle")), true);
+  assert.match(expansion.markdown, /Budget too small to include evidence\./u);
+
+  storage.close();
+});
+
+test("expand query overview mode prefers higher-depth source-rich nodes", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "overview-expand-query-session";
+  const cwd = "/tmp/overview-expand-query";
+
+  for (let index = 0; index < 40; index += 1) {
+    ingest(storage, "UserPromptSubmit", {
+      session_id: sessionId,
+      turn_id: `turn-${index}`,
+      cwd,
+      prompt: `overview-lineage recursive summary evidence ${index}`,
+    }, new Date(Date.UTC(2026, 5, 9, 16, 0, index)).toISOString());
+  }
+
+  const expansion = storage.expandQuery({
+    query: "overview-lineage recursive summary evidence",
+    cwd,
+    budgetTokens: 600,
+    limit: 4,
+    sourceLimit: 4,
+    overview: true,
+  });
+
+  assert.equal(expansion.nodes.length > 0, true);
+  assert.equal(expansion.nodes[0].depth > 0, true);
+  assert.equal(expansion.sources.some((source) => source.kind === "summary" && (source.depth ?? 0) > 0), true);
+
+  storage.close();
+});
+
 test("migrates pre-DAG SQLite indexes before creating graph indexes", () => {
   const home = tempHome();
   fs.mkdirSync(home, { recursive: true });

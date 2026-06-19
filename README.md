@@ -47,8 +47,10 @@ A typical retrieval flow is:
    so one missing word does not make retrieval look empty.
 3. Use `lcm_describe` on a promising session or summary node to inspect the
    summary, depth, source IDs, and lineage before loading more.
-4. Use `lcm_expand` on a chosen summary node when you need source-backed
-   evidence, or `lcm_pack_context` when Codex needs a ready-to-use context block.
+4. Use `lcm_expand` on a chosen summary node, `lcm_expand_query` when the query
+   should pick and recursively expand matching nodes, or `lcm_pack_context` when
+   Codex needs a ready-to-use context block. Pass `overview: true` to
+   `lcm_expand_query` for broad, source-rich lineage views.
 5. Page through long sessions or request a bounded graph slice instead of loading
    an entire raw history at once.
 
