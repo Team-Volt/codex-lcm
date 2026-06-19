@@ -31,6 +31,20 @@ Storage defaults to `~/.codex-lcm`. Override storage for hook and MCP operations
 CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 ```
 
+Useful diagnostics and backfill commands:
+
+```sh
+node bin/codex-lcm doctor --json
+node bin/codex-lcm import-codex-sessions --dry-run --json
+node bin/codex-lcm import-codex-sessions --json
+```
+
+`doctor` reports install wiring, storage health, capture state, summary index
+state, and recommendations. `import-codex-sessions` imports existing Codex
+session JSONL files from `~/.codex/sessions` unless `--from PATH` is provided.
+It leaves source transcripts untouched and skips duplicate event IDs on repeated
+runs.
+
 ## MCP Tools
 
 Standard recall workflow:

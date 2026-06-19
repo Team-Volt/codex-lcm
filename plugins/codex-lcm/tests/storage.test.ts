@@ -843,6 +843,33 @@ test("still appends raw JSONL when SQLite index is unavailable", () => {
   storage.close();
 });
 
+test("health falls back to raw JSONL when SQLite queries fail after open", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "health-query-fail", cwd: "/tmp/raw", prompt: "raw health fallback" }),
+    env: {},
+    now,
+  }));
+
+  (storage as unknown as { db: { prepare: () => never; close: () => void } }).db = {
+    prepare() {
+      throw new Error("query failure");
+    },
+    close() {},
+  };
+
+  const health = storage.health();
+  assert.equal(health.index_available, false);
+  assert.match(health.index_error ?? "", /query failure/u);
+  assert.equal(health.event_count, 1);
+  assert.equal(health.session_count, 1);
+
+  storage.close();
+});
+
 function ingestStatsFixture(storage: ReturnType<typeof createStorage>): void {
   for (let index = 0; index < 8; index += 1) {
     storage.ingest(normalizeHookEvent({

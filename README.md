@@ -179,10 +179,18 @@ Useful local commands:
 
 ```sh
 node bin/codex-lcm --help
+node bin/codex-lcm doctor --json
 node bin/codex-lcm health --json
 node bin/codex-lcm stats --json
 node bin/codex-lcm status --json
+node bin/codex-lcm import-codex-sessions --dry-run --json
 ```
+
+`doctor --json` combines plugin wiring status, storage health, event capture,
+summary indexing, and concrete recommendations. `import-codex-sessions` scans
+existing Codex JSONL transcripts, defaulting to `~/.codex/sessions`, and ingests
+them into LCM without modifying the source files. Use `--dry-run` first to see
+how many records are importable; repeated imports skip duplicate event IDs.
 
 `stats --json` includes `hook_event_counts`, so `PreCompact` capture can be
 checked without opening raw logs or SQLite.
