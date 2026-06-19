@@ -10,7 +10,7 @@ type JsonRpcMessage = {
 };
 
 const SERVER_NAME = "codex-lcm";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 
 const TOOLS = [
   {

@@ -99,10 +99,10 @@ operation.
 
 ## Installation
 
-Install from GitHub with Codex's native plugin flow:
+Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref main
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -121,24 +121,32 @@ development or compatibility checks.
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Update a local checkout install by pulling the checkout, then asking Codex to
-refresh the installed plugin cache:
+Upgrade an existing GitHub marketplace install to `v0.2.0`:
 
 ```sh
-git -C /path/to/codex-lcm pull --ff-only
+codex plugin marketplace remove codex-lcm
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Update an existing GitHub marketplace install with:
+Upgrade a local checkout install to `v0.2.0` by checking out the release tag,
+then asking Codex to refresh the installed plugin cache:
 
 ```sh
-codex plugin marketplace upgrade codex-lcm
+git -C /path/to/codex-lcm fetch --tags origin
+git -C /path/to/codex-lcm checkout v0.2.0
 codex plugin add codex-lcm@codex-lcm
 ```
 
-If `codex plugin marketplace upgrade codex-lcm` says the marketplace is not
-configured as a Git marketplace, your `codex-lcm` marketplace is path-backed.
-Use the local-checkout update command above instead. The cache directory may
+To keep following the moving `main` branch instead of a release tag, use:
+
+```sh
+codex plugin marketplace add Team-Volt/codex-lcm --ref main
+codex plugin add codex-lcm@codex-lcm
+```
+
+If your `codex-lcm` marketplace is path-backed and you want to keep using that
+checkout, use the local-checkout command above instead. The cache directory may
 keep the same version suffix after a local refresh; use `codex plugin list`,
 `codex-lcm stats --json`, or the `lcm_stats` MCP tool after restart to verify
 the loaded code.
@@ -155,11 +163,47 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Codex LCM is a `0.1` developer release. The core flow is implemented and tested:
-native plugin install, hook ingestion, local storage, search, graph retrieval,
-context packing, and the `lcm-recall` skill. The search backend is intentionally
-simple for now: SQLite FTS plus deterministic extractive summaries. Embeddings
-and hosted services are not required.
+Current release: `v0.2.0`.
+
+Codex LCM is a local-first Codex memory plugin with native plugin installation,
+hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
+deterministic summaries, recursive summary-node expansion, context packing,
+health/stats diagnostics, post-compaction capture, and Codex session import
+tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
+resumes, compaction recovery, long-running work, and questions about prior
+sessions.
+
+### v0.2.0 notes
+
+This first formal release provides the core Codex LCM workflow:
+
+- Native Codex plugin packaging with MCP, hooks, and skill registration.
+- Sanitized append-only event capture with local SQLite search and graph indexes.
+- Session, turn, event, checkpoint, tool-result, and summary-source DAG support.
+- Deterministic extractive session summaries plus recursive summary-node search
+  and expansion.
+- MCP tools for health, stats, current-session lookup, grep, describe, expand,
+  query expansion, context packing, graph inspection, raw-event paging, and note
+  recording.
+- Diagnostics for install wiring, capture state, storage health, hook counts,
+  and import readiness.
+- `import-codex-sessions` support for backfilling existing Codex transcript
+  JSONL files without modifying the source transcripts.
+- Local-only operation with no runtime npm dependencies, hosted services, or
+  embeddings required.
+
+Upgrade to `v0.2.0`:
+
+```sh
+codex plugin marketplace remove codex-lcm
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
+codex plugin add codex-lcm@codex-lcm
+```
+
+If `codex plugin marketplace remove codex-lcm` says the marketplace does not
+exist, continue with the `marketplace add` command.
+
+Restart Codex Desktop or start a fresh Codex CLI/TUI session after upgrading.
 
 ## Development
 
