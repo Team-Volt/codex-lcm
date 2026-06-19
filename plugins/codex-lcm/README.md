@@ -73,10 +73,10 @@ Native Codex plugin installation is the primary install path. It wires the MCP
 server, hook manifest, and skill from `.codex-plugin/plugin.json`; no separate
 `codex-lcm install` step is required.
 
-Install from GitHub:
+Install the latest tagged release from GitHub:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref main
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -89,26 +89,34 @@ codex plugin add codex-lcm@codex-lcm
 
 The first TUI session after install asks you to review and trust the hooks. That review is expected because Codex hooks can run outside the sandbox after you trust them.
 
-To update a local checkout install:
+To upgrade an existing GitHub marketplace install to `v0.2.0`:
 
 ```sh
-git -C /path/to/codex-lcm pull --ff-only
+codex plugin marketplace remove codex-lcm
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
 codex plugin add codex-lcm@codex-lcm
 ```
 
-To update an existing GitHub marketplace install:
+To upgrade a local checkout install to `v0.2.0`:
 
 ```sh
-codex plugin marketplace upgrade codex-lcm
+git -C /path/to/codex-lcm fetch --tags origin
+git -C /path/to/codex-lcm checkout v0.2.0
 codex plugin add codex-lcm@codex-lcm
 ```
 
-If Codex reports that `codex-lcm` is not configured as a Git marketplace, it is
-using your local checkout as the marketplace. Skip `marketplace upgrade` and run
-`codex plugin add codex-lcm@codex-lcm` after updating that checkout. The cache
-directory can keep the same version-looking suffix after a local refresh; verify
-with `codex plugin list`, `codex-lcm stats --json`, or the `lcm_stats` MCP tool
-after restart.
+To keep following the moving `main` branch instead of a release tag:
+
+```sh
+codex plugin marketplace add Team-Volt/codex-lcm --ref main
+codex plugin add codex-lcm@codex-lcm
+```
+
+If your `codex-lcm` marketplace is path-backed and you want to keep using that
+checkout, use the local-checkout command above instead. The cache directory can
+keep the same version-looking suffix after a local refresh; verify with
+`codex plugin list`, `codex-lcm stats --json`, or the `lcm_stats` MCP tool after
+restart.
 
 Restart Codex Desktop or start a fresh Codex CLI/TUI session after updating.
 Long-running clients keep the old plugin cache until they restart. If the update
