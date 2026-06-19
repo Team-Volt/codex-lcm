@@ -74,6 +74,26 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "lcm_expand_query",
+    title: "LCM Expand Query",
+    description: "Find matching summary nodes and recursively expand their source lineage into bounded evidence for a focused query.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        cwd: { type: "string" },
+        repoRoot: { type: "string" },
+        sessionIds: { type: "array", items: { type: "string" } },
+        budgetTokens: { type: "number", default: 2000 },
+        limit: { type: "number", default: 4 },
+        sourceLimit: { type: "number", default: 6, description: "Maximum source events or source summary nodes considered per matched node." },
+        overview: { type: "boolean", default: false, description: "Prefer higher-depth, source-rich summary nodes for broad overview queries." },
+      },
+      required: ["query"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "lcm_current_session",
     title: "LCM Current Session",
     description: "Find the current or latest known session by session ID, cwd, or repo root.",
@@ -221,6 +241,7 @@ function handleMessage(message: JsonRpcMessage): void {
       instructions: [
         "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, summary nodes, and packed context across Codex sessions.",
         "Use lcm_grep, lcm_describe, and lcm_expand for the standard LCM discovery-inspection-expansion workflow.",
+        "Use lcm_expand_query when a focused query should pick matching summary nodes and recursively expand their source evidence.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
         "Use lcm_pack_context for model-ready summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
         "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
@@ -291,6 +312,19 @@ function callTool(params: Record<string, unknown>) {
           nodeId: stringArg(args.nodeId, "nodeId"),
           query: optionalString(args.query),
           limit: optionalNumber(args.limit),
+        });
+        return toolResult(expansion.markdown, { expansion });
+      }
+      case "lcm_expand_query": {
+        const expansion = storage.expandQuery({
+          query: stringArg(args.query, "query"),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          sessionIds: optionalStringArray(args.sessionIds),
+          budgetTokens: optionalNumber(args.budgetTokens),
+          limit: optionalNumber(args.limit),
+          sourceLimit: optionalNumber(args.sourceLimit),
+          overview: optionalBoolean(args.overview),
         });
         return toolResult(expansion.markdown, { expansion });
       }

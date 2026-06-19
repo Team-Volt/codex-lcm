@@ -28,6 +28,7 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_grep",
       "lcm_describe",
       "lcm_expand",
+      "lcm_expand_query",
       "lcm_current_session",
       "lcm_search_sessions",
       "lcm_get_session",
@@ -38,6 +39,9 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_record_note",
     ],
   );
+  const expandQueryTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_expand_query");
+  assert.equal(expandQueryTool.inputSchema.properties.budgetTokens.default, 2000);
+  assert.equal(expandQueryTool.inputSchema.properties.overview.type, "boolean");
 });
 
 test("MCP stats reports aggregate summary depth and graph counts", () => {
@@ -283,6 +287,51 @@ test("MCP standard LCM verbs grep, describe, and expand summary-node evidence", 
   assert.equal(expansion.node.node_id, nodeId);
   assert.equal(expansion.source_events.length > 0, true);
   assert.match(expansion.markdown, /canonical alias evidence/u);
+});
+
+test("MCP expand_query returns recursive evidence for a focused query", () => {
+  const home = tempHome();
+  const cwd = "/tmp/mcp-expand-query";
+  for (let index = 0; index < 40; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "mcp-expand-query-session",
+        cwd,
+        prompt: index === 3
+          ? "mcp-expand-query-needle source lineage decision"
+          : `mcp expand query filler ${index}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assert.equal(hook.status, 0, hook.stderr);
+  }
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_expand_query",
+        arguments: {
+          query: "mcp-expand-query-needle source lineage",
+          cwd,
+          budgetTokens: 500,
+          limit: 2,
+          sourceLimit: 4,
+        },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const expansion = responses[1].result.structuredContent.expansion;
+  assert.equal(expansion.query, "mcp-expand-query-needle source lineage");
+  assert.match(expansion.markdown, /mcp-expand-query-needle source lineage decision/u);
+  assert.equal(expansion.estimated_tokens <= 500, true);
+  assert.equal(expansion.sources.some((source: { kind: string; node_id?: string }) => source.kind === "summary" && source.node_id), true);
+  assert.equal(expansion.sources.some((source: { kind: string; event_id?: string }) => source.kind === "event" && source.event_id), true);
+  assert.equal(typeof expansion.truncated, "boolean");
 });
 
 test("MCP describe reports missing sessions instead of fabricating descriptions", () => {

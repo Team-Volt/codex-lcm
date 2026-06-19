@@ -27,6 +27,7 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 - Use `lcm_stats` for aggregate storage, hook-event, summary-depth, graph-count, and freshness questions. It is the normal path for "how many summaries/nodes?" and "did PreCompact/PostCompact fire?" checks.
 - Keep retrieval bounded. Prefer packed context, graph slices, limits, and cursors over full-session dumps.
 - For standard LCM recall, use `lcm_grep` to find candidates, `lcm_describe` to inspect session or summary-node lineage, and `lcm_expand` to expand a chosen summary node into bounded source evidence.
+- Use `lcm_expand_query` when you have a focused question but do not yet know which summary node to expand. It searches matching summary nodes and recursively expands source lineage into bounded evidence. It does not synthesize an answer. Use `overview: true` for broad lineage views, and remember `sourceLimit` is per matched node/source expansion.
 - Treat `lcm_pack_context` as the model-ready retrieval path. It searches summary nodes first and expands bounded source lineage, so it is usually better than loading raw events for broad recall.
 - For broad or meta questions, start with `lcm_grep` or `lcm_search_sessions` and use each result's `best_match` clue before loading raw events. Summary titles, topics, outcomes, source event IDs, and best-match snippets are meant to be skimmed first.
 - Treat `discovery.confidence` and `discovery.reasons` as the best first-pass signal for whether a session is worth opening. `best_match.score` is raw match strength, not a standalone relevance judgment.
@@ -43,10 +44,11 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 2. Call `lcm_current_session` with the current `cwd` and repo root if known.
 3. Call `lcm_grep` with a concrete query and `cwd` or `repoRoot` when scope is known.
 4. For a promising hit, call `lcm_describe` with the session ID. If it exposes a relevant summary node, call `lcm_expand` with that node ID.
-5. Call `lcm_pack_context` when you need a model-ready context block instead of manually reading descriptions and expansions.
-6. If the task may involve older work or another thread, repeat `lcm_grep` or `lcm_search_sessions` with broader scope.
-7. For long sessions, prefer `lcm_describe`, `lcm_get_session_graph`, and paged `lcm_get_session` with `limit` and `cursor`; do not load the entire session unless the user explicitly asks for a full raw dump.
-8. Use `lcm_get_recent_context` for the latest bounded tail of a known session.
+5. Call `lcm_expand_query` when a focused query needs deeper source-lineage evidence and manual node selection would add friction.
+6. Call `lcm_pack_context` when you need a model-ready context block instead of manually reading descriptions and expansions.
+7. If the task may involve older work or another thread, repeat `lcm_grep` or `lcm_search_sessions` with broader scope.
+8. For long sessions, prefer `lcm_describe`, `lcm_get_session_graph`, and paged `lcm_get_session` with `limit` and `cursor`; do not load the entire session unless the user explicitly asks for a full raw dump.
+9. Use `lcm_get_recent_context` for the latest bounded tail of a known session.
 
 ## Tool Hints
 
@@ -55,6 +57,7 @@ Skip it for self-contained requests where prior Codex context cannot affect the 
 - Use `lcm_grep` for normal discovery across summaries and high-signal events; inspect `discovery.confidence`, `discovery.reasons`, `best_match.kind`, `best_match.snippet`, and `best_match.topics` to decide which sessions deserve deeper retrieval.
 - Use `lcm_describe` to inspect session summary nodes, node depth, source IDs, and lineage before expanding.
 - Use `lcm_expand` only after choosing a summary node. It expands bounded source summary nodes and source events, not an entire transcript.
+- Use `lcm_expand_query` for focused recursive evidence expansion when the query itself should pick the matching summary nodes.
 - Use `lcm_search_sessions` as the compatibility/advanced name for cross-session lookup.
 - Use `lcm_get_session_summary` for compact semantic clues, outcomes, and source event IDs.
 - Use `lcm_pack_context` for model-ready summary-node context with bounded source expansion.

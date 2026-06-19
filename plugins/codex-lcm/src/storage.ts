@@ -106,6 +106,26 @@ export type PackedContext = {
   sources: Array<{ kind: "event" | "note" | "checkpoint" | "summary"; session_id: string; event_id?: string; node_id?: string; timestamp: string }>;
 };
 
+export type QueryExpansionSource = {
+  kind: "summary" | "event";
+  session_id: string;
+  timestamp: string;
+  node_id?: string;
+  event_id?: string;
+  depth?: number;
+  hook_event?: string;
+};
+
+export type LcmQueryExpansion = {
+  query: string;
+  markdown: string;
+  estimated_tokens: number;
+  truncated: boolean;
+  nodes: SummaryNode[];
+  events: NormalizedEvent[];
+  sources: QueryExpansionSource[];
+};
+
 export type LcmDescription =
   | {
     target: "session";
@@ -628,6 +648,168 @@ export class LcmStorage {
       source_nodes: sourceNodes,
       source_events: sourceEvents,
       markdown,
+    };
+  }
+
+  expandQuery(args: {
+    query: string;
+    cwd?: string;
+    repoRoot?: string;
+    sessionIds?: string[];
+    budgetTokens?: number;
+    limit?: number;
+    sourceLimit?: number;
+    overview?: boolean;
+  }): LcmQueryExpansion {
+    const query = args.query.trim();
+    if (query.length === 0) throw new Error("query must be a non-empty string.");
+    const budgetTokens = Math.max(32, args.budgetTokens ?? 2000);
+    const budgetChars = budgetTokens * 4;
+    const candidateLimit = clampLimit(args.limit, 4, 12);
+    const searchLimit = args.overview ? Math.max(candidateLimit * 4, 24) : candidateLimit;
+    const sourceLimit = clampLimit(args.sourceLimit, 6, 24);
+    const maxNodes = Math.max(candidateLimit * 12, 24);
+
+    let candidates = this.searchSummaryNodes({
+      query,
+      cwd: args.cwd,
+      repoRoot: args.repoRoot,
+      sessionIds: args.sessionIds,
+      limit: searchLimit,
+    });
+    if (candidates.length === 0 && args.cwd && !args.sessionIds?.length) {
+      candidates = this.searchSummaryNodes({
+        query,
+        repoRoot: args.repoRoot,
+        limit: searchLimit,
+      });
+    }
+    if (candidates.length === 0 && !args.sessionIds?.length) {
+      const sessions = this.searchSessions({
+        query,
+        cwd: args.cwd,
+        repoRoot: args.repoRoot,
+        limit: candidateLimit,
+      });
+      for (const session of sessions) {
+        candidates.push(...this.getTopSummaryNodesForSession(session.session_id, 1));
+      }
+    }
+
+    const nodesById = new Map<string, SummaryNode>();
+    const eventsById = new Map<string, NormalizedEvent>();
+    const visit = (node: SummaryNode) => {
+      if (nodesById.has(node.node_id) || nodesById.size >= maxNodes) return;
+      nodesById.set(node.node_id, node);
+      for (const event of this.getSummaryNodeSourceEvents(node, query, sourceLimit)) {
+        eventsById.set(event.event_id, event);
+      }
+      if (node.source_type !== "nodes") return;
+      const sourceNodes = rankQueryExpansionNodes(this.getSourceSummaryNodes(node, sourceLimit), query, args.overview === true);
+      for (const sourceNode of sourceNodes) {
+        visit(sourceNode);
+        if (nodesById.size >= maxNodes) break;
+      }
+    };
+    for (const candidate of rankQueryExpansionNodes(candidates, query, args.overview === true).slice(0, candidateLimit)) visit(candidate);
+
+    const nodes = rankQueryExpansionNodes([...nodesById.values()], query, args.overview === true);
+    const events = [...eventsById.values()].sort((a, b) =>
+      queryTermHitCount(eventSignalText(b), query) - queryTermHitCount(eventSignalText(a), query) ||
+      a.timestamp.localeCompare(b.timestamp) ||
+      a.event_id.localeCompare(b.event_id));
+    const sources: QueryExpansionSource[] = [
+      ...nodes.map((node) => ({
+        kind: "summary" as const,
+        session_id: node.session_id,
+        node_id: node.node_id,
+        timestamp: node.latest_at,
+        depth: node.depth,
+      })),
+      ...events.map((event) => ({
+        kind: "event" as const,
+        session_id: event.session_id,
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+        hook_event: event.hook_event,
+      })),
+    ];
+
+    const lines = [
+      "# Codex LCM Recursive Evidence",
+      "",
+      `query: ${query}`,
+      "",
+    ];
+    let chars = lines.join("\n").length;
+    let truncated = false;
+    const addBlock = (text: string): boolean => {
+      if (chars + text.length > budgetChars) {
+        truncated = true;
+        return false;
+      }
+      lines.push(text);
+      chars += text.length;
+      return true;
+    };
+    const addFocusedEventFallback = (event: NormalizedEvent): void => {
+      let prefix = `### Focused Source Events\n- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}: `;
+      const suffix = "\n";
+      let available = budgetChars - chars - prefix.length - suffix.length;
+      if (available <= 0) {
+        prefix = "### Focused Source Events\n- ";
+        available = budgetChars - chars - prefix.length - suffix.length;
+      }
+      if (available <= 0) {
+        lines.push("Budget too small to include evidence.\n");
+        chars += "Budget too small to include evidence.\n".length;
+        truncated = true;
+        return;
+      }
+      const signal = focusedExcerpt(eventSignalText(event), query, available);
+      lines.push(`${prefix}${signal}${suffix}`);
+      chars += prefix.length + signal.length + suffix.length;
+      truncated = true;
+    };
+
+    if (events.length > 0) {
+      const eventLines = ["### Focused Source Events"];
+      for (const event of events.slice(0, sourceLimit)) {
+        const signal = eventSignalText(event);
+        if (signal.length === 0) continue;
+        eventLines.push(`- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}: ${signal}`);
+      }
+      eventLines.push("");
+      if (!addBlock(eventLines.join("\n"))) addFocusedEventFallback(events[0]);
+    }
+
+    if (nodes.length === 0 && events.length === 0) {
+      addBlock("No matching evidence found.\n");
+    }
+
+    for (const node of nodes) {
+      if (!addBlock(summaryNodeToMarkdown(node))) {
+        const compact = [
+          `## Summary Node d${node.depth}`,
+          `node: ${node.node_id}`,
+          `session: ${node.session_id}`,
+          `Focus: ${summaryNodeTitle(node)}`,
+          "",
+        ].join("\n");
+        addBlock(compact);
+      }
+    }
+
+    const markdown = lines.join("\n");
+
+    return {
+      query,
+      markdown,
+      estimated_tokens: estimateTokenCount(markdown),
+      truncated,
+      nodes,
+      events,
+      sources,
     };
   }
 
@@ -2025,6 +2207,34 @@ function parseStringArray(value: unknown): string[] {
 
 function clampLimit(limit: number | undefined, fallback: number, max = 200): number {
   return Math.min(Math.max(Number(limit ?? fallback), 1), max);
+}
+
+function rankQueryExpansionNodes(nodes: SummaryNode[], query: string, overview: boolean): SummaryNode[] {
+  const ranked = rankSummaryNodesForContext(nodes, query);
+  if (!overview) return ranked;
+  return ranked.sort((left, right) =>
+    right.depth - left.depth ||
+    Number(right.source_type === "nodes") - Number(left.source_type === "nodes") ||
+    right.source_ids.length - left.source_ids.length ||
+    queryTermHitCount(summaryNodeSearchText(right), query) - queryTermHitCount(summaryNodeSearchText(left), query) ||
+    right.latest_at.localeCompare(left.latest_at) ||
+    right.node_id.localeCompare(left.node_id));
+}
+
+function focusedExcerpt(value: string, query: string, maxChars: number): string {
+  if (maxChars <= 0) return "";
+  if (value.length <= maxChars) return value;
+  const terms = query.toLowerCase().split(/[^a-z0-9_-]+/u).filter((term) => term.length > 0);
+  const lowerValue = value.toLowerCase();
+  const hit = terms
+    .map((term) => lowerValue.indexOf(term))
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right)[0] ?? 0;
+  const prefix = hit > 0 ? "..." : "";
+  const suffix = hit + maxChars < value.length ? "..." : "";
+  const bodyBudget = Math.max(0, maxChars - prefix.length - suffix.length);
+  const start = Math.max(0, Math.min(hit, value.length - bodyBudget));
+  return `${prefix}${value.slice(start, start + bodyBudget)}${suffix}`;
 }
 
 function parseCursor(cursor: string | undefined): number {

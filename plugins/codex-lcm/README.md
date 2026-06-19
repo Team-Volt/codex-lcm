@@ -38,6 +38,7 @@ Standard recall workflow:
 - `lcm_grep`: find relevant sessions by searching summary nodes, session summaries, and high-signal events.
 - `lcm_describe`: inspect a session or summary node, including depth, source IDs, and lineage metadata.
 - `lcm_expand`: expand one summary node into bounded source summary nodes and high-signal source events.
+- `lcm_expand_query`: answer a focused retrieval need by searching matching summary nodes and recursively expanding their source lineage into bounded evidence. The default budget is 2000 tokens. Use `overview: true` for broad, source-rich lineage views. `sourceLimit` is per matched node/source expansion, and tight budgets reserve room for a focused source-event excerpt when one exists.
 - `lcm_pack_context`: pack relevant summary-node context into a model-ready Markdown block.
 
 Diagnostics and lower-level tools:
