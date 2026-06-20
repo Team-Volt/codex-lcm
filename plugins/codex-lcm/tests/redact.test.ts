@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import { sanitizeForStorage } from "../src/redact.ts";
@@ -32,6 +33,97 @@ test("redacts obvious bearer and provider tokens inside strings", () => {
   assert.match(text, /Authorization: Bearer \[REDACTED:token\]/u);
   assert.match(text, /ghp_\[REDACTED:token\]/u);
   assert.equal(result.redactions.length, 2);
+});
+
+test("redacts secret-like assignments inside strings", () => {
+  const result = sanitizeForStorage({
+    env: [
+      "authToken=tok_123456789",
+      "accessToken: acc_123456789",
+      "refresh_token = ref_123456789",
+      "sessionCookie=sid=abc123",
+      '"DATABASE_URL":"postgres://user:password@localhost:5432/app"',
+      "PRIVATE_KEY=-----BEGIN PRIVATE KEY-----abc-----END PRIVATE KEY-----",
+    ].join("\n"),
+  });
+
+  const env = (result.value as { env: string }).env;
+  assert.match(env, /authToken=\[REDACTED:secret\]/u);
+  assert.match(env, /accessToken: \[REDACTED:secret\]/u);
+  assert.match(env, /refresh_token = \[REDACTED:secret\]/u);
+  assert.match(env, /sessionCookie=\[REDACTED:secret\]/u);
+  assert.match(env, /"DATABASE_URL":"\[REDACTED:secret\]"/u);
+  assert.match(env, /PRIVATE_KEY=\[REDACTED:secret\]/u);
+  assert.doesNotMatch(env, /tok_123456789|password@localhost|BEGIN PRIVATE KEY/u);
+  assert.equal(result.redactions.length, 6);
+});
+
+test("redacts multiline private key assignments inside strings", () => {
+  const result = sanitizeForStorage({
+    env: [
+      "PRIVATE_KEY=-----BEGIN PRIVATE KEY-----",
+      "SUPERSECRETKEYBODY",
+      "-----END PRIVATE KEY-----",
+      'QUOTED_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----',
+      "SUPERSECRETQUOTEDKEYBODY",
+      '-----END PRIVATE KEY-----"',
+    ].join("\n"),
+  });
+
+  const env = (result.value as { env: string }).env;
+  assert.equal(env, 'PRIVATE_KEY=[REDACTED:secret]\nQUOTED_PRIVATE_KEY="[REDACTED:secret]"');
+  assert.doesNotMatch(env, /SUPERSECRETKEYBODY|SUPERSECRETQUOTEDKEYBODY|BEGIN PRIVATE KEY|END PRIVATE KEY/u);
+  assert.equal(result.redactions.length, 2);
+});
+
+test("redacts standalone multiline private key blocks inside strings", () => {
+  const result = sanitizeForStorage({
+    content: [
+      "before",
+      "-----BEGIN PRIVATE KEY-----",
+      "STANDALONESECRETKEYBODY",
+      "-----END PRIVATE KEY-----",
+      "after",
+    ].join("\n"),
+  });
+
+  const content = (result.value as { content: string }).content;
+  assert.equal(content, "before\n[REDACTED:secret]\nafter");
+  assert.doesNotMatch(content, /STANDALONESECRETKEYBODY|BEGIN PRIVATE KEY|END PRIVATE KEY/u);
+  assert.equal(result.redactions.length, 1);
+});
+
+test("keeps large non-secret strings within the performance budget", () => {
+  const content = "a".repeat(64 * 1024);
+  const startedAt = performance.now();
+  const result = sanitizeForStorage({ content });
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.deepEqual(result.value, { content });
+  assert.equal(result.redactions.length, 0);
+  assert.ok(elapsedMs < 250, `expected redaction to stay under 250ms, got ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("keeps long assignment-like non-secret strings within the performance budget", () => {
+  const content = `note=${"a".repeat(32 * 1024)} token ${"b".repeat(32 * 1024)}`;
+  const startedAt = performance.now();
+  const result = sanitizeForStorage({ content }, { maxStringBytes: content.length + 1024, maxPayloadBytes: content.length + 4096 });
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.deepEqual(result.value, { content });
+  assert.equal(result.redactions.length, 0);
+  assert.ok(elapsedMs < 250, `expected assignment-like redaction to stay under 250ms, got ${elapsedMs.toFixed(1)}ms`);
+});
+
+test("redacts long secret assignments within the performance budget", () => {
+  const content = `token=${"a".repeat(64 * 1024)}`;
+  const startedAt = performance.now();
+  const result = sanitizeForStorage({ content }, { maxStringBytes: content.length + 1024, maxPayloadBytes: content.length + 4096 });
+  const elapsedMs = performance.now() - startedAt;
+
+  assert.deepEqual(result.value, { content: "token=[REDACTED:secret]" });
+  assert.equal(result.redactions.length, 1);
+  assert.ok(elapsedMs < 250, `expected long secret assignment redaction to stay under 250ms, got ${elapsedMs.toFixed(1)}ms`);
 });
 
 test("truncates oversized string values with hash metadata", () => {

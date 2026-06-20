@@ -78,7 +78,7 @@ test("uses only Codex session environment fallback keys", () => {
 test("malformed stdin becomes a sanitized parse-error event instead of throwing", () => {
   const event = normalizeHookEvent({
     hookEvent: "SessionStart",
-    rawInput: "{not json sk-proj-secret-value",
+    rawInput: "{not json sk-proj-secret-value authToken=tok_123456789",
     env: { PWD: "/tmp/fallback" },
     now: fixedNow,
   });
@@ -86,6 +86,6 @@ test("malformed stdin becomes a sanitized parse-error event instead of throwing"
   assert.equal(event.session_id.startsWith("unknown-"), true);
   assert.equal(event.cwd, "/tmp/fallback");
   assert.equal(event.payload.parse_error, true);
-  assert.equal(event.payload.raw_preview, "{not json sk-proj_[REDACTED:token]");
-  assert.equal(event.redactions.length, 1);
+  assert.equal(event.payload.raw_preview, "{not json sk-proj_[REDACTED:token] authToken=[REDACTED:secret]");
+  assert.equal(event.redactions.length, 2);
 });
