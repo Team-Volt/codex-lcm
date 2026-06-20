@@ -47,12 +47,13 @@ const TOOLS = [
   {
     name: "lcm_describe",
     title: "LCM Describe",
-    description: "Inspect a session or summary node, including summary-node depth and source lineage metadata.",
+    description: "Inspect a session, summary node, or file reference, including summary-node depth and source lineage metadata.",
     inputSchema: {
       type: "object",
       properties: {
         sessionId: { type: "string" },
         nodeId: { type: "string" },
+        fileId: { type: "string" },
         limit: { type: "number", default: 50 },
       },
     },
@@ -90,6 +91,29 @@ const TOOLS = [
         overview: { type: "boolean", default: false, description: "Prefer higher-depth, source-rich summary nodes for broad overview queries." },
       },
       required: ["query"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "lcm_context_plan",
+    title: "LCM Context Plan",
+    description: "Estimate recent-session token pressure and recommend whether to pack LCM context. This observes pressure only; Codex owns compaction.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        cwd: { type: "string" },
+        repoRoot: { type: "string" },
+        modelContextWindow: { type: "number", default: 128000 },
+        autoCompactTokenLimit: { type: "number", default: 96000 },
+        recentEventLimit: { type: "number", default: 80 },
+        canControlCompaction: {
+          type: "boolean",
+          const: false,
+          default: false,
+          description: "Always false; this tool reports context pressure but cannot own Codex compaction.",
+        },
+      },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -242,6 +266,7 @@ function handleMessage(message: JsonRpcMessage): void {
         "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, summary nodes, and packed context across Codex sessions.",
         "Use lcm_grep, lcm_describe, and lcm_expand for the standard LCM discovery-inspection-expansion workflow.",
         "Use lcm_expand_query when a focused query should pick matching summary nodes and recursively expand their source evidence.",
+        "Use lcm_context_plan to estimate whether recent context is near or past a caller-provided soft limit; it does not control Codex compaction.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
         "Use lcm_pack_context for model-ready summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
         "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
@@ -300,11 +325,14 @@ function callTool(params: Record<string, unknown>) {
         const description = storage.describeMemory({
           sessionId: optionalString(args.sessionId),
           nodeId: optionalString(args.nodeId),
+          fileId: optionalString(args.fileId),
           limit: optionalNumber(args.limit),
         });
         const target = description.target === "session"
           ? description.session?.session_id ?? args.sessionId
-          : description.node.node_id;
+          : description.target === "summary_node"
+            ? description.node.node_id
+            : description.file_ref.file_ref_id;
         return toolResult(`Described ${description.target} ${target}.`, { description });
       }
       case "lcm_expand": {
@@ -327,6 +355,17 @@ function callTool(params: Record<string, unknown>) {
           overview: optionalBoolean(args.overview),
         });
         return toolResult(expansion.markdown, { expansion });
+      }
+      case "lcm_context_plan": {
+        const plan = storage.getContextPlan({
+          sessionId: optionalString(args.sessionId),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          modelContextWindow: optionalNumber(args.modelContextWindow),
+          autoCompactTokenLimit: optionalNumber(args.autoCompactTokenLimit),
+          recentEventLimit: optionalNumber(args.recentEventLimit),
+        });
+        return toolResult(`Context plan state: ${plan.state}. ${plan.recommendation}`, { plan });
       }
       case "lcm_current_session": {
         const session = storage.getCurrentSession({

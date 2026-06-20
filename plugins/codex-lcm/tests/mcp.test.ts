@@ -29,6 +29,7 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_describe",
       "lcm_expand",
       "lcm_expand_query",
+      "lcm_context_plan",
       "lcm_current_session",
       "lcm_search_sessions",
       "lcm_get_session",
@@ -42,6 +43,8 @@ test("MCP server initializes and lists LCM tools", () => {
   const expandQueryTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_expand_query");
   assert.equal(expandQueryTool.inputSchema.properties.budgetTokens.default, 2000);
   assert.equal(expandQueryTool.inputSchema.properties.overview.type, "boolean");
+  const contextPlanTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_context_plan");
+  assert.equal(contextPlanTool.inputSchema.properties.canControlCompaction.const, false);
 });
 
 test("MCP stats reports aggregate summary depth and graph counts", () => {
@@ -71,14 +74,18 @@ test("MCP stats reports aggregate summary depth and graph counts", () => {
 
   const stats = responses[1].result.structuredContent.stats;
   assert.equal(stats.event_count, 9);
+  assert.equal(stats.summary_count, 1);
+  assert.equal(stats.session_summary_count, 1);
   assert.equal(stats.summary_node_count, 3);
   assert.deepEqual(stats.hook_event_counts, { UserPromptSubmit: 9 });
   assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
   assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
+  assert.equal(stats.sessions_with_session_summary, 1);
   assert.equal(stats.sessions_with_summary_nodes, 1);
   assert.equal(stats.max_summary_depth, 1);
   assert.equal(stats.graph_nodes_by_kind.event, 9);
   assert.equal(stats.graph_edges_by_kind.contains, 9);
+  assert.equal(stats.graph_edges_by_kind.summary_source, 11);
 });
 
 test("MCP stats does not rebuild derived summaries", () => {
@@ -112,6 +119,44 @@ test("MCP stats does not rebuild derived summaries", () => {
   assert.equal(stats.summary_count, 0);
   assert.equal(stats.summary_node_count, 0);
   assert.equal(stats.index_error, undefined);
+});
+
+test("MCP context plan reports token pressure for a session", () => {
+  const home = tempHome();
+  for (let index = 0; index < 12; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "mcp-context-plan-session",
+        cwd: "/tmp/mcp-context-plan",
+        prompt: `mcp context budget pressure ${index} ${"signal ".repeat(40)}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assert.equal(hook.status, 0, hook.stderr);
+  }
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_context_plan",
+        arguments: {
+          sessionId: "mcp-context-plan-session",
+          modelContextWindow: 2_000,
+          autoCompactTokenLimit: 200,
+        },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const plan = responses[1].result.structuredContent.plan;
+  assert.equal(plan.session_id, "mcp-context-plan-session");
+  assert.equal(plan.state, "over_limit");
+  assert.equal(plan.can_control_compaction, false);
+  assert.equal(responses[1].result.content[0].text.includes("over_limit"), true);
 });
 
 test("MCP tools search and retrieve synthetic hook data", () => {
@@ -287,6 +332,64 @@ test("MCP standard LCM verbs grep, describe, and expand summary-node evidence", 
   assert.equal(expansion.node.node_id, nodeId);
   assert.equal(expansion.source_events.length > 0, true);
   assert.match(expansion.markdown, /canonical alias evidence/u);
+});
+
+test("MCP describe inspects large file references without loading content", () => {
+  const home = tempHome();
+  const cwd = "/tmp/mcp-file-ref";
+  const content = JSON.stringify({
+    rows: Array.from({ length: 800 }, (_, index) => ({ id: index, label: `mcp file row ${index}` })),
+  });
+  assert.equal(runCli(["hook", "PostToolUse"], {
+    input: JSON.stringify({
+      session_id: "mcp-file-ref-session",
+      cwd,
+      tool_name: "Read",
+      tool_response: {
+        file_path: "/tmp/mcp-file-ref/data.json",
+        content,
+      },
+    }),
+    env: { CODEX_LCM_HOME: home },
+  }).status, 0);
+
+  const descriptionResponses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_describe",
+        arguments: { sessionId: "mcp-file-ref-session", limit: 10 },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const fileRefs = descriptionResponses[1].result.structuredContent.description.file_refs;
+  assert.equal(fileRefs.length, 1);
+  assert.equal(fileRefs[0].path, "/tmp/mcp-file-ref/data.json");
+  assert.match(fileRefs[0].exploration_summary, /JSON object/u);
+  assert.equal("content" in fileRefs[0], false);
+
+  const fileResponses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_describe",
+        arguments: { fileId: fileRefs[0].file_ref_id },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+
+  const fileDescription = fileResponses[1].result.structuredContent.description;
+  assert.equal(fileDescription.target, "file_ref");
+  assert.equal(fileDescription.file_ref.file_ref_id, fileRefs[0].file_ref_id);
+  assert.equal(fileDescription.file_ref.byte_count, Buffer.byteLength(content, "utf8"));
+  assert.match(fileDescription.file_ref.exploration_summary, /rows/u);
 });
 
 test("MCP expand_query returns recursive evidence for a focused query", () => {

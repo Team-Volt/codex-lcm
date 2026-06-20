@@ -218,6 +218,10 @@ test("builds multi-depth summary nodes with source lineage", () => {
   assert.equal(depths.has(1), true);
   assert.equal(summaryNodes.some((node) => String(node.label).includes("SUMMARY-NODE-LATEST")), true);
   assert.equal(graph.edges.some((edge) => edge.kind === "summary_source"), true);
+  assert.equal(
+    new Set(graph.edges.map((edge) => `${edge.from_node_id}\0${edge.to_node_id}\0${edge.kind}`)).size,
+    graph.edges.length,
+  );
   for (const node of summaryNodes) {
     assert.equal(Array.isArray(node.metadata.source_ids), true);
     assert.match(String(node.metadata.source_type), /events|nodes/u);

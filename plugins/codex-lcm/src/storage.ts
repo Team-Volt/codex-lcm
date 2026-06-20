@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { loadConfig, type LcmConfig } from "./config.ts";
 import { createNoteEvent, type NormalizedEvent } from "./events.ts";
+import { extractFileReferences, type FileReference } from "./file-refs.ts";
 import {
   SUMMARY_ALGORITHM_VERSION,
   SUMMARY_NODE_CHUNK_SIZE,
@@ -36,6 +37,7 @@ import {
   type SummarySourceType,
 } from "./summary.ts";
 
+export type { FileReference } from "./file-refs.ts";
 export type { SessionMemorySummary, SummaryNode, SummarySourceType } from "./summary.ts";
 
 export type StorageOptions = {
@@ -106,6 +108,26 @@ export type RecentContext = {
   events: NormalizedEvent[];
 };
 
+export type ContextPlanState = "empty" | "under_limit" | "near_limit" | "over_limit" | "over_context";
+
+export type ContextPlan = {
+  session_id?: string;
+  cwd?: string;
+  repo_root?: string;
+  model_context_window: number;
+  auto_compact_token_limit: number;
+  recent_event_limit: number;
+  estimated_recent_tokens: number;
+  estimated_summary_tokens: number;
+  estimated_total_tokens: number;
+  summary_node_count: number;
+  latest_event_at: string | null;
+  state: ContextPlanState;
+  recommendation: string;
+  suggested_tools: string[];
+  can_control_compaction: false;
+};
+
 export type PackedContext = {
   markdown: string;
   estimated_tokens: number;
@@ -138,12 +160,17 @@ export type LcmDescription =
     session: SessionSummary | undefined;
     summary: SessionMemorySummary | undefined;
     summary_nodes: SummaryNode[];
+    file_refs: FileReference[];
   }
   | {
     target: "summary_node";
     node: SummaryNode;
     source_nodes: SummaryNode[];
     source_event_count: number;
+  }
+  | {
+    target: "file_ref";
+    file_ref: FileReference;
   };
 
 export type LcmExpansion = {
@@ -197,6 +224,7 @@ export type Health = {
   graph_node_count?: number;
   graph_edge_count?: number;
   summary_count?: number;
+  session_summary_count?: number;
   summary_node_count?: number;
 };
 
@@ -206,6 +234,7 @@ export type LcmStats = Health & {
   summary_nodes_by_source_type: Record<string, number>;
   graph_nodes_by_kind: Record<string, number>;
   graph_edges_by_kind: Record<string, number>;
+  sessions_with_session_summary: number;
   sessions_with_summary_nodes: number;
   max_summary_depth: number | null;
   latest_event_at: string | null;
@@ -217,7 +246,11 @@ const SUMMARY_EARLY_SIGNAL_LIMIT = 120;
 const SUMMARY_LATEST_SIGNAL_LIMIT = 240;
 const SUMMARY_RECENT_EVENT_LIMIT = 40;
 const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
-const KNOWN_ACYCLIC_EDGE_KINDS = new Set(["contains", "next", "tool_result", "checkpoint"]);
+const KNOWN_ACYCLIC_EDGE_KINDS = new Set(["contains", "next", "tool_result", "checkpoint", "summary_source"]);
+const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
+const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
+const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
+const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
 
 type IndexEventResult = {
   inserted: boolean;
@@ -245,6 +278,7 @@ export class LcmStorage {
         this.initialize();
         this.replayRawLogToIndex();
         this.backfillGraph();
+        this.backfillFileRefs();
         this.backfillSessionMemorySummaries();
       }
     } catch (error) {
@@ -436,6 +470,7 @@ export class LcmStorage {
         summary_nodes_by_source_type: {},
         graph_nodes_by_kind: {},
         graph_edges_by_kind: {},
+        sessions_with_session_summary: 0,
         sessions_with_summary_nodes: 0,
         max_summary_depth: null,
         latest_event_at: null,
@@ -475,6 +510,8 @@ export class LcmStorage {
         GROUP BY kind
         ORDER BY kind
       `),
+      session_summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
+      sessions_with_session_summary: Number(this.scalar("SELECT COUNT(DISTINCT session_id) AS count FROM session_summaries")),
       sessions_with_summary_nodes: Number(this.scalar("SELECT COUNT(DISTINCT session_id) AS count FROM summary_nodes")),
       max_summary_depth: this.optionalNumberScalar("SELECT MAX(depth) AS value FROM summary_nodes"),
       latest_event_at: this.optionalStringScalar("SELECT MAX(timestamp) AS value FROM events"),
@@ -665,10 +702,16 @@ export class LcmStorage {
         AND from_node_id IN (${placeholders})
         AND to_node_id IN (${placeholders})
       ORDER BY position ASC, created_at ASC, kind ASC
-    `).all(sessionId, ...nodeIdList)
+      `).all(sessionId, ...nodeIdList)
       .map(rowToGraphEdge)
       .filter((edge) => nodeIds.has(edge.from_node_id) && nodeIds.has(edge.to_node_id));
-    edges.push(...rawSummaryNodes.flatMap((node) => summaryGraphEdges(node, nodeIds)));
+    const edgeKeys = new Set(edges.map((edge) => graphEdgeKey(edge)));
+    for (const edge of rawSummaryNodes.flatMap((node) => summaryGraphEdges(node, nodeIds))) {
+      const key = graphEdgeKey(edge);
+      if (edgeKeys.has(key)) continue;
+      edgeKeys.add(key);
+      edges.push(edge);
+    }
     return { session_id: sessionId, nodes, edges };
   }
 
@@ -714,6 +757,78 @@ export class LcmStorage {
     };
   }
 
+  getContextPlan(args: {
+    sessionId?: string;
+    cwd?: string;
+    repoRoot?: string;
+    modelContextWindow?: number;
+    autoCompactTokenLimit?: number;
+    recentEventLimit?: number;
+  } = {}): ContextPlan {
+    const modelContextWindow = positiveInteger(args.modelContextWindow, DEFAULT_MODEL_CONTEXT_WINDOW);
+    const autoCompactTokenLimit = Math.min(
+      positiveInteger(args.autoCompactTokenLimit, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
+      modelContextWindow,
+    );
+    const recentEventLimit = clampLimit(args.recentEventLimit, DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT, 500);
+    try {
+      return this.buildContextPlanForArgs(args, modelContextWindow, autoCompactTokenLimit, recentEventLimit);
+    } catch (error) {
+      this.indexError = error instanceof Error ? error.message : String(error);
+      try {
+        this.db?.close();
+      } catch {
+        // Ignore close errors while degrading to raw JSONL context planning.
+      }
+      this.db = undefined;
+      return this.buildContextPlanForArgs(args, modelContextWindow, autoCompactTokenLimit, recentEventLimit);
+    }
+  }
+
+  private buildContextPlanForArgs(
+    args: {
+      sessionId?: string;
+      cwd?: string;
+      repoRoot?: string;
+    },
+    modelContextWindow: number,
+    autoCompactTokenLimit: number,
+    recentEventLimit: number,
+  ): ContextPlan {
+    const session = this.getCurrentSession({
+      sessionId: args.sessionId,
+      cwd: args.cwd,
+      repoRoot: args.repoRoot,
+    });
+    if (!session) {
+      return buildContextPlan({
+        modelContextWindow,
+        autoCompactTokenLimit,
+        recentEventLimit,
+        estimatedRecentTokens: 0,
+        estimatedSummaryTokens: 0,
+        summaryNodeCount: 0,
+        latestEventAt: null,
+      });
+    }
+
+    const events = this.getContextPlanEvents(session.session_id, recentEventLimit);
+    const summaryStats = this.getContextPlanSummaryStats(session.session_id);
+    const estimatedRecentTokens = estimateTokenCount(events.map(eventSearchText).join("\n"));
+    const latestEventAt = events[events.length - 1]?.timestamp ?? session.last_seen ?? null;
+
+    return buildContextPlan({
+      session,
+      modelContextWindow,
+      autoCompactTokenLimit,
+      recentEventLimit,
+      estimatedRecentTokens,
+      estimatedSummaryTokens: summaryStats.estimatedSummaryTokens,
+      summaryNodeCount: summaryStats.summaryNodeCount,
+      latestEventAt,
+    });
+  }
+
   recordNote(args: { sessionId: string; cwd: string; text: string }): NormalizedEvent {
     const event = createNoteEvent({
       sessionId: args.sessionId,
@@ -751,7 +866,39 @@ export class LcmStorage {
     `).all(sessionId, clampLimit(limit, 200, 2_000)).map(rowToSummaryNode);
   }
 
-  describeMemory(args: { sessionId?: string; nodeId?: string; limit?: number }): LcmDescription {
+  getFileRefsForSession(sessionId: string, limit = 50): FileReference[] {
+    if (!this.db) return [];
+    return this.db.prepare(`
+      SELECT file_ref_id, session_id, observed_event_id, timestamp, path, mime_type,
+             byte_count, sha256, exploration_summary, metadata_json
+      FROM file_refs
+      WHERE session_id = ?1
+      ORDER BY timestamp ASC, file_ref_id ASC
+      LIMIT ?2
+    `).all(sessionId, clampLimit(limit, 50, 500)).map(rowToFileReference);
+  }
+
+  getFileRef(fileRefId: string): FileReference | undefined {
+    if (!this.db) return undefined;
+    const row = this.db.prepare(`
+      SELECT file_ref_id, session_id, observed_event_id, timestamp, path, mime_type,
+             byte_count, sha256, exploration_summary, metadata_json
+      FROM file_refs
+      WHERE file_ref_id = ?1
+    `).get(fileRefId);
+    return row ? rowToFileReference(row) : undefined;
+  }
+
+  describeMemory(args: { sessionId?: string; nodeId?: string; fileId?: string; limit?: number }): LcmDescription {
+    if (args.fileId) {
+      const fileRef = this.getFileRef(args.fileId);
+      if (!fileRef) throw new Error(`File reference not found: ${args.fileId}`);
+      return {
+        target: "file_ref",
+        file_ref: fileRef,
+      };
+    }
+
     if (args.nodeId) {
       const node = this.getSummaryNode(args.nodeId);
       if (!node) throw new Error(`Summary node not found: ${args.nodeId}`);
@@ -775,6 +922,7 @@ export class LcmStorage {
       session,
       summary,
       summary_nodes: summaryNodes,
+      file_refs: this.getFileRefsForSession(args.sessionId, clampLimit(args.limit, 50, 500)),
     };
   }
 
@@ -1100,6 +1248,38 @@ export class LcmStorage {
       .slice(0, clampLimit(limit, SUMMARY_NODE_SOURCE_EVENT_LIMIT, 20));
   }
 
+  private getContextPlanEvents(sessionId: string, limit: number): NormalizedEvent[] {
+    if (!this.db) {
+      return readRawEvents(this.config.rawLogPath)
+        .filter((event) => event.session_id === sessionId)
+        .slice(-limit);
+    }
+    const rows = this.db.prepare(`
+      SELECT raw_json FROM (
+        SELECT raw_json, timestamp, rowid
+        FROM events
+        WHERE session_id = ?1
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT ?2
+      )
+      ORDER BY timestamp ASC, rowid ASC
+    `).all(sessionId, limit);
+    return rows.map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent);
+  }
+
+  private getContextPlanSummaryStats(sessionId: string): { summaryNodeCount: number; estimatedSummaryTokens: number } {
+    if (!this.db) return { summaryNodeCount: 0, estimatedSummaryTokens: 0 };
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS summary_node_count, COALESCE(SUM(token_count), 0) AS estimated_summary_tokens
+      FROM summary_nodes
+      WHERE session_id = ?1
+    `).get(sessionId) as { summary_node_count?: number; estimated_summary_tokens?: number } | undefined;
+    return {
+      summaryNodeCount: Number(row?.summary_node_count ?? 0),
+      estimatedSummaryTokens: Number(row?.estimated_summary_tokens ?? 0),
+    };
+  }
+
   packContext(args: { query?: string; sessionIds?: string[]; budgetTokens?: number; cwd?: string } = {}): PackedContext {
     const budgetTokens = Math.max(16, args.budgetTokens ?? 1200);
     const budgetChars = budgetTokens * 4;
@@ -1367,6 +1547,22 @@ export class LcmStorage {
         git_branch TEXT,
         topics_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS file_refs (
+        file_ref_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        observed_event_id TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        path TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        byte_count INTEGER NOT NULL,
+        sha256 TEXT NOT NULL,
+        exploration_summary TEXT NOT NULL,
+        metadata_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS index_metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
       CREATE VIRTUAL TABLE IF NOT EXISTS summary_node_fts USING fts5(
         node_id UNINDEXED,
         session_id,
@@ -1383,6 +1579,8 @@ export class LcmStorage {
       CREATE INDEX IF NOT EXISTS idx_session_summaries_updated ON session_summaries(updated_at);
       CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_depth_latest ON summary_nodes(session_id, depth, latest_at);
       CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_latest ON summary_nodes(session_id, latest_at);
+      CREATE INDEX IF NOT EXISTS idx_file_refs_session_time ON file_refs(session_id, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_file_refs_path ON file_refs(path);
     `);
     this.ensureColumn("events", "turn_id", "TEXT");
     this.ensureColumn("events", "tool_use_id", "TEXT");
@@ -1466,6 +1664,7 @@ export class LcmStorage {
     const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
     const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
     this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
+    this.indexFileRefsForEvent(event);
     const summaryTouched = isSummarySourceEvent(event);
     if (summaryTouched && options.rebuildSummary && this.shouldRebuildSessionMemorySummary(event)) {
       this.rebuildSessionMemorySummary(event.session_id);
@@ -1562,6 +1761,40 @@ export class LcmStorage {
 
     if (event.hook_event === "PreCompact" || eventCount % CHECKPOINT_INTERVAL === 0) {
       this.insertCheckpoint(event, eventCount);
+    }
+  }
+
+  private indexFileRefsForEvent(event: NormalizedEvent): void {
+    if (!this.db) return;
+    const refs = extractFileReferences(event);
+    for (const ref of refs) {
+      this.db.prepare(`
+        INSERT INTO file_refs
+          (file_ref_id, session_id, observed_event_id, timestamp, path, mime_type,
+           byte_count, sha256, exploration_summary, metadata_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(file_ref_id) DO UPDATE SET
+          session_id = excluded.session_id,
+          observed_event_id = excluded.observed_event_id,
+          timestamp = excluded.timestamp,
+          path = excluded.path,
+          mime_type = excluded.mime_type,
+          byte_count = excluded.byte_count,
+          sha256 = excluded.sha256,
+          exploration_summary = excluded.exploration_summary,
+          metadata_json = excluded.metadata_json
+      `).run(
+        ref.file_ref_id,
+        ref.session_id,
+        ref.observed_event_id,
+        ref.timestamp,
+        ref.path,
+        ref.mime_type,
+        ref.byte_count,
+        ref.sha256,
+        ref.exploration_summary,
+        JSON.stringify(ref.metadata),
+      );
     }
   }
 
@@ -1732,6 +1965,47 @@ export class LcmStorage {
     }
   }
 
+  private backfillFileRefs(): void {
+    if (!this.db) return;
+    const marker = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(FILE_REF_BACKFILL_KEY) as { value?: string } | undefined;
+    if (marker?.value === "1") return;
+    const rows = this.db.prepare(`
+      SELECT raw_json
+      FROM events
+      WHERE hook_event = 'PostToolUse'
+        AND (
+          raw_json LIKE '%file_path%'
+          OR raw_json LIKE '%filepath%'
+          OR raw_json LIKE '%absolute_path%'
+          OR raw_json LIKE '%filename%'
+          OR raw_json LIKE '%"path"%'
+          OR raw_json LIKE '%"file"%'
+        )
+      ORDER BY timestamp ASC, rowid ASC
+    `).all();
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const event = JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent;
+        this.indexFileRefsForEvent(event);
+      }
+      this.db.prepare(`
+        INSERT INTO index_metadata (key, value)
+        VALUES (?1, '1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(FILE_REF_BACKFILL_KEY);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures; the original backfill error is more useful.
+      }
+      this.indexError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   private backfillSessionMemorySummaries(): void {
     if (!this.db) return;
     const rows = this.db.prepare(`
@@ -1873,18 +2147,23 @@ export class LcmStorage {
     const sourceEvents = this.getAllSummarySourceEventsForSession(sessionId);
     this.db.prepare("DELETE FROM summary_node_fts WHERE session_id = ?1").run(sessionId);
     this.db.prepare("DELETE FROM summary_nodes WHERE session_id = ?1").run(sessionId);
+    this.db.prepare("DELETE FROM graph_edges WHERE session_id = ?1 AND kind = 'summary_source'").run(sessionId);
     if (sourceEvents.length === 0) return;
 
     let previousDepth = chunkArray(sourceEvents, SUMMARY_NODE_CHUNK_SIZE)
       .map((events) => buildLeafSummaryNode(events));
+    const nodes: SummaryNode[] = [];
     for (const node of previousDepth) this.insertSummaryNode(node);
+    nodes.push(...previousDepth);
 
     for (let depth = 1; depth <= SUMMARY_NODE_MAX_DEPTH && previousDepth.length > 1; depth += 1) {
       const condensed = chunkArray(previousDepth, SUMMARY_NODE_FANOUT)
         .map((nodes) => buildCondensedSummaryNode(nodes, depth));
       for (const node of condensed) this.insertSummaryNode(node);
+      nodes.push(...condensed);
       previousDepth = condensed;
     }
+    for (const node of nodes) this.insertSummarySourceEdges(node);
   }
 
   private insertSummaryNode(node: SummaryNode): void {
@@ -1941,6 +2220,23 @@ export class LcmStorage {
       String(node.depth),
       summaryNodeSearchText(node),
     );
+  }
+
+  private insertSummarySourceEdges(node: SummaryNode): void {
+    for (const [index, sourceId] of node.source_ids.entries()) {
+      this.insertGraphEdge(
+        node.node_id,
+        node.source_type === "events" ? eventNodeId(sourceId) : sourceId,
+        "summary_source",
+        node.session_id,
+        index,
+        node.created_at,
+        {
+          depth: node.depth,
+          source_type: node.source_type,
+        },
+      );
+    }
   }
 
   private getAllSummarySourceEventsForSession(sessionId: string): NormalizedEvent[] {
@@ -2046,6 +2342,22 @@ function rowToSummaryNode(row: unknown): SummaryNode {
   };
 }
 
+function rowToFileReference(row: unknown): FileReference {
+  const record = row as Record<string, unknown>;
+  return {
+    file_ref_id: String(record.file_ref_id),
+    session_id: String(record.session_id),
+    observed_event_id: String(record.observed_event_id),
+    timestamp: String(record.timestamp),
+    path: String(record.path),
+    mime_type: String(record.mime_type),
+    byte_count: Number(record.byte_count),
+    sha256: String(record.sha256),
+    exploration_summary: String(record.exploration_summary),
+    metadata: parseMetadata(record.metadata_json),
+  };
+}
+
 function summaryNodeToGraphNode(node: SummaryNode): GraphNode {
   return {
     node_id: node.node_id,
@@ -2087,6 +2399,10 @@ function summaryGraphEdges(node: SummaryNode, nodeIds: Set<string>): GraphEdge[]
       },
     }];
   });
+}
+
+function graphEdgeKey(edge: Pick<GraphEdge, "from_node_id" | "to_node_id" | "kind">): string {
+  return `${edge.from_node_id}\0${edge.to_node_id}\0${edge.kind}`;
 }
 
 function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
@@ -2374,6 +2690,64 @@ function parseStringArray(value: unknown): string[] {
 
 function clampLimit(limit: number | undefined, fallback: number, max = 200): number {
   return Math.min(Math.max(Number(limit ?? fallback), 1), max);
+}
+
+function positiveInteger(value: number | undefined, fallback: number): number {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function buildContextPlan(args: {
+  session?: SessionSummary;
+  modelContextWindow: number;
+  autoCompactTokenLimit: number;
+  recentEventLimit: number;
+  estimatedRecentTokens: number;
+  estimatedSummaryTokens: number;
+  summaryNodeCount: number;
+  latestEventAt: string | null;
+}): ContextPlan {
+  const estimatedTotalTokens = args.estimatedRecentTokens + args.estimatedSummaryTokens;
+  const state = contextPlanState(estimatedTotalTokens, args.autoCompactTokenLimit, args.modelContextWindow);
+  const suggestedTools = state === "under_limit" || state === "empty"
+    ? ["lcm_context_plan"]
+    : ["lcm_context_plan", "lcm_pack_context", "lcm_expand_query"];
+  return {
+    ...(args.session ? {
+      session_id: args.session.session_id,
+      cwd: args.session.cwd,
+      ...(args.session.repo_root ? { repo_root: args.session.repo_root } : {}),
+    } : {}),
+    model_context_window: args.modelContextWindow,
+    auto_compact_token_limit: args.autoCompactTokenLimit,
+    recent_event_limit: args.recentEventLimit,
+    estimated_recent_tokens: args.estimatedRecentTokens,
+    estimated_summary_tokens: args.estimatedSummaryTokens,
+    estimated_total_tokens: estimatedTotalTokens,
+    summary_node_count: args.summaryNodeCount,
+    latest_event_at: args.latestEventAt,
+    state,
+    recommendation: contextPlanRecommendation(state, args.summaryNodeCount),
+    suggested_tools: suggestedTools,
+    can_control_compaction: false,
+  };
+}
+
+function contextPlanState(estimatedRecentTokens: number, autoCompactTokenLimit: number, modelContextWindow: number): ContextPlanState {
+  if (estimatedRecentTokens <= 0) return "empty";
+  if (estimatedRecentTokens >= modelContextWindow) return "over_context";
+  if (estimatedRecentTokens >= autoCompactTokenLimit) return "over_limit";
+  if (estimatedRecentTokens >= Math.floor(autoCompactTokenLimit * 0.8)) return "near_limit";
+  return "under_limit";
+}
+
+function contextPlanRecommendation(state: ContextPlanState, summaryNodeCount: number): string {
+  if (state === "empty") return "No matching session found.";
+  if (state === "under_limit") return "No context packing needed yet.";
+  if (summaryNodeCount === 0) return "Context pressure is high, but no summary nodes are available yet.";
+  if (state === "near_limit") return "Near the soft context limit; use lcm_pack_context for broad recall before continuing.";
+  if (state === "over_context") return "Estimated recent context is past the model window; use lcm_pack_context or lcm_expand_query for focused recovery.";
+  return "Past the soft context limit; use lcm_pack_context or lcm_expand_query before relying on raw recent context.";
 }
 
 function rankQueryExpansionNodes(nodes: SummaryNode[], query: string, overview: boolean): SummaryNode[] {

@@ -25,7 +25,7 @@ Build a fresh Codex-native, session-first lossless context memory plugin. It cap
 Storage defaults to `~/.codex-lcm` and can be overridden with `CODEX_LCM_HOME`.
 
 - `events.jsonl`: append-only sanitized raw event log. This is written first and must succeed even if SQLite indexing fails.
-- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `session_summaries`, `session_summary_fts`, `summary_nodes`, `summary_node_fts`, `graph_nodes`, and `graph_edges`.
+- `index.sqlite`: derived index with `sessions`, `events`, `event_fts`, `session_summaries`, `session_summary_fts`, `summary_nodes`, `summary_node_fts`, `file_refs`, `graph_nodes`, and `graph_edges`.
 - Events include schema version, event ID, timestamp, hook event, session ID, cwd, optional repo root, optional git branch, sanitized payload, redaction metadata, truncation metadata, and a SHA-256 hash of the original stdin.
 
 Raw event capture is lossless for retained sanitized payloads. Privacy and safety controls run before persistence: obvious secrets are redacted, oversized strings/objects are truncated with hashes and byte counts, and binary/image-like blobs are replaced with metadata.
@@ -39,7 +39,7 @@ The DAG layer is deterministic and rebuildable from indexed raw events:
 - Summary nodes summarize high-signal event chunks and lower-depth summary nodes.
 - Edges are typed as `contains`, `next`, `tool_result`, `checkpoint`, or `summary_source`.
 
-Edge insertion rejects self-edges and recursive back edges, so the derived graph remains acyclic. Graph failures are treated as index failures; the raw JSONL event has already been written and remains recoverable.
+Edge insertion rejects self-edges. Unknown edge kinds also run a recursive back-edge check; known internal edge kinds (`contains`, `next`, `tool_result`, `checkpoint`, and `summary_source`) skip that expensive check because they are derived from append-only session order or summary-source lineage. Graph failures are treated as index failures; the raw JSONL event has already been written and remains recoverable.
 
 The summary layer is also deterministic and rebuildable. It extracts compact
 session-level clues from high-signal events: user prompts, notes, stop messages,
@@ -52,6 +52,12 @@ The job is ranking and context packing; raw events stay the evidence layer.
 Codex-generated suggestion prompts and their JSON suggestion responses remain
 raw events, but they are skipped by summaries and summary nodes so broad search
 does not confuse generated next-step ideas with user-directed work.
+
+Large path-backed tool outputs are indexed as `file_refs` when the sanitized
+payload exposes a path plus large content or truncation metadata. File
+references store path, byte count, SHA-256, MIME guess, source event ID, and a
+compact exploration summary. They are derived metadata; raw events remain the
+source of truth.
 
 For long sessions, the session-summary builder samples early high-signal events,
 latest high-signal events, and recent events. Summary nodes are chunked and
@@ -67,9 +73,9 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 ## MCP Tools
 
 - `lcm_health`: report storage paths, index status, event count, session count, summary-node count, and current configuration.
-- `lcm_stats`: report aggregate index shape, hook-event counts, summary nodes by depth, graph node and edge counts, freshness timestamps, max summary depth, and sessions with summary nodes without returning raw transcript text.
+- `lcm_stats`: report aggregate index shape, hook-event counts, session-summary count, summary nodes by depth, graph node and edge counts, freshness timestamps, max summary depth, and sessions with summaries or summary nodes without returning raw transcript text.
 - `lcm_grep`: standard discovery entry point. It searches summary nodes, session summaries, and high-signal raw events, then returns session-level matches with best-match and discovery metadata.
-- `lcm_describe`: inspect a session or summary node before loading raw content. Session descriptions include the deterministic summary and bounded summary-node list; node descriptions include depth and source lineage metadata.
+- `lcm_describe`: inspect a session, summary node, or file reference before loading raw content. Session descriptions include the deterministic summary, bounded summary-node list, and indexed file references; node descriptions include depth and source lineage metadata.
 - `lcm_expand`: expand a selected summary node into bounded source summary nodes and high-signal source events. This is deterministic evidence expansion, not agent-driven answer synthesis.
 - `lcm_current_session`: locate the current or latest known session by session ID, cwd, or repo root.
 - `lcm_search_sessions`: cross-session discovery using SQLite FTS. Results
@@ -82,6 +88,7 @@ The hook path is synchronous only long enough to sanitize, append JSONL, and att
 - `lcm_get_session_graph`: retrieve a bounded DAG slice for a session, including summary nodes when present.
 - `lcm_get_recent_context`: retrieve recent events for a session or latest cwd-matching session.
 - `lcm_expand_query`: search matching summary nodes, recursively expand source lineage, and return bounded evidence for a focused query. It is deterministic retrieval, not LLM synthesis. The default budget is 2000 tokens. Pass `overview: true` to prefer higher-depth, source-rich nodes for broad lineage queries. `sourceLimit` is per matched node/source expansion. If no evidence matches, the Markdown says so; if a tight budget truncates output, it reserves room for a focused source-event excerpt when available.
+- `lcm_context_plan`: estimate recent-session token pressure, summary-node availability, soft-limit state, and retrieval recommendations. It reports `can_control_compaction: false`; Codex owns compaction.
 - `lcm_pack_context`: pack matching summary nodes and bounded source lineage into a token-budgeted Markdown context block. A cwd-scoped pack falls back to bounded global search when scoped retrieval is empty.
 - `lcm_record_note`: append a user-authored note as a first-class event and index it.
 

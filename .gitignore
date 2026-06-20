@@ -1,5 +1,7 @@
 node_modules/
 .codex-lcm/
+**/docs/superpowers/
+**/docs/*plan*.md
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
