@@ -26,15 +26,15 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "install") {
-    printObjectOrText(planInstall({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }), rest);
+    printObjectOrText(planInstall({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }));
     return;
   }
   if (command === "uninstall") {
-    printObjectOrText(planUninstall({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }), rest);
+    printObjectOrText(planUninstall({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }));
     return;
   }
   if (command === "status") {
-    printObjectOrText(readStatus({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }), rest);
+    printObjectOrText(readStatus({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }));
     return;
   }
   if (command === "doctor") {
@@ -43,7 +43,7 @@ export async function main(argv: string[]): Promise<void> {
       printObjectOrText(buildDoctorReport({
         status: readStatus({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }),
         health: storage.health(),
-      }), rest);
+      }));
     } finally {
       storage.close();
     }
@@ -56,7 +56,7 @@ export async function main(argv: string[]): Promise<void> {
       printObjectOrText(importCodexSessions(storage, {
         from: optionValue(rest, "--from"),
         dryRun,
-      }), rest);
+      }));
     } finally {
       storage.close();
     }
@@ -65,7 +65,7 @@ export async function main(argv: string[]): Promise<void> {
   if (command === "health") {
     const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
-      printObjectOrText(storage.health(), rest);
+      printObjectOrText(storage.health());
     } finally {
       storage.close();
     }
@@ -74,7 +74,7 @@ export async function main(argv: string[]): Promise<void> {
   if (command === "stats") {
     const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
-      printObjectOrText(storage.stats(), rest);
+      printObjectOrText(storage.stats());
     } finally {
       storage.close();
     }
@@ -149,10 +149,6 @@ function optionValue(args: string[], flag: string): string | undefined {
   return args[index + 1];
 }
 
-function printObjectOrText(value: unknown, args: string[]): void {
-  if (args.includes("--json")) {
-    process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
-    return;
-  }
+function printObjectOrText(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
