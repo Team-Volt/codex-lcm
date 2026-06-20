@@ -179,6 +179,87 @@ test("writable storage replays raw JSONL events that are missing from SQLite ind
   storage.close();
 });
 
+test("writable storage removes stale SQLite rows when raw JSONL is truncated", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const retained = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "raw-retained", cwd: "/tmp/raw-retained", prompt: "retained raw prompt" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  });
+  const stale = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "raw-stale", cwd: "/tmp/raw-stale", prompt: "stale sqlite prompt" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  });
+
+  storage.ingest(retained);
+  storage.ingest(stale);
+  storage.close();
+  fs.writeFileSync(path.join(home, "events.jsonl"), `${JSON.stringify(retained)}\n`, { mode: 0o600 });
+
+  const reopened = createStorage({ home });
+
+  assert.equal(reopened.health().event_count, 1);
+  assert.deepEqual(reopened.searchSessions({ query: "retained", limit: 5 }).map((match) => match.session_id), ["raw-retained"]);
+  assert.deepEqual(reopened.searchSessions({ query: "stale", limit: 5 }).map((match) => match.session_id), []);
+  assert.equal(reopened.getSession("raw-stale").events.length, 0);
+
+  reopened.close();
+});
+
+test("writable storage clears SQLite when raw JSONL is emptied", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "raw-empty", cwd: "/tmp/raw-empty", prompt: "remove all indexed rows" }),
+    env: {},
+    now,
+  }));
+  storage.close();
+  fs.writeFileSync(path.join(home, "events.jsonl"), "", { mode: 0o600 });
+
+  const reopened = createStorage({ home });
+
+  assert.equal(reopened.health().event_count, 0);
+  assert.equal(reopened.health().session_count, 0);
+  assert.deepEqual(reopened.searchSessions({ query: "remove all indexed rows", limit: 5 }), []);
+
+  reopened.close();
+});
+
+test("writable storage repairs same-count raw and SQLite event ID mismatches", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const indexedOnly = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "indexed-only", cwd: "/tmp/indexed-only", prompt: "indexed only stale prompt" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  });
+  const rawOnly = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "raw-only", cwd: "/tmp/raw-only", prompt: "raw only replacement prompt" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  });
+
+  storage.ingest(indexedOnly);
+  storage.close();
+  fs.writeFileSync(path.join(home, "events.jsonl"), `${JSON.stringify(rawOnly)}\n`, { mode: 0o600 });
+
+  const reopened = createStorage({ home });
+
+  assert.equal(reopened.health().event_count, 1);
+  assert.deepEqual(reopened.searchSessions({ query: "replacement", limit: 5 }).map((match) => match.session_id), ["raw-only"]);
+  assert.deepEqual(reopened.searchSessions({ query: "stale", limit: 5 }).map((match) => match.session_id), []);
+
+  reopened.close();
+});
+
 test("tool chatter does not rebuild session summaries until a landmark event", () => {
   const home = tempHome();
   const storage = createStorage({ home });
@@ -372,6 +453,128 @@ test("bulk ingest appends raw events once and rebuilds summaries once per touche
   assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 4);
   assert.equal(storage.health().event_count, 4);
   assert.equal(storage.getSessionMemorySummary(sessionId)?.outcomes.includes("bulk import final outcome"), true);
+
+  storage.close();
+});
+
+test("bulk ingest reuses cached raw event ids across repeated 500-event batches", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "bulk-cache-session";
+  const cwd = "/tmp/bulk-cache";
+  const rawLogPath = path.join(home, "events.jsonl");
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd, prompt: "seed raw event for cache warmup" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  const fsModule = fs as typeof fs & { readFileSync: typeof fs.readFileSync };
+  const originalReadFileSync = fsModule.readFileSync;
+  let rawLogReads = 0;
+  fsModule.readFileSync = ((...args: Parameters<typeof originalReadFileSync>) => {
+    if (args[0] === rawLogPath) {
+      rawLogReads += 1;
+    }
+    return originalReadFileSync(...args);
+  }) as typeof originalReadFileSync;
+
+  try {
+    const bulkIngest = storage as unknown as {
+      ingestMany(events: NormalizedEvent[]): { imported: number; skippedDuplicate: number; touchedSessions: string[] };
+    };
+
+    for (let batchIndex = 0; batchIndex < 4; batchIndex += 1) {
+      const events = Array.from({ length: 500 }, (_, eventIndex) => normalizeHookEvent({
+        hookEvent: "UserPromptSubmit",
+        rawInput: JSON.stringify({
+          session_id: sessionId,
+          cwd,
+          prompt: `cache batch ${batchIndex} event ${eventIndex}`,
+        }),
+        env: {},
+        now: () => new Date(Date.UTC(2026, 5, 9, 12, batchIndex, eventIndex)),
+      }));
+
+      const result = bulkIngest.ingestMany(events);
+      assert.equal(result.imported, 500);
+      assert.equal(result.skippedDuplicate, 0);
+      assert.deepEqual(result.touchedSessions, [sessionId]);
+    }
+
+    assert.equal(rawLogReads, 1);
+    assert.equal(storage.health().event_count, 2001);
+  } finally {
+    fsModule.readFileSync = originalReadFileSync;
+    storage.close();
+  }
+});
+
+test("bulk ingest can defer summary rebuilds until touched sessions are finalized", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "bulk-deferred-summary-session";
+  const events = Array.from({ length: 4 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: sessionId,
+      cwd: "/tmp/bulk-deferred-summary",
+      prompt: `deferred summary prompt ${index}`,
+    }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+  }));
+
+  const first = storage.ingestMany(events.slice(0, 2), { rebuildSummaries: false });
+  const second = storage.ingestMany(events.slice(2), { rebuildSummaries: false });
+
+  assert.deepEqual(first.touchedSessions, [sessionId]);
+  assert.deepEqual(second.touchedSessions, [sessionId]);
+  assert.equal(storage.getSessionMemorySummary(sessionId), undefined);
+
+  const rebuilt = storage.rebuildSessionMemorySummaries([...first.touchedSessions, ...second.touchedSessions]);
+
+  assert.deepEqual(rebuilt, [sessionId]);
+  assert.equal(storage.getSessionMemorySummary(sessionId)?.key_prompts.includes("deferred summary prompt 3"), true);
+
+  storage.close();
+});
+
+test("bulk ingest retry after SQLite rollback does not duplicate raw JSONL", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "bulk-rollback-session",
+      cwd: "/tmp/bulk-rollback",
+      prompt: "bulk rollback retry prompt",
+    }),
+    env: {},
+    now,
+  });
+  const internals = storage as unknown as {
+    indexEventInTransaction: (event: NormalizedEvent, options: { rebuildSummary: boolean }) => unknown;
+  };
+  const originalIndexEventInTransaction = internals.indexEventInTransaction;
+  internals.indexEventInTransaction = () => {
+    throw new Error("forced index failure");
+  };
+
+  const failed = storage.ingestMany([event]);
+  internals.indexEventInTransaction = originalIndexEventInTransaction;
+  const retried = storage.ingestMany([event]);
+
+  assert.equal(failed.imported, 1);
+  assert.equal(retried.imported, 0);
+  assert.equal(retried.skippedDuplicate, 1);
+  assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
+  assert.equal(storage.health().event_count, 1);
+  assert.deepEqual(storage.searchSessions({ query: "rollback retry", limit: 5 }).map((match) => match.session_id), [
+    "bulk-rollback-session",
+  ]);
 
   storage.close();
 });

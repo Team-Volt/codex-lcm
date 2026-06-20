@@ -52,6 +52,10 @@ export type IngestManyResult = {
   touchedSessions: string[];
 };
 
+export type IngestManyOptions = {
+  readonly rebuildSummaries?: boolean;
+};
+
 export type SearchSessionArgs = {
   query?: string;
   limit?: number;
@@ -257,11 +261,18 @@ type IndexEventResult = {
   summaryTouched: boolean;
 };
 
+type RawEventIdCache = {
+  size: number;
+  mtimeMs: number;
+  eventIds: Set<string>;
+};
+
 export class LcmStorage {
   readonly config: LcmConfig;
   private db?: DatabaseSync;
   private indexError?: string;
   private readonly readOnly: boolean;
+  private rawEventIdCache?: RawEventIdCache;
 
   constructor(options: StorageOptions = {}) {
     this.config = options.config ?? loadConfig({ home: options.home });
@@ -312,43 +323,61 @@ export class LcmStorage {
     }
   }
 
-  ingestMany(events: NormalizedEvent[]): IngestManyResult {
+  ingestMany(events: NormalizedEvent[], options: IngestManyOptions = {}): IngestManyResult {
     if (this.readOnly) {
       throw new Error("Cannot ingest events with read-only storage.");
     }
     if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
+    const rebuildSummaries = options.rebuildSummaries ?? true;
 
-    const known = this.knownEventIds(events.map((event) => event.event_id));
-    const seen = new Set(known);
-    const uniqueEventsToImport: NormalizedEvent[] = [];
+    const rawEventIds = this.readRawEventIds();
+    const indexedEventIds = this.db ? this.knownEventIds(events.map((event) => event.event_id)) : rawEventIds;
+    const rawSeen = new Set(rawEventIds);
+    const indexSeen = new Set(indexedEventIds);
+    const eventsToAppend: NormalizedEvent[] = [];
+    const eventsToIndex: NormalizedEvent[] = [];
     let skippedDuplicate = 0;
     for (const event of events) {
-      if (seen.has(event.event_id)) {
+      if (rawSeen.has(event.event_id)) {
         skippedDuplicate += 1;
+        if (this.db && !indexSeen.has(event.event_id)) {
+          indexSeen.add(event.event_id);
+          eventsToIndex.push(event);
+        }
         continue;
       }
-      seen.add(event.event_id);
-      uniqueEventsToImport.push(event);
+      rawSeen.add(event.event_id);
+      indexSeen.add(event.event_id);
+      eventsToAppend.push(event);
+      eventsToIndex.push(event);
     }
 
-    if (uniqueEventsToImport.length === 0) {
+    if (eventsToAppend.length === 0 && eventsToIndex.length === 0) {
       return { imported: 0, skippedDuplicate, touchedSessions: [] };
     }
 
-    fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(this.config.rawLogPath, `${uniqueEventsToImport.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
-    if (!this.db) return { imported: uniqueEventsToImport.length, skippedDuplicate, touchedSessions: [] };
+    if (eventsToAppend.length > 0) {
+      fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
+      fs.appendFileSync(this.config.rawLogPath, `${eventsToAppend.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+      for (const event of eventsToAppend) {
+        rawEventIds.add(event.event_id);
+      }
+      this.storeRawEventIds(rawEventIds);
+    }
+    if (!this.db) return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
 
     const touchedSessions = new Set<string>();
     try {
       this.db.exec("BEGIN IMMEDIATE");
-      for (const event of uniqueEventsToImport) {
+      for (const event of eventsToIndex) {
         const result = this.indexEventInTransaction(event, { rebuildSummary: false });
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
-      const rebuiltSessions = this.rebuildTouchedSummarySessions(touchedSessions);
+      const rebuiltSessions = rebuildSummaries
+        ? this.rebuildTouchedSummarySessions(touchedSessions)
+        : sortedSessionIds(touchedSessions);
       this.db.exec("COMMIT");
-      return { imported: uniqueEventsToImport.length, skippedDuplicate, touchedSessions: rebuiltSessions };
+      return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
@@ -356,7 +385,71 @@ export class LcmStorage {
         // Ignore rollback failures; raw JSONL is still durable and can be replayed.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
-      return { imported: uniqueEventsToImport.length, skippedDuplicate, touchedSessions: [] };
+      return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
+    }
+  }
+
+  private readRawEventIds(): Set<string> {
+    const stat = this.rawLogStat();
+    const cache = this.rawEventIdCache;
+    if (cache && stat && cache.size === stat.size && cache.mtimeMs === stat.mtimeMs) {
+      return cache.eventIds;
+    }
+
+    const eventIds = readRawEventIds(this.config.rawLogPath);
+    if (stat) {
+      this.rawEventIdCache = {
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        eventIds,
+      };
+    } else {
+      this.rawEventIdCache = {
+        size: 0,
+        mtimeMs: 0,
+        eventIds,
+      };
+    }
+    return eventIds;
+  }
+
+  private storeRawEventIds(eventIds: Set<string>): void {
+    const stat = this.rawLogStat();
+    this.rawEventIdCache = stat
+      ? {
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          eventIds,
+        }
+      : {
+          size: 0,
+          mtimeMs: 0,
+          eventIds,
+        };
+  }
+
+  private rawLogStat(): fs.Stats | undefined {
+    if (!fs.existsSync(this.config.rawLogPath)) return undefined;
+    return fs.statSync(this.config.rawLogPath);
+  }
+
+  rebuildSessionMemorySummaries(sessionIds: Iterable<string>): string[] {
+    if (!this.db) return [];
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const rebuiltSessions = this.rebuildTouchedSummarySessions(sessionIds);
+      this.db.exec("COMMIT");
+      return rebuiltSessions;
+    } catch (error) {
+      let rollbackError: unknown;
+      try {
+        this.db.exec("ROLLBACK");
+      } catch (caught) {
+        rollbackError = caught;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.indexError = rollbackError === undefined ? message : `${message}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+      return [];
     }
   }
 
@@ -407,13 +500,19 @@ export class LcmStorage {
 
   private replayRawLogToIndex(): void {
     if (!this.db || !fs.existsSync(this.config.rawLogPath)) return;
-    const rawLineCount = countRawEventLines(this.config.rawLogPath);
-    if (rawLineCount === 0 || Number(this.scalar("SELECT COUNT(*) AS count FROM events")) >= rawLineCount) return;
-
     const rawEvents = readRawEvents(this.config.rawLogPath);
-    if (rawEvents.length === 0) return;
-    const known = this.knownEventIds(rawEvents.map((event) => event.event_id));
-    const missingEvents = rawEvents.filter((event) => !known.has(event.event_id));
+    const indexedIds = this.indexedEventIds();
+    if (rawEvents.length === 0) {
+      if (indexedIds.size > 0) this.rebuildIndexFromRawEvents([]);
+      return;
+    }
+    const rawIds = new Set(rawEvents.map((event) => event.event_id));
+    const hasStaleIndexedRows = [...indexedIds].some((eventId) => !rawIds.has(eventId));
+    if (hasStaleIndexedRows) {
+      this.rebuildIndexFromRawEvents(rawEvents);
+      return;
+    }
+    const missingEvents = rawEvents.filter((event) => !indexedIds.has(event.event_id));
     if (missingEvents.length === 0) return;
 
     const touchedSessions = new Set<string>();
@@ -435,6 +534,45 @@ export class LcmStorage {
     }
   }
 
+  private rebuildIndexFromRawEvents(rawEvents: NormalizedEvent[]): void {
+    if (!this.db) return;
+    const touchedSessions = new Set<string>();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.clearDerivedIndex();
+      for (const event of rawEvents) {
+        const result = this.indexEventInTransaction(event, { rebuildSummary: false });
+        if (result.summaryTouched) touchedSessions.add(event.session_id);
+      }
+      this.rebuildTouchedSummarySessions(touchedSessions);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      let rollbackError: unknown;
+      try {
+        this.db.exec("ROLLBACK");
+      } catch (caught) {
+        rollbackError = caught;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.indexError = rollbackError === undefined ? message : `${message}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+    }
+  }
+
+  private clearDerivedIndex(): void {
+    if (!this.db) return;
+    this.db.prepare("DELETE FROM summary_node_fts").run();
+    this.db.prepare("DELETE FROM session_summary_fts").run();
+    this.db.prepare("DELETE FROM event_fts").run();
+    this.db.prepare("DELETE FROM summary_nodes").run();
+    this.db.prepare("DELETE FROM session_summaries").run();
+    this.db.prepare("DELETE FROM file_refs").run();
+    this.db.prepare("DELETE FROM graph_edges").run();
+    this.db.prepare("DELETE FROM graph_nodes").run();
+    this.db.prepare("DELETE FROM events").run();
+    this.db.prepare("DELETE FROM sessions").run();
+    this.db.prepare("DELETE FROM index_metadata").run();
+  }
+
   private knownEventIds(eventIds: string[]): Set<string> {
     const uniqueIds = Array.from(new Set(eventIds.filter(Boolean)));
     if (uniqueIds.length === 0) return new Set();
@@ -454,8 +592,14 @@ export class LcmStorage {
     return known;
   }
 
+  private indexedEventIds(): Set<string> {
+    if (!this.db) return new Set();
+    const rows = this.db.prepare("SELECT event_id FROM events").all() as Array<{ event_id: string }>;
+    return new Set(rows.map((row) => row.event_id));
+  }
+
   private rebuildTouchedSummarySessions(sessionIds: Iterable<string>): string[] {
-    const rebuiltSessions = Array.from(new Set(sessionIds)).sort((left, right) => left.localeCompare(right));
+    const rebuiltSessions = sortedSessionIds(sessionIds);
     for (const sessionId of rebuiltSessions) this.rebuildSessionMemorySummary(sessionId);
     return rebuiltSessions;
   }
@@ -2837,12 +2981,8 @@ function readRawEvents(rawLogPath: string): NormalizedEvent[] {
     });
 }
 
-function countRawEventLines(rawLogPath: string): number {
-  if (!fs.existsSync(rawLogPath)) return 0;
-  return fs.readFileSync(rawLogPath, "utf8")
-    .split(/\r?\n/u)
-    .filter((line) => line.trim().length > 0)
-    .length;
+function readRawEventIds(rawLogPath: string): Set<string> {
+  return new Set(readRawEvents(rawLogPath).map((event) => event.event_id));
 }
 
 function countEventsByHook(events: NormalizedEvent[]): Record<string, number> {
@@ -2870,6 +3010,10 @@ function chunkArray<T>(values: T[], size: number): T[][] {
     chunks.push(values.slice(index, index + size));
   }
   return chunks;
+}
+
+function sortedSessionIds(sessionIds: Iterable<string>): string[] {
+  return Array.from(new Set(sessionIds)).sort((left, right) => left.localeCompare(right));
 }
 
 function summarizeSessions(events: NormalizedEvent[]): SessionSummary[] {
