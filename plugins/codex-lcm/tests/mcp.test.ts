@@ -47,6 +47,54 @@ test("MCP server initializes and lists LCM tools", () => {
   assert.equal(contextPlanTool.inputSchema.properties.canControlCompaction.const, false);
 });
 
+test("MCP server accepts Content-Length framed requests", () => {
+  const home = tempHome();
+  const result = runCli(["mcp"], {
+    input: framedInput([
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+    ]),
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const responses = parseFramedOutput(result.stdout);
+  assert.equal(responses[0].result.serverInfo.name, "codex-lcm");
+  assert.equal(responses[1].result.tools.some((tool: { name: string }) => tool.name === "lcm_health"), true);
+});
+
+test("MCP server returns parse errors for malformed newline JSON", () => {
+  const result = runCli(["mcp"], { input: "{not json\n" });
+
+  assert.equal(result.status, 0, result.stderr);
+  const responses = result.stdout
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
+  assert.equal(responses[0].id, null);
+  assert.equal(responses[0].error.code, -32700);
+});
+
+test("MCP server returns parse errors for malformed framed JSON", () => {
+  const body = "{not json";
+  const result = runCli(["mcp"], { input: `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}` });
+
+  assert.equal(result.status, 0, result.stderr);
+  const responses = parseFramedOutput(result.stdout);
+  assert.equal(responses[0].id, null);
+  assert.equal(responses[0].error.code, -32700);
+});
+
+test("MCP server rejects oversized framed bodies", () => {
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+  const result = runCli(["mcp"], { input: `Content-Length: ${512 * 1024 + 1}\r\n\r\n${body}` });
+
+  assert.equal(result.status, 0, result.stderr);
+  const responses = parseFramedOutput(result.stdout);
+  assert.equal(responses[0].id, null);
+  assert.equal(responses[0].error.code, -32700);
+});
+
 test("MCP stats reports aggregate summary depth and graph counts", () => {
   const home = tempHome();
   const cwd = "/tmp/mcp-stats";
@@ -455,3 +503,29 @@ test("MCP describe reports missing sessions instead of fabricating descriptions"
   assert.equal(responses[1].error.code, -32602);
   assert.match(responses[1].error.message, /Session not found: missing-session/u);
 });
+
+function framedInput(messages: unknown[]): string {
+  return messages.map((message) => {
+    const body = JSON.stringify(message);
+    return `Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`;
+  }).join("");
+}
+
+function parseFramedOutput(output: string): Array<Record<string, unknown>> {
+  const responses: Array<Record<string, unknown>> = [];
+  let buffer = Buffer.from(output, "utf8");
+  while (buffer.length > 0) {
+    const headerEnd = buffer.indexOf("\r\n\r\n");
+    assert.notEqual(headerEnd, -1, output);
+    const header = buffer.subarray(0, headerEnd).toString("utf8");
+    const lengthMatch = /^Content-Length: (\d+)$/imu.exec(header);
+    assert.ok(lengthMatch, header);
+    const length = Number(lengthMatch[1]);
+    const bodyStart = headerEnd + 4;
+    const bodyEnd = bodyStart + length;
+    assert.equal(buffer.length >= bodyEnd, true, output);
+    responses.push(JSON.parse(buffer.subarray(bodyStart, bodyEnd).toString("utf8")) as Record<string, unknown>);
+    buffer = buffer.subarray(bodyEnd);
+  }
+  return responses;
+}

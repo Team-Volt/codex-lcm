@@ -1,5 +1,4 @@
-import readline from "node:readline";
-
+import { DEFAULT_LIMITS } from "./config.ts";
 import { createStorage } from "./storage.ts";
 
 type JsonRpcMessage = {
@@ -11,6 +10,10 @@ type JsonRpcMessage = {
 
 const SERVER_NAME = "codex-lcm";
 const SERVER_VERSION = "0.2.0";
+const HEADER_SEPARATOR = Buffer.from("\r\n\r\n", "utf8");
+const MAX_MESSAGE_BYTES = DEFAULT_LIMITS.maxInputBytes;
+
+let responseFraming: "line" | "header" = "line";
 
 const TOOLS = [
   {
@@ -238,21 +241,83 @@ const TOOLS = [
 ];
 
 export function startMcpServer(): void {
-  const lines = readline.createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity,
-  });
-
-  lines.on("line", (line) => {
-    if (line.trim().length === 0) return;
-    let message: JsonRpcMessage;
-    try {
-      message = JSON.parse(line);
-    } catch {
+  let buffer = Buffer.alloc(0);
+  process.stdin.on("data", (chunk: Buffer | string) => {
+    buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8")]);
+    if (buffer.length > MAX_MESSAGE_BYTES) {
+      sendError(null, -32700, "Parse error");
+      buffer = Buffer.alloc(0);
       return;
     }
-    handleMessage(message);
+    buffer = processInputBuffer(buffer);
   });
+}
+
+function processInputBuffer(input: Buffer): Buffer {
+  let buffer = input;
+  while (buffer.length > 0) {
+    if (startsWithHeader(buffer)) {
+      responseFraming = "header";
+      const parsed = takeHeaderMessage(buffer);
+      if (parsed.kind === "incomplete") return buffer;
+      buffer = parsed.remaining;
+      handleRawMessage(parsed.body);
+      continue;
+    }
+
+    const newlineIndex = buffer.indexOf("\n");
+    if (newlineIndex === -1) return buffer;
+    const line = buffer.subarray(0, newlineIndex).toString("utf8").trim();
+    buffer = buffer.subarray(newlineIndex + 1);
+    if (line.length === 0) continue;
+    handleRawMessage(line);
+  }
+  return buffer;
+}
+
+type ParsedHeaderMessage =
+  | { readonly kind: "complete"; readonly body: string; readonly remaining: Buffer }
+  | { readonly kind: "incomplete" };
+
+function startsWithHeader(buffer: Buffer): boolean {
+  return buffer.subarray(0, "Content-Length:".length).toString("utf8").toLowerCase() === "content-length:";
+}
+
+function takeHeaderMessage(buffer: Buffer): ParsedHeaderMessage {
+  const headerEnd = buffer.indexOf(HEADER_SEPARATOR);
+  if (headerEnd === -1) return { kind: "incomplete" };
+  const header = buffer.subarray(0, headerEnd).toString("utf8");
+  const lengthMatch = /^Content-Length:\s*(\d+)$/imu.exec(header);
+  if (!lengthMatch) {
+    sendError(null, -32700, "Parse error");
+    return { kind: "complete", body: "", remaining: buffer.subarray(headerEnd + HEADER_SEPARATOR.length) };
+  }
+  const bodyLength = Number(lengthMatch[1]);
+  if (!Number.isSafeInteger(bodyLength) || bodyLength > MAX_MESSAGE_BYTES) {
+    sendError(null, -32700, "Parse error");
+    return { kind: "complete", body: "", remaining: Buffer.alloc(0) };
+  }
+  const bodyStart = headerEnd + HEADER_SEPARATOR.length;
+  const bodyEnd = bodyStart + bodyLength;
+  if (buffer.length < bodyEnd) return { kind: "incomplete" };
+  return {
+    kind: "complete",
+    body: buffer.subarray(bodyStart, bodyEnd).toString("utf8"),
+    remaining: buffer.subarray(bodyEnd),
+  };
+}
+
+function handleRawMessage(raw: string): void {
+  if (raw.trim().length === 0) return;
+  try {
+    handleMessage(JSON.parse(raw) as JsonRpcMessage);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      sendError(null, -32700, "Parse error");
+      return;
+    }
+    throw error;
+  }
 }
 
 function handleMessage(message: JsonRpcMessage): void {
@@ -438,7 +503,12 @@ function callTool(params: Record<string, unknown>) {
 }
 
 function send(message: unknown): void {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  const body = JSON.stringify(message);
+  if (responseFraming === "header") {
+    process.stdout.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n\r\n${body}`);
+    return;
+  }
+  process.stdout.write(`${body}\n`);
 }
 
 function sendResult(id: JsonRpcMessage["id"], result: unknown): void {
