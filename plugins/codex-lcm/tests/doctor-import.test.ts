@@ -90,6 +90,21 @@ test("import-codex-sessions ingests existing Codex JSONL sessions idempotently",
   assert.match(search.stdout, /import fixture assistant result/u);
 });
 
+test("import-codex-sessions progress writes to stderr without corrupting JSON stdout", () => {
+  const source = writeCodexSessionFixture();
+  const lcmHome = tempHome("codex-lcm-import-progress-");
+
+  const result = runCli(["import-codex-sessions", "--from", source, "--progress", "--json"], {
+    env: { CODEX_LCM_HOME: lcmHome },
+  });
+
+  assertCliOk(result);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.events_imported, 4);
+  assert.match(result.stderr, /codex-lcm import:/u);
+  assert.match(result.stderr, /imported=4/u);
+});
+
 function writeCodexSessionFixture(): string {
   const root = tempHome("codex-session-source-");
   const dir = path.join(root, "2026", "06", "18");

@@ -3,9 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { normalizeHookEvent } from "../src/events.ts";
+import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
 import { createStorage } from "../src/storage.ts";
-import { clearDerivedSummaries, tempHome } from "./helpers.ts";
+import { clearDerivedSummaries, readJsonl, tempHome } from "./helpers.ts";
 
 const now = () => new Date("2026-06-09T12:00:00.000Z");
 
@@ -83,6 +83,31 @@ test("read-only storage opens do not rebuild derived indexes", () => {
   readOnlyStorage.close();
 });
 
+test("writable storage replays raw JSONL events that are missing from SQLite index", () => {
+  const home = tempHome();
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "raw-replay-session",
+      cwd: "/tmp/raw-replay",
+      prompt: "raw replay prompt should be searchable",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  });
+  fs.writeFileSync(path.join(home, "events.jsonl"), `${JSON.stringify(event)}\n`, { mode: 0o600 });
+
+  const storage = createStorage({ home });
+
+  assert.equal(storage.health().event_count, 1);
+  assert.deepEqual(storage.searchSessions({ query: "raw replay searchable", limit: 5 }).map((match) => match.session_id), [
+    "raw-replay-session",
+  ]);
+  assert.equal(storage.getSessionMemorySummary("raw-replay-session")?.updated_at, "2026-06-09T12:00:00.000Z");
+
+  storage.close();
+});
+
 test("tool chatter does not rebuild session summaries until a landmark event", () => {
   const home = tempHome();
   const storage = createStorage({ home });
@@ -147,6 +172,53 @@ test("tool chatter does not rebuild session summaries until a landmark event", (
   storage.close();
 });
 
+test("coalesces prompt-only summary rebuilds but keeps stop freshness", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "prompt-coalesce-session",
+      cwd: "/tmp/prompt-coalesce",
+      prompt: "initial prompt summary source",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  assert.equal(storage.getSessionMemorySummary("prompt-coalesce-session")?.updated_at, "2026-06-09T12:00:00.000Z");
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "prompt-coalesce-session",
+      cwd: "/tmp/prompt-coalesce",
+      prompt: "second prompt should wait for a landmark",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  }));
+  assert.equal(storage.getSessionMemorySummary("prompt-coalesce-session")?.updated_at, "2026-06-09T12:00:00.000Z");
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "prompt-coalesce-session",
+      cwd: "/tmp/prompt-coalesce",
+      last_assistant_message: "landmark outcome refreshed the coalesced prompt summary",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:02.000Z"),
+  }));
+
+  const refreshed = storage.getSessionMemorySummary("prompt-coalesce-session");
+  assert.equal(refreshed?.updated_at, "2026-06-09T12:00:02.000Z");
+  assert.equal(refreshed?.key_prompts.some((prompt) => prompt.includes("second prompt")), true);
+  assert.equal(refreshed?.outcomes.some((outcome) => outcome.includes("landmark outcome")), true);
+
+  storage.close();
+});
+
 test("post-compaction payloads refresh session summaries as high-signal outcomes", () => {
   const home = tempHome();
   const storage = createStorage({ home });
@@ -178,6 +250,57 @@ test("post-compaction payloads refresh session summaries as high-signal outcomes
   assert.match(summary?.overview ?? "", /bounded LCM recall/u);
   assert.equal(summary?.source_event_ids.length, 2);
   assert.deepEqual(storage.stats().hook_event_counts, { PostCompact: 1, UserPromptSubmit: 1 });
+
+  storage.close();
+});
+
+test("bulk ingest appends raw events once and rebuilds summaries once per touched session", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "bulk-ingest-session";
+  const cwd = "/tmp/bulk-ingest";
+  const events: NormalizedEvent[] = [
+    "first bulk import prompt",
+    "second bulk import prompt",
+    "third bulk import prompt",
+  ].map((prompt, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd, prompt }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+  }));
+  events.push(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: sessionId,
+      cwd,
+      last_assistant_message: "bulk import final outcome",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:03.000Z"),
+  }));
+
+  const internals = storage as unknown as {
+    rebuildSessionMemorySummary(sessionId: string): void;
+  };
+  const originalRebuild = internals.rebuildSessionMemorySummary.bind(storage);
+  let rebuilds = 0;
+  internals.rebuildSessionMemorySummary = (id: string) => {
+    rebuilds += 1;
+    originalRebuild(id);
+  };
+
+  const result = (storage as unknown as {
+    ingestMany(events: NormalizedEvent[]): { imported: number; skippedDuplicate: number; touchedSessions: string[] };
+  }).ingestMany([...events, events[0]]);
+
+  assert.equal(result.imported, 4);
+  assert.equal(result.skippedDuplicate, 1);
+  assert.deepEqual(result.touchedSessions, [sessionId]);
+  assert.equal(rebuilds, 1);
+  assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 4);
+  assert.equal(storage.health().event_count, 4);
+  assert.equal(storage.getSessionMemorySummary(sessionId)?.outcomes.includes("bulk import final outcome"), true);
 
   storage.close();
 });
