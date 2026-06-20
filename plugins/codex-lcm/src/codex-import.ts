@@ -8,6 +8,9 @@ import { type LcmStorage } from "./storage.ts";
 export type ImportCodexSessionsOptions = {
   from?: string;
   dryRun?: boolean;
+  batchSize?: number;
+  progressIntervalRecords?: number;
+  progress?: (report: ImportCodexSessionsReport) => void;
 };
 
 export type ImportCodexSessionsReport = {
@@ -19,6 +22,8 @@ export type ImportCodexSessionsReport = {
   events_imported: number;
   events_skipped_duplicate: number;
   records_skipped: number;
+  duration_ms: number;
+  events_per_second: number;
   errors: Array<{ file: string; line?: number; message: string }>;
 };
 
@@ -35,6 +40,7 @@ export function defaultCodexSessionsPath(): string {
 }
 
 export function importCodexSessions(storage: LcmStorage, options: ImportCodexSessionsOptions = {}): ImportCodexSessionsReport {
+  const startedAt = Date.now();
   const source = path.resolve(options.from ?? defaultCodexSessionsPath());
   const report: ImportCodexSessionsReport = {
     mode: options.dryRun ? "dry-run" : "import",
@@ -45,17 +51,67 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
     events_imported: 0,
     events_skipped_duplicate: 0,
     records_skipped: 0,
+    duration_ms: 0,
+    events_per_second: 0,
     errors: [],
+  };
+  const batchSize = Math.max(1, options.batchSize ?? 500);
+  const progressIntervalRecords = Math.max(1, options.progressIntervalRecords ?? 1000);
+  const pendingEvents: NormalizedEvent[] = [];
+  let lastProgressRecordCount = 0;
+
+  const updateTiming = () => {
+    report.duration_ms = Math.max(0, Date.now() - startedAt);
+    report.events_per_second = report.duration_ms > 0
+      ? Math.round((report.events_imported / (report.duration_ms / 1000)) * 100) / 100
+      : 0;
+  };
+  const emitProgress = (force = false) => {
+    if (!options.progress) return;
+    if (!force && report.records_read - lastProgressRecordCount < progressIntervalRecords) return;
+    updateTiming();
+    options.progress(report);
+    lastProgressRecordCount = report.records_read;
+  };
+  const flushBatch = () => {
+    if (pendingEvents.length === 0) return;
+    const result = storage.ingestMany(pendingEvents.splice(0, pendingEvents.length));
+    report.events_imported += result.imported;
+    report.events_skipped_duplicate += result.skippedDuplicate;
+    emitProgress();
   };
 
   for (const file of listJsonlFiles(source)) {
     report.files_scanned += 1;
-    importFile(storage, file, report, options.dryRun === true);
+    importFile(storage, file, report, {
+      onImportableEvent: (event) => {
+        if (options.dryRun) {
+          if (storage.hasEvent(event.event_id)) {
+            report.events_skipped_duplicate += 1;
+          }
+          return;
+        }
+        pendingEvents.push(event);
+        if (pendingEvents.length >= batchSize) flushBatch();
+      },
+      onProgress: emitProgress,
+    });
   }
+  if (!options.dryRun) flushBatch();
+  updateTiming();
+  emitProgress(true);
   return report;
 }
 
-function importFile(storage: LcmStorage, file: string, report: ImportCodexSessionsReport, dryRun: boolean): void {
+function importFile(
+  storage: LcmStorage,
+  file: string,
+  report: ImportCodexSessionsReport,
+  options: {
+    onImportableEvent: (event: NormalizedEvent) => void;
+    onProgress: () => void;
+  },
+): void {
   const state: ImportState = {};
   const lines = fs.readFileSync(file, "utf8").split(/\r?\n/u);
   for (let index = 0; index < lines.length; index += 1) {
@@ -70,23 +126,19 @@ function importFile(storage: LcmStorage, file: string, report: ImportCodexSessio
     } catch (error) {
       report.records_skipped += 1;
       report.errors.push({ file, line: index + 1, message: error instanceof Error ? error.message : String(error) });
+      options.onProgress();
       continue;
     }
 
     const event = codexRecordToEvent(record, file, state);
     if (!event) {
       report.records_skipped += 1;
+      options.onProgress();
       continue;
     }
     report.events_importable += 1;
-    if (storage.hasEvent(event.event_id)) {
-      report.events_skipped_duplicate += 1;
-      continue;
-    }
-    if (!dryRun) {
-      storage.ingest(event);
-      report.events_imported += 1;
-    }
+    options.onImportableEvent(event);
+    options.onProgress();
   }
 }
 

@@ -51,11 +51,16 @@ export async function main(argv: string[]): Promise<void> {
   }
   if (command === "import-codex-sessions") {
     const dryRun = rest.includes("--dry-run");
+    const showProgress = rest.includes("--progress");
     const storage = createStorage({ config: loadConfig(), readOnly: dryRun });
     try {
       printObjectOrText(importCodexSessions(storage, {
         from: optionValue(rest, "--from"),
         dryRun,
+        batchSize: numberOptionValue(rest, "--batch-size"),
+        progress: showProgress ? (report) => {
+          process.stderr.write(`codex-lcm import: files=${report.files_scanned} records=${report.records_read} importable=${report.events_importable} imported=${report.events_imported} duplicates=${report.events_skipped_duplicate} skipped=${report.records_skipped} rate=${report.events_per_second}/s\n`);
+        } : undefined,
       }));
     } finally {
       storage.close();
@@ -115,7 +120,7 @@ Commands:
   codex-lcm doctor [--json]              Diagnose install, storage, and capture state
   codex-lcm health [--json]
   codex-lcm stats [--json]
-  codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--json]
+  codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--progress] [--batch-size N] [--json]
   codex-lcm uninstall --dry-run [--json] Print manual cleanup plan
 `);
 }
@@ -147,6 +152,13 @@ function optionValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   if (index === -1) return undefined;
   return args[index + 1];
+}
+
+function numberOptionValue(args: string[], flag: string): number | undefined {
+  const value = optionValue(args, flag);
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function printObjectOrText(value: unknown): void {

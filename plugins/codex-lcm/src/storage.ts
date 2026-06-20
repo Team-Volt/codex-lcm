@@ -44,6 +44,12 @@ export type StorageOptions = {
   readOnly?: boolean;
 };
 
+export type IngestManyResult = {
+  imported: number;
+  skippedDuplicate: number;
+  touchedSessions: string[];
+};
+
 export type SearchSessionArgs = {
   query?: string;
   limit?: number;
@@ -210,6 +216,13 @@ const CHECKPOINT_INTERVAL = 50;
 const SUMMARY_EARLY_SIGNAL_LIMIT = 120;
 const SUMMARY_LATEST_SIGNAL_LIMIT = 240;
 const SUMMARY_RECENT_EVENT_LIMIT = 40;
+const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
+const KNOWN_ACYCLIC_EDGE_KINDS = new Set(["contains", "next", "tool_result", "checkpoint"]);
+
+type IndexEventResult = {
+  inserted: boolean;
+  summaryTouched: boolean;
+};
 
 export class LcmStorage {
   readonly config: LcmConfig;
@@ -230,6 +243,7 @@ export class LcmStorage {
       this.db = new DatabaseSync(this.config.indexPath, this.readOnly ? { readOnly: true } : {});
       if (!this.readOnly) {
         this.initialize();
+        this.replayRawLogToIndex();
         this.backfillGraph();
         this.backfillSessionMemorySummaries();
       }
@@ -261,6 +275,54 @@ export class LcmStorage {
       this.indexEvent(event);
     } catch (error) {
       this.indexError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  ingestMany(events: NormalizedEvent[]): IngestManyResult {
+    if (this.readOnly) {
+      throw new Error("Cannot ingest events with read-only storage.");
+    }
+    if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
+
+    const known = this.knownEventIds(events.map((event) => event.event_id));
+    const seen = new Set(known);
+    const uniqueEventsToImport: NormalizedEvent[] = [];
+    let skippedDuplicate = 0;
+    for (const event of events) {
+      if (seen.has(event.event_id)) {
+        skippedDuplicate += 1;
+        continue;
+      }
+      seen.add(event.event_id);
+      uniqueEventsToImport.push(event);
+    }
+
+    if (uniqueEventsToImport.length === 0) {
+      return { imported: 0, skippedDuplicate, touchedSessions: [] };
+    }
+
+    fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(this.config.rawLogPath, `${uniqueEventsToImport.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+    if (!this.db) return { imported: uniqueEventsToImport.length, skippedDuplicate, touchedSessions: [] };
+
+    const touchedSessions = new Set<string>();
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      for (const event of uniqueEventsToImport) {
+        const result = this.indexEventInTransaction(event, { rebuildSummary: false });
+        if (result.summaryTouched) touchedSessions.add(event.session_id);
+      }
+      const rebuiltSessions = this.rebuildTouchedSummarySessions(touchedSessions);
+      this.db.exec("COMMIT");
+      return { imported: uniqueEventsToImport.length, skippedDuplicate, touchedSessions: rebuiltSessions };
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures; raw JSONL is still durable and can be replayed.
+      }
+      this.indexError = error instanceof Error ? error.message : String(error);
+      return { imported: uniqueEventsToImport.length, skippedDuplicate, touchedSessions: [] };
     }
   }
 
@@ -307,6 +369,61 @@ export class LcmStorage {
       event_count: rawEvents.length,
       session_count: summarizeSessions(rawEvents).length,
     };
+  }
+
+  private replayRawLogToIndex(): void {
+    if (!this.db || !fs.existsSync(this.config.rawLogPath)) return;
+    const rawLineCount = countRawEventLines(this.config.rawLogPath);
+    if (rawLineCount === 0 || Number(this.scalar("SELECT COUNT(*) AS count FROM events")) >= rawLineCount) return;
+
+    const rawEvents = readRawEvents(this.config.rawLogPath);
+    if (rawEvents.length === 0) return;
+    const known = this.knownEventIds(rawEvents.map((event) => event.event_id));
+    const missingEvents = rawEvents.filter((event) => !known.has(event.event_id));
+    if (missingEvents.length === 0) return;
+
+    const touchedSessions = new Set<string>();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const event of missingEvents) {
+        const result = this.indexEventInTransaction(event, { rebuildSummary: false });
+        if (result.summaryTouched) touchedSessions.add(event.session_id);
+      }
+      this.rebuildTouchedSummarySessions(touchedSessions);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures; the original replay error is more useful.
+      }
+      this.indexError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private knownEventIds(eventIds: string[]): Set<string> {
+    const uniqueIds = Array.from(new Set(eventIds.filter(Boolean)));
+    if (uniqueIds.length === 0) return new Set();
+    if (!this.db) {
+      const wanted = new Set(uniqueIds);
+      return new Set(readRawEvents(this.config.rawLogPath)
+        .map((event) => event.event_id)
+        .filter((eventId) => wanted.has(eventId)));
+    }
+
+    const known = new Set<string>();
+    for (const chunk of chunkArray(uniqueIds, 500)) {
+      const placeholders = chunk.map((_, index) => `?${index + 1}`).join(", ");
+      const rows = this.db.prepare(`SELECT event_id FROM events WHERE event_id IN (${placeholders})`).all(...chunk) as Array<{ event_id: string }>;
+      for (const row of rows) known.add(row.event_id);
+    }
+    return known;
+  }
+
+  private rebuildTouchedSummarySessions(sessionIds: Iterable<string>): string[] {
+    const rebuiltSessions = Array.from(new Set(sessionIds)).sort((left, right) => left.localeCompare(right));
+    for (const sessionId of rebuiltSessions) this.rebuildSessionMemorySummary(sessionId);
+    return rebuiltSessions;
   }
 
   stats(): LcmStats {
@@ -1280,65 +1397,9 @@ export class LcmStorage {
 
   private indexEvent(event: NormalizedEvent): void {
     if (!this.db) return;
-    const raw = JSON.stringify(event);
-    const text = eventSearchText(event);
-    const metadata = extractEventMetadata(event);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const insert = this.db.prepare(`
-        INSERT OR IGNORE INTO events
-          (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, text, raw_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-      `).run(
-        event.event_id,
-        event.session_id,
-        event.timestamp,
-        event.hook_event,
-        event.cwd,
-        event.repo_root ?? null,
-        event.git_branch ?? null,
-        metadata.turn_id ?? null,
-        metadata.tool_use_id ?? null,
-        text,
-        raw,
-      );
-      if ((insert as { changes?: number }).changes === 0) {
-        this.db.exec("COMMIT");
-        return;
-      }
-      this.db.prepare(`
-        INSERT INTO sessions (session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count)
-        VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1)
-        ON CONFLICT(session_id) DO UPDATE SET
-          last_seen = CASE WHEN excluded.last_seen > sessions.last_seen THEN excluded.last_seen ELSE sessions.last_seen END,
-          cwd = excluded.cwd,
-          repo_root = COALESCE(excluded.repo_root, sessions.repo_root),
-          git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
-          event_count = sessions.event_count + 1
-      `).run(
-        event.session_id,
-        event.timestamp,
-        event.cwd,
-        event.repo_root ?? null,
-        event.git_branch ?? null,
-      );
-      this.db.prepare(`
-        INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-      `).run(
-        event.event_id,
-        event.session_id,
-        event.cwd,
-        event.repo_root ?? "",
-        event.hook_event,
-        text,
-      );
-      const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
-      const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
-      this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
-      if (isSummarySourceEvent(event)) {
-        this.rebuildSessionMemorySummary(event.session_id);
-      }
+      this.indexEventInTransaction(event, { rebuildSummary: true });
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -1348,6 +1409,68 @@ export class LcmStorage {
       }
       throw error;
     }
+  }
+
+  private indexEventInTransaction(event: NormalizedEvent, options: { rebuildSummary: boolean }): IndexEventResult {
+    if (!this.db) return { inserted: false, summaryTouched: false };
+    const raw = JSON.stringify(event);
+    const text = eventSearchText(event);
+    const metadata = extractEventMetadata(event);
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO events
+        (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, text, raw_json)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+    `).run(
+      event.event_id,
+      event.session_id,
+      event.timestamp,
+      event.hook_event,
+      event.cwd,
+      event.repo_root ?? null,
+      event.git_branch ?? null,
+      metadata.turn_id ?? null,
+      metadata.tool_use_id ?? null,
+      text,
+      raw,
+    );
+    if ((insert as { changes?: number }).changes === 0) {
+      return { inserted: false, summaryTouched: false };
+    }
+    this.db.prepare(`
+      INSERT INTO sessions (session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count)
+      VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1)
+      ON CONFLICT(session_id) DO UPDATE SET
+        last_seen = CASE WHEN excluded.last_seen > sessions.last_seen THEN excluded.last_seen ELSE sessions.last_seen END,
+        cwd = excluded.cwd,
+        repo_root = COALESCE(excluded.repo_root, sessions.repo_root),
+        git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
+        event_count = sessions.event_count + 1
+    `).run(
+      event.session_id,
+      event.timestamp,
+      event.cwd,
+      event.repo_root ?? null,
+      event.git_branch ?? null,
+    );
+    this.db.prepare(`
+      INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+    `).run(
+      event.event_id,
+      event.session_id,
+      event.cwd,
+      event.repo_root ?? "",
+      event.hook_event,
+      text,
+    );
+    const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
+    const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
+    this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
+    const summaryTouched = isSummarySourceEvent(event);
+    if (summaryTouched && options.rebuildSummary && this.shouldRebuildSessionMemorySummary(event)) {
+      this.rebuildSessionMemorySummary(event.session_id);
+    }
+    return { inserted: true, summaryTouched };
   }
 
   private indexGraphForEvent(event: NormalizedEvent, eventCount: number, currentRowId = 0): void {
@@ -1532,7 +1655,7 @@ export class LcmStorage {
     metadata: Record<string, unknown> = {},
   ): void {
     if (!this.db) return;
-    if (this.wouldCreateCycle(fromNodeId, toNodeId)) {
+    if (fromNodeId === toNodeId || (!KNOWN_ACYCLIC_EDGE_KINDS.has(kind) && this.wouldCreateCycle(fromNodeId, toNodeId))) {
       throw new Error(`Refusing to insert graph edge that would create a cycle: ${fromNodeId} -> ${toNodeId}`);
     }
     this.db.prepare(`
@@ -1682,6 +1805,20 @@ export class LcmStorage {
     return Object.fromEntries(rows.map((row) => [String(row.key), Number(row.count)]));
   }
 
+  private shouldRebuildSessionMemorySummary(event: NormalizedEvent): boolean {
+    if (!this.db || !isSummarySourceEvent(event)) return false;
+    if (event.hook_event !== "UserPromptSubmit") return true;
+    const existingSummary = this.db.prepare("SELECT 1 FROM session_summaries WHERE session_id = ?1 LIMIT 1").get(event.session_id);
+    if (!existingSummary) return true;
+    const highSignalCount = Number(this.db.prepare(`
+      SELECT COUNT(*) AS count FROM events
+      WHERE session_id = ?1
+        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
+    `).get(event.session_id)?.count ?? 0);
+    const chunkOffset = highSignalCount % SUMMARY_NODE_CHUNK_SIZE;
+    return chunkOffset === 0 || chunkOffset === 1;
+  }
+
   private rebuildSessionMemorySummary(sessionId: string): void {
     if (!this.db) return;
     const events = this.getSummaryEventsForSession(sessionId);
@@ -1822,18 +1959,17 @@ export class LcmStorage {
 
   private getSummaryEventsForSession(sessionId: string): NormalizedEvent[] {
     if (!this.db) return [];
-    const highSignalFilter = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
     const earlySignals = this.db.prepare(`
       SELECT raw_json FROM events
       WHERE session_id = ?1
-        AND hook_event IN ${highSignalFilter}
+        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
       ORDER BY timestamp ASC, rowid ASC
       LIMIT ?2
     `).all(sessionId, SUMMARY_EARLY_SIGNAL_LIMIT);
     const latestSignals = this.db.prepare(`
       SELECT raw_json FROM events
       WHERE session_id = ?1
-        AND hook_event IN ${highSignalFilter}
+        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
       ORDER BY timestamp DESC, rowid DESC
       LIMIT ?2
     `).all(sessionId, SUMMARY_LATEST_SIGNAL_LIMIT);
@@ -2325,6 +2461,14 @@ function readRawEvents(rawLogPath: string): NormalizedEvent[] {
         return [];
       }
     });
+}
+
+function countRawEventLines(rawLogPath: string): number {
+  if (!fs.existsSync(rawLogPath)) return 0;
+  return fs.readFileSync(rawLogPath, "utf8")
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length > 0)
+    .length;
 }
 
 function countEventsByHook(events: NormalizedEvent[]): Record<string, number> {

@@ -111,6 +111,34 @@ test("rejects edges that would introduce a graph cycle", () => {
   storage.close();
 });
 
+test("skips recursive cycle checks for known acyclic internal edge kinds", () => {
+  const storage = createStorage({ home: tempHome() });
+  const graphInternals = storage as unknown as {
+    wouldCreateCycle(fromNodeId: string, toNodeId: string): boolean;
+  };
+  let cycleChecks = 0;
+  graphInternals.wouldCreateCycle = () => {
+    cycleChecks += 1;
+    throw new Error("recursive cycle guard should not run for internal edge kinds");
+  };
+
+  ingest(storage, "SessionStart", {
+    session_id: "acyclic-bypass-session",
+    cwd: "/tmp/dag-acyclic-bypass",
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "acyclic-bypass-session",
+    turn_id: "turn-1",
+    cwd: "/tmp/dag-acyclic-bypass",
+    prompt: "known internal edges skip recursive cycle checks",
+  }, "2026-06-09T12:00:01.000Z");
+
+  assert.equal(cycleChecks, 0);
+  assert.equal(storage.getSessionGraph("acyclic-bypass-session", { limit: 20 }).edges.length > 0, true);
+
+  storage.close();
+});
+
 test("pages session retrieval for very long sessions", () => {
   const storage = createStorage({ home: tempHome() });
   const sessionId = "paged-session";
