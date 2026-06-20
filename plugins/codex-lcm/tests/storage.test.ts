@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
@@ -48,10 +49,12 @@ test("stats reports aggregate summary and graph shape without raw content", () =
   assert.equal(stats.event_count, 9);
   assert.equal(stats.session_count, 1);
   assert.equal(stats.summary_count, 1);
+  assert.equal(stats.session_summary_count, 1);
   assert.equal(stats.summary_node_count, 3);
   assert.deepEqual(stats.hook_event_counts, { PreCompact: 1, UserPromptSubmit: 8 });
   assert.deepEqual(stats.summary_nodes_by_depth, { "0": 2, "1": 1 });
   assert.deepEqual(stats.summary_nodes_by_source_type, { events: 2, nodes: 1 });
+  assert.equal(stats.sessions_with_session_summary, 1);
   assert.equal(stats.sessions_with_summary_nodes, 1);
   assert.equal(stats.max_summary_depth, 1);
   assert.equal(stats.latest_event_at, "2026-06-09T12:00:08.000Z");
@@ -59,6 +62,7 @@ test("stats reports aggregate summary and graph shape without raw content", () =
   assert.equal(stats.graph_nodes_by_kind.event, 9);
   assert.equal(stats.graph_nodes_by_kind.session, 1);
   assert.equal(stats.graph_edges_by_kind.contains, 9);
+  assert.equal(stats.graph_edges_by_kind.summary_source, 11);
   assert.equal("raw_json" in stats, false);
 
   storage.close();
@@ -81,6 +85,73 @@ test("read-only storage opens do not rebuild derived indexes", () => {
   assert.equal(stats.index_error, undefined);
 
   readOnlyStorage.close();
+});
+
+test("context plan reports budget pressure without claiming compaction control", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const prompt = "context budget pressure ".repeat(40);
+
+  for (let index = 0; index < 12; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: "context-plan-session",
+        cwd: "/tmp/context-plan",
+        prompt: `${prompt}${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+
+  const plan = storage.getContextPlan({
+    sessionId: "context-plan-session",
+    modelContextWindow: 20_000,
+    autoCompactTokenLimit: 200,
+  });
+
+  assert.equal(plan.session_id, "context-plan-session");
+  assert.equal(plan.can_control_compaction, false);
+  assert.equal(plan.state, "over_limit");
+  assert.equal(plan.summary_node_count, 3);
+  assert.equal(plan.estimated_recent_tokens > plan.auto_compact_token_limit, true);
+  assert.equal(plan.latest_event_at, "2026-06-09T12:00:11.000Z");
+  assert.equal(plan.suggested_tools.includes("lcm_pack_context"), true);
+  assert.match(plan.recommendation, /lcm_pack_context/u);
+
+  storage.close();
+});
+
+test("context plan includes summary-node tokens in pressure state", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  for (let index = 0; index < 40; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: "context-plan-summary-pressure-session",
+        cwd: "/tmp/context-plan-summary-pressure",
+        prompt: `summary pressure topic ${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 13, 0, index)),
+    }));
+  }
+
+  const plan = storage.getContextPlan({
+    sessionId: "context-plan-summary-pressure-session",
+    modelContextWindow: 20_000,
+    autoCompactTokenLimit: 120,
+    recentEventLimit: 1,
+  });
+
+  assert.equal(plan.estimated_recent_tokens < plan.auto_compact_token_limit, true);
+  assert.equal(plan.estimated_total_tokens >= plan.auto_compact_token_limit, true);
+  assert.equal(plan.state, "over_limit");
+
+  storage.close();
 });
 
 test("writable storage replays raw JSONL events that are missing from SQLite index", () => {
@@ -303,6 +374,90 @@ test("bulk ingest appends raw events once and rebuilds summaries once per touche
   assert.equal(storage.getSessionMemorySummary(sessionId)?.outcomes.includes("bulk import final outcome"), true);
 
   storage.close();
+});
+
+test("indexes large path-backed tool outputs as file references", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const content = JSON.stringify({
+    rows: Array.from({ length: 800 }, (_, index) => ({ id: index, label: `large file row ${index}` })),
+  });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: "file-ref-session",
+      cwd: "/tmp/file-ref",
+      tool_name: "Read",
+      tool_response: {
+        file_path: "/tmp/file-ref/data.json",
+        result: { content },
+      },
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+
+  const refs = storage.getFileRefsForSession("file-ref-session");
+
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0].path, "/tmp/file-ref/data.json");
+  assert.equal(refs[0].session_id, "file-ref-session");
+  assert.equal(refs[0].mime_type, "application/json");
+  assert.equal(refs[0].byte_count, Buffer.byteLength(content, "utf8"));
+  assert.match(refs[0].file_ref_id, /^file:/u);
+  assert.match(refs[0].sha256, /^[a-f0-9]{64}$/u);
+  assert.match(refs[0].exploration_summary, /JSON object/u);
+  assert.match(refs[0].exploration_summary, /rows/u);
+
+  const described = storage.getFileRef(refs[0].file_ref_id);
+  assert.deepEqual(described, refs[0]);
+
+  storage.close();
+});
+
+test("writable storage backfills file references for existing indexed events", () => {
+  const home = tempHome();
+  const content = JSON.stringify({
+    rows: Array.from({ length: 800 }, (_, index) => ({ id: index, label: `backfill file row ${index}` })),
+  });
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: "file-ref-backfill-session",
+      cwd: "/tmp/file-ref-backfill",
+      tool_name: "Read",
+      tool_response: {
+        file_path: "/tmp/file-ref-backfill/data.json",
+        content,
+      },
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  storage.close();
+
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  try {
+    db.exec("DELETE FROM file_refs");
+    try {
+      db.exec("DELETE FROM index_metadata WHERE key = 'file_refs_backfilled_v1'");
+    } catch {
+      // Old indexes did not have migration metadata.
+    }
+  } finally {
+    db.close();
+  }
+
+  const reopened = createStorage({ home });
+  const refs = reopened.getFileRefsForSession("file-ref-backfill-session");
+
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0].path, "/tmp/file-ref-backfill/data.json");
+  assert.equal(refs[0].byte_count, Buffer.byteLength(content, "utf8"));
+
+  reopened.close();
 });
 
 test("post-compaction reason text is a summary signal fallback", () => {
@@ -989,6 +1144,32 @@ test("health falls back to raw JSONL when SQLite queries fail after open", () =>
   assert.match(health.index_error ?? "", /query failure/u);
   assert.equal(health.event_count, 1);
   assert.equal(health.session_count, 1);
+
+  storage.close();
+});
+
+test("context plan falls back to raw JSONL when SQLite queries fail after open", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "context-plan-query-fail", cwd: "/tmp/raw", prompt: "raw context plan fallback" }),
+    env: {},
+    now,
+  }));
+
+  (storage as unknown as { db: { prepare: () => never; close: () => void } }).db = {
+    prepare() {
+      throw new Error("query failure");
+    },
+    close() {},
+  };
+
+  const plan = storage.getContextPlan({ sessionId: "context-plan-query-fail" });
+  assert.equal(plan.session_id, "context-plan-query-fail");
+  assert.equal(plan.estimated_recent_tokens > 0, true);
+  assert.equal(plan.state, "under_limit");
 
   storage.close();
 });

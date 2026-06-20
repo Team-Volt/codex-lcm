@@ -90,6 +90,7 @@ test("stats command reports aggregate summary depth and graph counts", () => {
   assert.equal(stats.max_summary_depth, 1);
   assert.equal(stats.graph_nodes_by_kind.event, 9);
   assert.equal(stats.graph_edges_by_kind.contains, 9);
+  assert.equal(stats.graph_edges_by_kind.summary_source, 11);
 });
 
 test("stats command does not rebuild derived summaries", () => {
@@ -117,4 +118,39 @@ test("stats command does not rebuild derived summaries", () => {
   assert.equal(stats.summary_count, 0);
   assert.equal(stats.summary_node_count, 0);
   assert.equal(stats.index_error, undefined);
+});
+
+test("context-plan command reports budget pressure as JSON", () => {
+  const home = tempHome();
+  for (let index = 0; index < 12; index += 1) {
+    const hook = runCli(["hook", "UserPromptSubmit"], {
+      input: JSON.stringify({
+        session_id: "cli-context-plan-session",
+        cwd: "/tmp/cli-context-plan",
+        prompt: `cli context budget pressure ${index} ${"signal ".repeat(40)}`,
+      }),
+      env: { CODEX_LCM_HOME: home },
+    });
+    assertCliOk(hook);
+  }
+
+  const result = runCli([
+    "context-plan",
+    "--session-id",
+    "cli-context-plan-session",
+    "--model-context-window",
+    "2000",
+    "--auto-compact-token-limit",
+    "200",
+    "--json",
+  ], {
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assertCliOk(result);
+  const plan = JSON.parse(result.stdout);
+  assert.equal(plan.session_id, "cli-context-plan-session");
+  assert.equal(plan.state, "over_limit");
+  assert.equal(plan.can_control_compaction, false);
+  assert.equal(plan.suggested_tools.includes("lcm_pack_context"), true);
 });

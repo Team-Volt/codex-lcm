@@ -22,6 +22,8 @@ node bin/codex-lcm install --dry-run  # optional manual wiring plan
 node bin/codex-lcm status
 node bin/codex-lcm health
 node bin/codex-lcm stats
+node bin/codex-lcm context-plan
+node bin/codex-lcm benchmark long-context
 node bin/codex-lcm uninstall --dry-run  # optional manual cleanup plan
 ```
 
@@ -37,20 +39,25 @@ Useful diagnostics and backfill commands:
 node bin/codex-lcm doctor --json
 node bin/codex-lcm import-codex-sessions --dry-run --json
 node bin/codex-lcm import-codex-sessions --json
+node bin/codex-lcm context-plan --session-id SESSION --json
+node bin/codex-lcm benchmark long-context --json
 ```
 
 `doctor` reports install wiring, storage health, capture state, summary index
 state, and recommendations. `import-codex-sessions` imports existing Codex
 session JSONL files from `~/.codex/sessions` unless `--from PATH` is provided.
 It leaves source transcripts untouched and skips duplicate event IDs on repeated
-runs.
+runs. `context-plan` estimates recent-session token pressure and recommends
+when to pack LCM context; it does not control Codex compaction. The benchmark
+command generates a temporary synthetic long session and verifies old evidence
+can still be recovered through `lcm_pack_context`.
 
 ## MCP Tools
 
 Standard recall workflow:
 
 - `lcm_grep`: find relevant sessions by searching summary nodes, session summaries, and high-signal events.
-- `lcm_describe`: inspect a session or summary node, including depth, source IDs, and lineage metadata.
+- `lcm_describe`: inspect a session, summary node, or indexed file reference, including depth, source IDs, lineage metadata, and large-output summaries.
 - `lcm_expand`: expand one summary node into bounded source summary nodes and high-signal source events.
 - `lcm_expand_query`: answer a focused retrieval need by searching matching summary nodes and recursively expanding their source lineage into bounded evidence. The default budget is 2000 tokens. Use `overview: true` for broad, source-rich lineage views. `sourceLimit` is per matched node/source expansion, and tight budgets reserve room for a focused source-event excerpt when one exists.
 - `lcm_pack_context`: pack relevant summary-node context into a model-ready Markdown block.
@@ -59,6 +66,7 @@ Diagnostics and lower-level tools:
 
 - `lcm_health`
 - `lcm_stats`
+- `lcm_context_plan`
 - `lcm_current_session`
 - `lcm_search_sessions`
 - `lcm_get_session`
@@ -170,7 +178,7 @@ Hooks capture the JSON payload Codex sends on stdin for:
 - `PostCompact`
 - `Stop`
 
-Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes.
+Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes. Large path-backed outputs are indexed as file references with path, byte count, SHA-256, MIME guess, and a compact exploration summary; the indexed metadata does not reload the full content.
 
 Project and git data are metadata only. Search and retrieval are session-first and work for projectless sessions.
 
@@ -185,7 +193,7 @@ SQLite stores a derived DAG alongside FTS:
 - Typed edges include `contains`, `next`, `tool_result`, `checkpoint`, and
   `summary_source`.
 
-Edges are inserted with a recursive cycle check. The graph is derived from raw events and can be rebuilt; `events.jsonl` remains the source of truth.
+Unknown edge kinds use recursive cycle checks. Known internal edge kinds (`contains`, `next`, `tool_result`, `checkpoint`, and `summary_source`) skip that expensive check because they are derived from append-only session order or summary-source lineage. The graph is derived from raw events and can be rebuilt; `events.jsonl` remains the source of truth.
 
 SQLite also stores deterministic extractive summaries in `session_summaries` and
 `session_summary_fts`. A summary contains a title, overview, topics, key user
@@ -203,7 +211,7 @@ The summary-node layer adds a second derived index:
 
 - D0 summary nodes summarize bounded chunks of high-signal events.
 - D1 and deeper summary nodes summarize lower-depth summary nodes.
-- `summary_source` edges connect summary nodes back to their child nodes or raw event nodes.
+- `summary_source` edges are persisted and connect summary nodes back to their child nodes or raw event nodes.
 - `summary_node_fts` lets retrieval search the summary DAG before falling back to raw event FTS.
 
 This mirrors the lossless-context pattern used by systems such as lossless-claw
@@ -220,11 +228,18 @@ summary text; empty completion markers are still stored and counted.
 Use `lcm_stats` or `node bin/codex-lcm stats --json` to inspect aggregate index
 shape without reading raw transcript text. The stats output includes summary
 nodes by depth, summary source types, hook-event counts, graph node and edge
-counts, freshness timestamps, max summary depth, and the number of sessions with
+counts, freshness timestamps, max summary depth, `session_summary_count`,
+`sessions_with_session_summary`, and the number of sessions with summary nodes.
+The legacy `summary_count` field is kept as an alias for session summaries, not
 summary nodes. Check `hook_event_counts.PreCompact` and
 `hook_event_counts.PostCompact` when verifying that Codex compaction hooks are
 being captured. Health and stats diagnostics open the index read-only; normal
 hook ingestion and note writes perform derived-index maintenance.
+
+Use `lcm_context_plan` or `node bin/codex-lcm context-plan --json` when an agent
+needs to decide whether to call `lcm_pack_context`. It reports estimated recent
+tokens, summary-node availability, soft-limit state, and recommended retrieval
+tools. It is an observability surface only; Codex owns compaction.
 
 For long sessions, summary rebuilds use a bounded sample of early high-signal
 events, latest high-signal events, and recent events. That keeps ingestion fast
@@ -254,6 +269,11 @@ questions do not return empty or misleadingly narrow context just because the
 current directory is too narrow. Packed context excludes LCM self-reference tool
 chatter and generated suggestion chatter, and prefers summary-node source
 lineage over arbitrary raw tool output.
+
+`node bin/codex-lcm benchmark long-context --json` runs a local synthetic
+retrieval check. It creates temporary storage, imports a long session with an old
+needle event, and verifies `lcm_pack_context` recovers that source under a
+bounded budget. Pass `--home PATH` to keep the benchmark storage for inspection.
 
 ## Privacy And Safety
 

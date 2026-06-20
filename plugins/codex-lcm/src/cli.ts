@@ -1,4 +1,5 @@
 import { DEFAULT_LIMITS, loadConfig, pluginRoot } from "./config.ts";
+import { runLongContextBenchmark } from "./benchmark.ts";
 import { importCodexSessions } from "./codex-import.ts";
 import { buildDoctorReport } from "./doctor.ts";
 import { normalizeHookEvent } from "./events.ts";
@@ -67,6 +68,16 @@ export async function main(argv: string[]): Promise<void> {
     }
     return;
   }
+  if (command === "benchmark") {
+    const benchmarkName = rest[0];
+    if (benchmarkName !== "long-context") throw new Error("Usage: codex-lcm benchmark long-context [--events N] [--budget-tokens N] [--home PATH] [--json]");
+    printObjectOrText(runLongContextBenchmark({
+      events: numberOptionValue(rest, "--events"),
+      budgetTokens: numberOptionValue(rest, "--budget-tokens"),
+      home: optionValue(rest, "--home"),
+    }));
+    return;
+  }
   if (command === "health") {
     const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
@@ -80,6 +91,22 @@ export async function main(argv: string[]): Promise<void> {
     const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
       printObjectOrText(storage.stats());
+    } finally {
+      storage.close();
+    }
+    return;
+  }
+  if (command === "context-plan") {
+    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    try {
+      printObjectOrText(storage.getContextPlan({
+        sessionId: optionValue(rest, "--session-id"),
+        cwd: optionValue(rest, "--cwd"),
+        repoRoot: optionValue(rest, "--repo-root"),
+        modelContextWindow: numberOptionValue(rest, "--model-context-window"),
+        autoCompactTokenLimit: numberOptionValue(rest, "--auto-compact-token-limit"),
+        recentEventLimit: numberOptionValue(rest, "--recent-event-limit"),
+      }));
     } finally {
       storage.close();
     }
@@ -120,6 +147,8 @@ Commands:
   codex-lcm doctor [--json]              Diagnose install, storage, and capture state
   codex-lcm health [--json]
   codex-lcm stats [--json]
+  codex-lcm context-plan [--session-id ID] [--cwd PATH] [--repo-root PATH] [--model-context-window N] [--auto-compact-token-limit N] [--recent-event-limit N] [--json]
+  codex-lcm benchmark long-context [--events N] [--budget-tokens N] [--home PATH] [--json]
   codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--progress] [--batch-size N] [--json]
   codex-lcm uninstall --dry-run [--json] Print manual cleanup plan
 `);

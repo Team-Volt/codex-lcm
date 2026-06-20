@@ -8,8 +8,8 @@
 4. Obvious secrets and oversized content are sanitized.
 5. The sanitized event is appended to `events.jsonl`.
 6. SQLite indexing is attempted. This builds session rows, FTS rows, extractive
-   summaries, and a derived DAG. Index failure does not undo or block raw append.
-7. `codex-lcm mcp` serves health, stats, search, summary, retrieval, note, and context-packing tools over newline-delimited JSON-RPC.
+   summaries, file references, and a derived DAG. Index failure does not undo or block raw append.
+7. `codex-lcm mcp` serves health, stats, search, summary, retrieval, diagnostics, note, and context-packing tools over newline-delimited JSON-RPC.
 
 ## Plugin Packaging
 
@@ -68,10 +68,16 @@ SQLite tables:
 - `session_summary_fts`
 - `summary_nodes`
 - `summary_node_fts`
+- `file_refs`
 - `graph_nodes`
 - `graph_edges`
 
 Codex LCM creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
+
+`file_refs` records large path-backed outputs detected in sanitized event
+payloads. Each row stores the path, source event, byte count, SHA-256, MIME
+guess, and a compact exploration summary. It is metadata for inspection and
+search triage, not a second copy of the full file.
 
 ## Summary Index
 
@@ -148,7 +154,13 @@ Edge kinds:
 - `checkpoint`: session to checkpoint.
 - `summary_source`: summary node to source event node or lower-depth summary node.
 
-Before inserting an edge, storage runs a recursive reachability check from the prospective child to the prospective parent. If the parent is already reachable from the child, the edge is rejected because it would create a cycle.
+`summary_source` edges are persisted when summary nodes are rebuilt. Older
+indexes without persisted summary-source rows still get a synthesized fallback
+when graph slices are read. Unknown edge kinds run a recursive reachability
+check from the prospective child to the prospective parent. Known internal edge
+kinds (`contains`, `next`, `tool_result`, `checkpoint`, and `summary_source`)
+skip that expensive check because they are derived from append-only session
+order or summary-source lineage.
 
 For very long sessions, callers should prefer bounded graph and event access:
 
@@ -156,7 +168,12 @@ For very long sessions, callers should prefer bounded graph and event access:
 - `lcm_expand_query` for focused recursive evidence expansion without manually choosing a node first.
 - `lcm_get_session` with `limit` and `cursor`.
 - `lcm_get_session_graph` with a bounded `limit`.
+- `lcm_context_plan` to decide whether summary-node packing is likely useful before continuing a long session.
 - `lcm_pack_context`, which searches summary nodes first and expands bounded source lineage.
+
+`codex-lcm benchmark long-context --json` is the local regression harness for
+this path. It creates temporary storage, imports a synthetic long session with
+an old marker event, and verifies packed context recovers that source evidence.
 
 Search uses strict SQLite FTS first against summary nodes, session summaries,
 and events. If a non-empty query has no strict hits, LCM builds a relaxed query
