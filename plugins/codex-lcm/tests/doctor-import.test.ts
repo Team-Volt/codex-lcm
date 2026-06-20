@@ -45,7 +45,7 @@ test("import-codex-sessions ingests existing Codex JSONL sessions idempotently",
   const source = writeCodexSessionFixture();
   const lcmHome = tempHome("codex-lcm-import-");
 
-  const first = runCli(["import-codex-sessions", "--from", source, "--json"], {
+  const first = runCli(["import-codex-sessions", "--from", source, "--batch-size", "1", "--json"], {
     env: { CODEX_LCM_HOME: lcmHome },
   });
   assertCliOk(first);
