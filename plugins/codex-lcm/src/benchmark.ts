@@ -15,7 +15,6 @@ export type LongContextBenchmarkOptions = {
   events?: number;
   budgetTokens?: number;
   home?: string;
-  cleanup?: boolean;
 };
 
 export type LongContextBenchmarkResult = {
@@ -35,7 +34,7 @@ export function runLongContextBenchmark(options: LongContextBenchmarkOptions = {
   const eventCount = Math.max(16, Math.floor(options.events ?? 128));
   const budgetTokens = Math.max(64, Math.floor(options.budgetTokens ?? 1200));
   const home = options.home ?? fs.mkdtempSync(path.join(os.tmpdir(), "codex-lcm-benchmark-"));
-  const cleanup = options.cleanup ?? options.home === undefined;
+  const cleanup = options.home === undefined;
   const startedAt = performance.now();
   const storage = createStorage({ home });
 

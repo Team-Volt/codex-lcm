@@ -34,7 +34,6 @@ import {
   toFtsQueries,
   type SessionMemorySummary,
   type SummaryNode,
-  type SummarySourceType,
 } from "./summary.ts";
 
 export type { FileReference } from "./file-refs.ts";
@@ -1077,7 +1076,7 @@ export class LcmStorage {
     const sourceEvents = this.getSummaryNodeSourceEvents(node, args.query, args.limit);
     const markdown = [
       summaryNodeToMarkdown(node),
-      summaryNodeExpansionToMarkdown(node, {
+      summaryNodeExpansionToMarkdown({
         sourceNodes,
         sourceEvents,
       }),
@@ -1505,7 +1504,7 @@ export class LcmStorage {
         const sourceEvents = this.getSummaryNodeSourceEvents(node, query);
         const text = [
           summaryNodeToMarkdown(node),
-          summaryNodeExpansionToMarkdown(node, {
+          summaryNodeExpansionToMarkdown({
             sourceNodes,
             sourceEvents,
           }),

@@ -4,7 +4,7 @@ import { importCodexSessions } from "./codex-import.ts";
 import { buildDoctorReport } from "./doctor.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
-import { planInstall, planUninstall, readStatus } from "./installer.ts";
+import { readStatus } from "./installer.ts";
 import { startMcpServer } from "./mcp.ts";
 import { createStorage } from "./storage.ts";
 
@@ -24,14 +24,6 @@ export async function main(argv: string[]): Promise<void> {
   }
   if (command === "hook") {
     await runHook(rest);
-    return;
-  }
-  if (command === "install") {
-    printObjectOrText(planInstall({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }));
-    return;
-  }
-  if (command === "uninstall") {
-    printObjectOrText(planUninstall({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }));
     return;
   }
   if (command === "status") {
@@ -142,7 +134,6 @@ function printHelp(): void {
 Commands:
   codex-lcm mcp
   codex-lcm hook <event>
-  codex-lcm install --dry-run [--json]   Print manual MCP/hook wiring plan
   codex-lcm status [--json]
   codex-lcm doctor [--json]              Diagnose install, storage, and capture state
   codex-lcm health [--json]
@@ -150,7 +141,6 @@ Commands:
   codex-lcm context-plan [--session-id ID] [--cwd PATH] [--repo-root PATH] [--model-context-window N] [--auto-compact-token-limit N] [--recent-event-limit N] [--json]
   codex-lcm benchmark long-context [--events N] [--budget-tokens N] [--home PATH] [--json]
   codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--progress] [--batch-size N] [--json]
-  codex-lcm uninstall --dry-run [--json] Print manual cleanup plan
 `);
 }
 

@@ -21,9 +21,7 @@ Codex LCM is packaged as a native Codex plugin. The manifest at
 - `skills`: points to `skills/`, which exposes `lcm-recall`.
 
 After `codex plugin add codex-lcm@codex-lcm`, these plugin-owned resources are
-the active install surface. The `codex-lcm install --dry-run` command is not
-part of native plugin installation; it only prints an equivalent manual wiring
-plan for development or compatibility checks.
+the active install surface. No separate `codex-lcm` CLI install step is needed.
 
 ## Event Schema
 

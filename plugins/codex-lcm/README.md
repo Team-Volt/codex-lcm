@@ -18,13 +18,11 @@ payloads read as JSON from stdin.
 node bin/codex-lcm --help
 node bin/codex-lcm mcp
 node bin/codex-lcm hook UserPromptSubmit
-node bin/codex-lcm install --dry-run  # optional manual wiring plan
 node bin/codex-lcm status
 node bin/codex-lcm health
 node bin/codex-lcm stats
 node bin/codex-lcm context-plan
 node bin/codex-lcm benchmark long-context
-node bin/codex-lcm uninstall --dry-run  # optional manual cleanup plan
 ```
 
 Storage defaults to `~/.codex-lcm`. Override storage for hook and MCP operations with:
@@ -77,79 +75,10 @@ Diagnostics and lower-level tools:
 
 ## Installing
 
-Native Codex plugin installation is the primary install path. It wires the MCP
-server, hook manifest, and skill from `.codex-plugin/plugin.json`; no separate
-`codex-lcm install` step is required.
-
-Install the latest tagged release from GitHub:
-
-```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
-codex plugin add codex-lcm@codex-lcm
-```
-
-Or install as a Codex plugin from a local checkout:
-
-```sh
-codex plugin marketplace add /path/to/codex-lcm
-codex plugin add codex-lcm@codex-lcm
-```
-
-The first TUI session after install asks you to review and trust the hooks. That review is expected because Codex hooks can run outside the sandbox after you trust them.
-
-To upgrade an existing GitHub marketplace install to `v0.2.0`:
-
-```sh
-codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
-codex plugin add codex-lcm@codex-lcm
-```
-
-To upgrade a local checkout install to `v0.2.0`:
-
-```sh
-git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.0
-codex plugin add codex-lcm@codex-lcm
-```
-
-To keep following the moving `main` branch instead of a release tag:
-
-```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref main
-codex plugin add codex-lcm@codex-lcm
-```
-
-If your `codex-lcm` marketplace is path-backed and you want to keep using that
-checkout, use the local-checkout command above instead. The cache directory can
-keep the same version-looking suffix after a local refresh; verify with
-`codex plugin list`, `codex-lcm stats --json`, or the `lcm_stats` MCP tool after
-restart.
-
-Restart Codex Desktop or start a fresh Codex CLI/TUI session after updating.
-Long-running clients keep the old plugin cache until they restart. If the update
-changes hook command text, Codex may ask you to review and trust the hooks again.
-
-To remove the native plugin, use Codex's plugin manager:
-
-```sh
-codex plugin remove codex-lcm@codex-lcm
-```
-
-### Manual Wiring Planner
-
-`codex-lcm install` is retained for development, diagnostics, and manual or
-older setups where you want to inspect equivalent MCP and hook wiring without
-changing `~/.codex`:
-
-```sh
-node bin/codex-lcm install --dry-run
-```
-
-The dry run prints the `codex mcp add codex-lcm -- node ".../bin/codex-lcm" mcp` command and the hook entries that would be merged into `~/.codex/hooks.json`.
-
-This command is not needed after native plugin installation. It does not modify
-`~/.codex/config.toml`, `~/.codex/hooks.json`, or the installed skill.
+Use the root [Installation](../../README.md#installation) section for install,
+upgrade, local checkout, and removal commands. Native Codex plugin installation
+wires the MCP server, hooks, and skill from `.codex-plugin/plugin.json`; no
+separate `codex-lcm` CLI install step is required.
 
 The native Codex plugin files are:
 
@@ -308,7 +237,6 @@ local permission issues.
 - Session summaries are deterministic and extractive; they do not call an LLM or external summarizer.
 - Checkpoints are structural; they track graph/session shape rather than prose summaries.
 - Hook payload compatibility is based on verified local Codex/installed-plugin behavior and tolerant parsing.
-- `codex-lcm install` and `codex-lcm uninstall` are dry-run manual wiring planners. Native plugin install and removal are handled by `codex plugin add` and `codex plugin remove`.
 - `node:sqlite` is used through Node 22 and should be treated as a local runtime dependency.
 
 ## License
