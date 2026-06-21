@@ -114,9 +114,7 @@ codex plugin add codex-lcm@codex-lcm
 ```
 
 The native plugin manifest wires the MCP server, lifecycle hooks, and
-`lcm-recall` skill. You do not need to run `codex-lcm install` after
-`codex plugin add`; that command is only a dry-run manual wiring planner for
-development or compatibility checks.
+`lcm-recall` skill. No separate `codex-lcm` CLI install step is required.
 
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
@@ -192,18 +190,7 @@ This first formal release provides the core Codex LCM workflow:
 - Local-only operation with no runtime npm dependencies, hosted services, or
   embeddings required.
 
-Upgrade to `v0.2.0`:
-
-```sh
-codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
-codex plugin add codex-lcm@codex-lcm
-```
-
-If `codex plugin marketplace remove codex-lcm` says the marketplace does not
-exist, continue with the `marketplace add` command.
-
-Restart Codex Desktop or start a fresh Codex CLI/TUI session after upgrading.
+Use the [Installation](#installation) section for install and upgrade commands.
 
 ## Development
 
@@ -242,7 +229,6 @@ checked without opening raw logs or SQLite.
 For deeper implementation notes, see:
 
 - `plugins/codex-lcm/README.md`
-- `plugins/codex-lcm/docs/design.md`
 - `plugins/codex-lcm/docs/architecture.md`
 - `plugins/codex-lcm/docs/troubleshooting.md`
 

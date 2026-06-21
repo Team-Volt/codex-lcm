@@ -3,40 +3,10 @@ import path from "node:path";
 
 import { codexHome, pluginRoot } from "./config.ts";
 
-const HOOK_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop"];
-
 export type InstallerOptions = {
   codexHome?: string;
   root?: string;
 };
-
-export function planInstall(options: InstallerOptions = {}) {
-  const root = path.resolve(options.root ?? pluginRoot());
-  const binPath = path.join(root, "bin", "codex-lcm");
-  return {
-    mode: "dry-run",
-    plugin_root: root,
-    skills: {
-      path: path.join(root, "skills"),
-      recall_skill: path.join(root, "skills", "lcm-recall", "SKILL.md"),
-      note: "Loaded by native Codex plugin installation; this dry-run planner does not copy or install skills.",
-    },
-    mcp: {
-      command: `codex mcp add codex-lcm -- node ${JSON.stringify(binPath)} mcp`,
-    },
-    hooks: buildHookConfig(root).hooks,
-  };
-}
-
-export function planUninstall(_options: InstallerOptions = {}) {
-  return {
-    mode: "dry-run",
-    mcp: {
-      command: "codex mcp remove codex-lcm",
-    },
-    hook_command_match: "codex-lcm",
-  };
-}
 
 export function readStatus(options: InstallerOptions = {}) {
   const home = path.resolve(options.codexHome ?? codexHome());
@@ -75,24 +45,6 @@ export function readStatus(options: InstallerOptions = {}) {
     hooks_configured: manualHooksConfigured || (pluginOwnedWiringAvailable && pluginDeclaresHooks && hookManifestAvailable),
     recall_skill_available: fs.existsSync(path.join(root, "skills", "lcm-recall", "SKILL.md")),
   };
-}
-
-function buildHookConfig(root: string) {
-  const binPath = path.join(root, "bin", "codex-lcm");
-  const hooks: Record<string, Array<{ hooks: Array<{ type: "command"; command: string; statusMessage?: string }>; matcher?: string }>> = {};
-  for (const event of HOOK_EVENTS) {
-    const entry: { hooks: Array<{ type: "command"; command: string; statusMessage?: string }>; matcher?: string } = {
-      hooks: [
-        {
-          type: "command",
-          command: `node ${JSON.stringify(binPath)} hook ${event}`,
-        },
-      ],
-    };
-    if (event === "PreToolUse") entry.matcher = ".*";
-    hooks[event] = [entry];
-  }
-  return { hooks };
 }
 
 function readOptional(filePath: string): string | undefined {

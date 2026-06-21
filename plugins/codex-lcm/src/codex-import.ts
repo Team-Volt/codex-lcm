@@ -9,7 +9,6 @@ export type ImportCodexSessionsOptions = {
   from?: string;
   dryRun?: boolean;
   batchSize?: number;
-  progressIntervalRecords?: number;
   progress?: (report: ImportCodexSessionsReport) => void;
 };
 
@@ -56,7 +55,6 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
     errors: [],
   };
   const batchSize = Math.max(1, options.batchSize ?? 5000);
-  const progressIntervalRecords = Math.max(1, options.progressIntervalRecords ?? 1000);
   const pendingEvents: NormalizedEvent[] = [];
   const touchedSessions = new Set<string>();
   let lastProgressRecordCount = 0;
@@ -69,7 +67,7 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
   };
   const emitProgress = (force = false) => {
     if (!options.progress) return;
-    if (!force && report.records_read - lastProgressRecordCount < progressIntervalRecords) return;
+    if (!force && report.records_read - lastProgressRecordCount < 1000) return;
     updateTiming();
     options.progress(report);
     lastProgressRecordCount = report.records_read;

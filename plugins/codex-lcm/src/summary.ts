@@ -203,7 +203,7 @@ export function summaryNodeToCompactMarkdown(node: SummaryNode, args: {
   return lines.join("\n");
 }
 
-export function summaryNodeExpansionToMarkdown(node: SummaryNode, args: {
+export function summaryNodeExpansionToMarkdown(args: {
   sourceNodes: SummaryNode[];
   sourceEvents: NormalizedEvent[];
 }): string {
