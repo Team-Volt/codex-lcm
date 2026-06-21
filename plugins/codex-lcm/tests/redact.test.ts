@@ -42,6 +42,8 @@ test("redacts secret-like assignments inside strings", () => {
       "accessToken: acc_123456789",
       "refresh_token = ref_123456789",
       "sessionCookie=sid=abc123",
+      "authorization=Bearer abc12345",
+      "authToken=Bearer abcdefghijklmnopqrstuvwxyz0123456789",
       '"DATABASE_URL":"postgres://user:password@localhost:5432/app"',
       "PRIVATE_KEY=-----BEGIN PRIVATE KEY-----abc-----END PRIVATE KEY-----",
     ].join("\n"),
@@ -52,10 +54,27 @@ test("redacts secret-like assignments inside strings", () => {
   assert.match(env, /accessToken: \[REDACTED:secret\]/u);
   assert.match(env, /refresh_token = \[REDACTED:secret\]/u);
   assert.match(env, /sessionCookie=\[REDACTED:secret\]/u);
+  assert.match(env, /authorization=Bearer \[REDACTED:token\]/u);
+  assert.match(env, /authToken=Bearer \[REDACTED:token\]/u);
   assert.match(env, /"DATABASE_URL":"\[REDACTED:secret\]"/u);
   assert.match(env, /PRIVATE_KEY=\[REDACTED:secret\]/u);
-  assert.doesNotMatch(env, /tok_123456789|password@localhost|BEGIN PRIVATE KEY/u);
-  assert.equal(result.redactions.length, 6);
+  assert.doesNotMatch(env, /tok_123456789|abc12345|abcdefghijklmnopqrstuvwxyz0123456789|password@localhost|BEGIN PRIVATE KEY/u);
+  assert.equal(result.redactions.length, 8);
+});
+
+test("redacts bearer token contents regardless of token length", () => {
+  const result = sanitizeForStorage({
+    short: "Authorization: Bearer abc123",
+    long: `curl -H "Authorization: Bearer ${"a".repeat(256)}" https://example.test`,
+  });
+
+  assert.equal((result.value as { short: string }).short, "Authorization: Bearer [REDACTED:token]");
+  assert.equal(
+    (result.value as { long: string }).long,
+    `curl -H "Authorization: Bearer [REDACTED:token]" https://example.test`,
+  );
+  assert.doesNotMatch(JSON.stringify(result.value), /abc123|aaaaaaaa/u);
+  assert.equal(result.redactions.length, 2);
 });
 
 test("redacts multiline private key assignments inside strings", () => {

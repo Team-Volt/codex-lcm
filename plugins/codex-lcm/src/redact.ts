@@ -33,11 +33,11 @@ type TokenPattern = {
 
 const TOKEN_PATTERNS: TokenPattern[] = [
   {
-    regex: /Authorization:\s*Bearer\s+[A-Za-z0-9._~+/=-]{8,}/giu,
+    regex: /Authorization:\s*Bearer\s+(?!\[REDACTED:token\])[^\s"']+/giu,
     replacement: "Authorization: Bearer [REDACTED:token]",
   },
   {
-    regex: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/gu,
+    regex: /\bBearer\s+(?!\[REDACTED:token\])[^\s"']+/gu,
     replacement: "Bearer [REDACTED:token]",
   },
   {
@@ -222,7 +222,11 @@ function redactSecretAssignmentLine(value: string, path: string, redactions: Red
 
   const prefix = value.slice(0, secretStart);
   const secret = value.slice(secretStart);
-  if (secret.startsWith("[REDACTED:secret]") || secret.startsWith("Bearer")) return value;
+  if (secret.startsWith("[REDACTED:secret]")) return value;
+  if (/^Bearer\s+[^\s"']+/u.test(secret)) {
+    redactions.push({ path, reason: "token-pattern" });
+    return `${prefix}${secret.replace(/^Bearer\s+[^\s"']+/u, "Bearer [REDACTED:token]")}`;
+  }
 
   const quote = secret[0];
   if (quote === "\"" || quote === "'") {
