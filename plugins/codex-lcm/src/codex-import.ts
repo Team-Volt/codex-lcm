@@ -55,9 +55,10 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
     events_per_second: 0,
     errors: [],
   };
-  const batchSize = Math.max(1, options.batchSize ?? 500);
+  const batchSize = Math.max(1, options.batchSize ?? 5000);
   const progressIntervalRecords = Math.max(1, options.progressIntervalRecords ?? 1000);
   const pendingEvents: NormalizedEvent[] = [];
+  const touchedSessions = new Set<string>();
   let lastProgressRecordCount = 0;
 
   const updateTiming = () => {
@@ -75,15 +76,16 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
   };
   const flushBatch = () => {
     if (pendingEvents.length === 0) return;
-    const result = storage.ingestMany(pendingEvents.splice(0, pendingEvents.length));
+    const result = storage.ingestMany(pendingEvents.splice(0, pendingEvents.length), { rebuildSummaries: false });
     report.events_imported += result.imported;
     report.events_skipped_duplicate += result.skippedDuplicate;
+    for (const sessionId of result.touchedSessions) touchedSessions.add(sessionId);
     emitProgress();
   };
 
   for (const file of listJsonlFiles(source)) {
     report.files_scanned += 1;
-    importFile(storage, file, report, {
+    importFile(file, report, {
       onImportableEvent: (event) => {
         if (options.dryRun) {
           if (storage.hasEvent(event.event_id)) {
@@ -98,13 +100,13 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
     });
   }
   if (!options.dryRun) flushBatch();
+  if (!options.dryRun) storage.rebuildSessionMemorySummaries(touchedSessions);
   updateTiming();
   emitProgress(true);
   return report;
 }
 
 function importFile(
-  storage: LcmStorage,
   file: string,
   report: ImportCodexSessionsReport,
   options: {

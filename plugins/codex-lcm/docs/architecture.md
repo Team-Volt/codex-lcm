@@ -9,7 +9,7 @@
 5. The sanitized event is appended to `events.jsonl`.
 6. SQLite indexing is attempted. This builds session rows, FTS rows, extractive
    summaries, file references, and a derived DAG. Index failure does not undo or block raw append.
-7. `codex-lcm mcp` serves health, stats, search, summary, retrieval, diagnostics, note, and context-packing tools over newline-delimited JSON-RPC.
+7. `codex-lcm mcp` serves health, stats, search, summary, retrieval, diagnostics, note, and context-packing tools over stdio JSON-RPC.
 
 ## Plugin Packaging
 
@@ -187,7 +187,7 @@ or misleadingly narrow pack.
 
 ## MCP Protocol
 
-The server follows the local Codex plugin pattern verified in the installed OpenAI Developers plugin: one JSON-RPC message per line over stdio.
+The server accepts the local Codex plugin newline-delimited JSON-RPC pattern and Content-Length framed JSON-RPC messages over stdio. Responses use newline-delimited JSON by default and mirror Content-Length framing after a framed request.
 
 Implemented methods:
 
