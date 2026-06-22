@@ -11,7 +11,7 @@ import { createStorage } from "./storage.ts";
 export async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === "--version" || command === "-v") {
-    process.stdout.write("0.2.0\n");
+    process.stdout.write("0.2.1\n");
     return;
   }
   if (command === "--help" || command === "-h" || command === undefined) {

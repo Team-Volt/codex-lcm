@@ -102,7 +102,7 @@ operation.
 Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.1
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -119,20 +119,20 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Upgrade an existing GitHub marketplace install to `v0.2.0`:
+Upgrade an existing GitHub marketplace install to `v0.2.1`:
 
 ```sh
 codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.0
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.1
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Upgrade a local checkout install to `v0.2.0` by checking out the release tag,
+Upgrade a local checkout install to `v0.2.1` by checking out the release tag,
 then asking Codex to refresh the installed plugin cache:
 
 ```sh
 git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.0
+git -C /path/to/codex-lcm checkout v0.2.1
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -161,7 +161,7 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Current release: `v0.2.0`.
+Current release: `v0.2.1`.
 
 Codex LCM is a local-first Codex memory plugin with native plugin installation,
 hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
@@ -171,24 +171,15 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions.
 
-### v0.2.0 notes
+### v0.2.1 notes
 
-This first formal release provides the core Codex LCM workflow:
+This patch release hardens storage and MCP behavior, speeds up indexing, adds
+context-planning/file-reference retrieval, and removes stale cleanup surfaces.
 
-- Native Codex plugin packaging with MCP, hooks, and skill registration.
-- Sanitized append-only event capture with local SQLite search and graph indexes.
-- Session, turn, event, checkpoint, tool-result, and summary-source DAG support.
-- Deterministic extractive session summaries plus recursive summary-node search
-  and expansion.
-- MCP tools for health, stats, current-session lookup, grep, describe, expand,
-  query expansion, context packing, graph inspection, raw-event paging, and note
-  recording.
-- Diagnostics for install wiring, capture state, storage health, hook counts,
-  and import readiness.
-- `import-codex-sessions` support for backfilling existing Codex transcript
-  JSONL files without modifying the source transcripts.
-- Local-only operation with no runtime npm dependencies, hosted services, or
-  embeddings required.
+- Adds LCM context planning and file-reference support.
+- Hardens redaction, raw-log indexing, and framed MCP stdio handling.
+- Speeds up Codex session import and write indexing.
+- Simplifies CLI JSON output and removes stale cleanup surfaces.
 
 Use the [Installation](#installation) section for install and upgrade commands.
 

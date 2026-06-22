@@ -9,7 +9,7 @@ type JsonRpcMessage = {
 };
 
 const SERVER_NAME = "codex-lcm";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.2.1";
 const HEADER_SEPARATOR = Buffer.from("\r\n\r\n", "utf8");
 const MAX_MESSAGE_BYTES = DEFAULT_LIMITS.maxInputBytes;
 
