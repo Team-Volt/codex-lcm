@@ -6,6 +6,13 @@ import test from "node:test";
 
 import { assertCliOk, clearDerivedSummaries, readJsonl, runCli, tempHome } from "./helpers.ts";
 
+type HookAdditionalContextOutput = {
+  readonly hookSpecificOutput: {
+    readonly hookEventName: string;
+    readonly additionalContext: string;
+  };
+};
+
 test("hook command ingests a synthetic projectless prompt event", () => {
   const home = tempHome();
   const result = runCli(["hook", "UserPromptSubmit"], {
@@ -59,6 +66,69 @@ test("hook command captures git metadata as optional session metadata", () => {
   }>;
   assert.equal(fs.realpathSync(event.repo_root ?? ""), fs.realpathSync(repo));
   assert.equal(event.git_branch, "feature/test");
+});
+
+test("PostCompact hook output nudges the next compact SessionStart to recall LCM", () => {
+  const home = tempHome();
+  const env = { CODEX_LCM_HOME: home };
+  const postCompact = runCli(["hook", "PostCompact"], {
+    input: JSON.stringify({
+      session_id: "compact-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/compact-project",
+      hook_event_name: "PostCompact",
+      trigger: "auto",
+    }),
+    env,
+  });
+  assertCliOk(postCompact);
+  assert.equal(postCompact.stdout, "");
+
+  const sessionStart = runCli(["hook", "SessionStart"], {
+    input: JSON.stringify({
+      session_id: "compact-session",
+      cwd: "/tmp/compact-project",
+      hook_event_name: "SessionStart",
+      source: "compact",
+    }),
+    env,
+  });
+
+  assertCliOk(sessionStart);
+  const output: unknown = JSON.parse(sessionStart.stdout);
+  assertHookAdditionalContextOutput(output);
+  assert.equal(output.hookSpecificOutput.hookEventName, "SessionStart");
+  assert.match(output.hookSpecificOutput.additionalContext, /POST-COMPACTION LCM RECOVERY/u);
+  assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
+});
+
+test("post-compaction LCM nudge is emitted once per compacted session", () => {
+  const home = tempHome();
+  const env = { CODEX_LCM_HOME: home };
+  const postCompact = runCli(["hook", "PostCompact"], {
+    input: JSON.stringify({
+      session_id: "compact-once-session",
+      cwd: "/tmp/compact-once-project",
+      hook_event_name: "PostCompact",
+      trigger: "manual",
+    }),
+    env,
+  });
+  assertCliOk(postCompact);
+
+  const payload = JSON.stringify({
+    session_id: "compact-once-session",
+    cwd: "/tmp/compact-once-project",
+    hook_event_name: "SessionStart",
+    source: "compact",
+  });
+  const first = runCli(["hook", "SessionStart"], { input: payload, env });
+  const second = runCli(["hook", "SessionStart"], { input: payload, env });
+
+  assertCliOk(first);
+  assertCliOk(second);
+  assert.match(first.stdout, /lcm_pack_context/u);
+  assert.equal(second.stdout, "");
 });
 
 test("stats command reports aggregate summary depth and graph counts", () => {
@@ -154,3 +224,17 @@ test("context-plan command reports budget pressure as JSON", () => {
   assert.equal(plan.can_control_compaction, false);
   assert.equal(plan.suggested_tools.includes("lcm_pack_context"), true);
 });
+
+function assertHookAdditionalContextOutput(value: unknown): asserts value is HookAdditionalContextOutput {
+  assert.equal(isRecord(value), true);
+  if (!isRecord(value)) return;
+  const hookSpecificOutput = value.hookSpecificOutput;
+  assert.equal(isRecord(hookSpecificOutput), true);
+  if (!isRecord(hookSpecificOutput)) return;
+  assert.equal(typeof hookSpecificOutput.hookEventName, "string");
+  assert.equal(typeof hookSpecificOutput.additionalContext, "string");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
