@@ -13,6 +13,7 @@ import {
   SUMMARY_NODE_PACK_LIMIT,
   SUMMARY_NODE_SOURCE_EVENT_LIMIT,
   SUMMARY_NODE_VERSION,
+  HISTORICAL_SOURCE_TEXT_NOTICE,
   buildCondensedSummaryNode,
   buildLeafSummaryNode,
   buildSessionMemorySummary,
@@ -22,6 +23,7 @@ import {
   isSummarySourceEvent,
   matchesQueryText,
   queryTermHitCount,
+  quoteHistoricalText,
   rankSummaryNodesForContext,
   sessionSummaryToMarkdown,
   summaryNodeExpansionToMarkdown,
@@ -1192,7 +1194,12 @@ export class LcmStorage {
       return true;
     };
     const addFocusedEventFallback = (event: NormalizedEvent): void => {
-      let prefix = `### Focused Source Events\n- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}: `;
+      let prefix = [
+        "### Focused Source Events",
+        `- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}:`,
+        `  ${HISTORICAL_SOURCE_TEXT_NOTICE}`,
+        "",
+      ].join("\n");
       const suffix = "\n";
       let available = budgetChars - chars - prefix.length - suffix.length;
       if (available <= 0) {
@@ -1205,7 +1212,7 @@ export class LcmStorage {
         truncated = true;
         return;
       }
-      const signal = focusedExcerpt(eventSignalText(event), query, available);
+      const signal = quoteHistoricalText(focusedExcerpt(eventSignalText(event), query, Math.max(0, available - 4)), "  ");
       lines.push(`${prefix}${signal}${suffix}`);
       chars += prefix.length + signal.length + suffix.length;
       truncated = true;
@@ -1216,7 +1223,9 @@ export class LcmStorage {
       for (const event of events.slice(0, sourceLimit)) {
         const signal = eventSignalText(event);
         if (signal.length === 0) continue;
-        eventLines.push(`- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}: ${signal}`);
+        eventLines.push(`- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}:`);
+        eventLines.push(`  ${HISTORICAL_SOURCE_TEXT_NOTICE}`);
+        eventLines.push(quoteHistoricalText(signal, "  "));
       }
       eventLines.push("");
       if (!addBlock(eventLines.join("\n"))) addFocusedEventFallback(events[0]);
@@ -1509,7 +1518,7 @@ export class LcmStorage {
             sourceEvents,
           }),
         ].filter(Boolean).join("\n");
-        const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents });
+        const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents, query });
         return { node, sourceEvents, text, compactText };
       });
 

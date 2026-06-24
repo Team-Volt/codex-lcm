@@ -89,3 +89,37 @@ test("malformed stdin becomes a sanitized parse-error event instead of throwing"
   assert.equal(event.payload.raw_preview, "{not json sk-proj_[REDACTED:token] authToken=[REDACTED:secret]");
   assert.equal(event.redactions.length, 2);
 });
+
+test("redacts secret-shaped top-level metadata before persistence", () => {
+  const event = normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: "session-sk-proj-secret-value",
+      cwd: "/tmp/cwd-Authorization: Bearer metadata-secret",
+      project: "project-ghp_1234567890123456789012345",
+      tool_name: "tool-xoxb-1234567890123456",
+      tool_response: "Authorization: Bearer payload-secret",
+    }),
+    env: {},
+    now: fixedNow,
+    repo: {
+      repoRoot: "/tmp/repo-Authorization: Bearer repo-secret",
+      gitBranch: "branch-ghp_1234567890123456789012345",
+    },
+  });
+
+  const serialized = JSON.stringify(event);
+  assert.doesNotMatch(serialized, /sk-proj-secret-value/u);
+  assert.doesNotMatch(serialized, /metadata-secret/u);
+  assert.doesNotMatch(serialized, /ghp_1234567890123456789012345/u);
+  assert.doesNotMatch(serialized, /xoxb-1234567890123456/u);
+  assert.doesNotMatch(serialized, /repo-secret/u);
+  assert.doesNotMatch(serialized, /payload-secret/u);
+  assert.match(event.session_id, /sk-proj_\[REDACTED:token\]/u);
+  assert.match(event.cwd, /Bearer \[REDACTED:token\]/u);
+  assert.match(event.project ?? "", /ghp_\[REDACTED:token\]/u);
+  assert.match(event.tool_name ?? "", /xox\[REDACTED:token\]/u);
+  assert.match(event.repo_root ?? "", /Bearer \[REDACTED:token\]/u);
+  assert.match(event.git_branch ?? "", /ghp_\[REDACTED:token\]/u);
+  assert.equal(event.payload.tool_response, "Authorization: Bearer [REDACTED:token]");
+});
