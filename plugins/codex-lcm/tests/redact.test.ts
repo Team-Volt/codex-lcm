@@ -24,6 +24,27 @@ test("redacts secret-like object keys recursively", () => {
   assert.equal(result.truncations.length, 0);
 });
 
+test("preserves benign token budget and count metadata", () => {
+  const result = sanitizeForStorage({
+    token_budget: 1200,
+    tokens_budget: 1200,
+    tokens_used: 374,
+    auto_compact_token_limit: 100000,
+    token_count: 42,
+    token: "sk-proj-secret-value",
+  });
+
+  assert.deepEqual(result.value, {
+    token_budget: 1200,
+    tokens_budget: 1200,
+    tokens_used: 374,
+    auto_compact_token_limit: 100000,
+    token_count: 42,
+    token: "[REDACTED:secret]",
+  });
+  assert.equal(result.redactions.length, 1);
+});
+
 test("redacts obvious bearer and provider tokens inside strings", () => {
   const result = sanitizeForStorage({
     text: "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789 and ghp_abcdefghijklmnopqrstuvwxyz012345",
@@ -43,6 +64,7 @@ test("redacts secret-like assignments inside strings", () => {
       "refresh_token = ref_123456789",
       "sessionCookie=sid=abc123",
       "authorization=Bearer abc12345",
+      "authorization=Basic dXNlcjpwYXNz",
       "authToken=Bearer abcdefghijklmnopqrstuvwxyz0123456789",
       '"DATABASE_URL":"postgres://user:password@localhost:5432/app"',
       "PRIVATE_KEY=-----BEGIN PRIVATE KEY-----abc-----END PRIVATE KEY-----",
@@ -55,11 +77,89 @@ test("redacts secret-like assignments inside strings", () => {
   assert.match(env, /refresh_token = \[REDACTED:secret\]/u);
   assert.match(env, /sessionCookie=\[REDACTED:secret\]/u);
   assert.match(env, /authorization=Bearer \[REDACTED:token\]/u);
+  assert.match(env, /authorization=\[REDACTED:secret\]/u);
   assert.match(env, /authToken=Bearer \[REDACTED:token\]/u);
   assert.match(env, /"DATABASE_URL":"\[REDACTED:secret\]"/u);
   assert.match(env, /PRIVATE_KEY=\[REDACTED:secret\]/u);
-  assert.doesNotMatch(env, /tok_123456789|abc12345|abcdefghijklmnopqrstuvwxyz0123456789|password@localhost|BEGIN PRIVATE KEY/u);
-  assert.equal(result.redactions.length, 8);
+  assert.doesNotMatch(env, /tok_123456789|abc12345|dXNlcjpwYXNz|abcdefghijklmnopqrstuvwxyz0123456789|password@localhost|BEGIN PRIVATE KEY/u);
+  assert.equal(result.redactions.length, 9);
+});
+
+test("preserves benign numeric token metadata inside JSON-like text", () => {
+  const result = sanitizeForStorage({
+    text: [
+      '"token_budget": 1200,',
+      '"tokens_budget": 1200,',
+      '"tokens_used": 374,',
+      '"auto_compact_token_limit": 100000,',
+      '"token_count": 42,',
+      '"token": "sk-proj-secret-value",',
+      '"authorization": "Bearer fake-secret"',
+    ].join("\n"),
+  });
+
+  if (typeof result.value !== "object" || result.value === null || !("text" in result.value) || typeof result.value.text !== "string") {
+    assert.fail("expected sanitized value to contain text");
+  }
+  const text = result.value.text;
+  assert.match(text, /"token_budget": 1200,/u);
+  assert.match(text, /"tokens_budget": 1200,/u);
+  assert.match(text, /"tokens_used": 374,/u);
+  assert.match(text, /"auto_compact_token_limit": 100000,/u);
+  assert.match(text, /"token_count": 42,/u);
+  assert.match(text, /"token": "\[REDACTED:secret\]"/u);
+  assert.match(text, /"authorization": "Bearer \[REDACTED:token\]"/u);
+  assert.doesNotMatch(text, /sk-proj-secret-value|fake-secret/u);
+  assert.equal(result.redactions.length, 2);
+});
+
+test("preserves benign token metric prose while redacting later fake secrets", () => {
+  const result = sanitizeForStorage({
+    text: [
+      "lcm-token-metrics-smoke-20260624-1720 benign metrics:",
+      "token_budget=1200 tokens_budget=1300 tokens_used=374 token_count=148 auto_compact_token_limit=150000",
+      'json={"token_budget":1200,"tokens_budget":1300,"tokens_used":374,"token_count":148,"auto_compact_token_limit":150000}.',
+      "fake secrets: Authorization: Bearer abc123 fakeAuth=Bearer abc1234567890abcdef longBearer=Bearer abcdefghijklmnopqrstuvwxyz0123456789._~+/=- provider=sk-proj-testvalue_abcdefghijklmnopqrstuvwxyz1234567890",
+    ].join(" "),
+  });
+
+  if (typeof result.value !== "object" || result.value === null || !("text" in result.value) || typeof result.value.text !== "string") {
+    assert.fail("expected sanitized value to contain text");
+  }
+  const text = result.value.text;
+  assert.match(text, /token_budget=1200/u);
+  assert.match(text, /tokens_budget=1300/u);
+  assert.match(text, /tokens_used=374/u);
+  assert.match(text, /token_count=148/u);
+  assert.match(text, /auto_compact_token_limit=150000/u);
+  assert.match(text, /"token_budget":1200/u);
+  assert.match(text, /Authorization: Bearer \[REDACTED:token\]/u);
+  assert.match(text, /fakeAuth=Bearer \[REDACTED:token\]/u);
+  assert.match(text, /longBearer=Bearer \[REDACTED:token\]/u);
+  assert.match(text, /provider=sk-proj_\[REDACTED:token\]/u);
+  assert.doesNotMatch(text, /abc123|abcdefghijklmnopqrstuvwxyz1234567890|abcdefghijklmnopqrstuvwxyz0123456789/u);
+  assert.doesNotMatch(text, /benign metrics: \[REDACTED:secret\]/u);
+});
+
+test("preserves token metric JSON assignment while redacting later fake secrets", () => {
+  const result = sanitizeForStorage({
+    text: 'lcm-token-metrics-json-smoke-20260624-1721 metrics_json={"token_budget":1200,"tokens_budget":1300,"tokens_used":374,"token_count":148,"auto_compact_token_limit":150000}; fake secrets follow: Authorization: Bearer abc123 fakeAuth=Bearer abc1234567890abcdef provider=sk-proj-testvalue_abcdefghijklmnopqrstuvwxyz1234567890',
+  });
+
+  if (typeof result.value !== "object" || result.value === null || !("text" in result.value) || typeof result.value.text !== "string") {
+    assert.fail("expected sanitized value to contain text");
+  }
+  const text = result.value.text;
+  assert.match(text, /metrics_json=\{"token_budget":1200/u);
+  assert.match(text, /"tokens_budget":1300/u);
+  assert.match(text, /"tokens_used":374/u);
+  assert.match(text, /"token_count":148/u);
+  assert.match(text, /"auto_compact_token_limit":150000/u);
+  assert.match(text, /Authorization: Bearer \[REDACTED:token\]/u);
+  assert.match(text, /fakeAuth=Bearer \[REDACTED:token\]/u);
+  assert.match(text, /provider=sk-proj_\[REDACTED:token\]/u);
+  assert.doesNotMatch(text, /abc123|abcdefghijklmnopqrstuvwxyz1234567890/u);
+  assert.doesNotMatch(text, /metrics_json=\[REDACTED:secret\]/u);
 });
 
 test("redacts bearer token contents regardless of token length", () => {

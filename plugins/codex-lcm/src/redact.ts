@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import { DEFAULT_LIMITS, type LcmLimits } from "./config.ts";
+import { redactSecretAssignments, shouldRedactSecretKey } from "./redact-assignments.ts";
 
 export type RedactionRecord = {
   path: string;
@@ -23,8 +24,6 @@ export type SanitizeResult = {
 };
 
 export type RedactionOptions = Partial<LcmLimits>;
-
-const SECRET_KEY_RE = /(^|[_-])(api[_-]?key|authorization|auth|bearer|cookie|credential|password|private[_-]?key|secret|token)([_-]|$)/iu;
 
 type TokenPattern = {
   regex: RegExp;
@@ -61,20 +60,6 @@ const TOKEN_PATTERNS: TokenPattern[] = [
     replacement: "AKIA[REDACTED:token]",
   },
 ];
-
-const PRIVATE_KEY_BLOCK_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/gu;
-const SECRET_ASSIGNMENT_HINTS = [
-  "api",
-  "auth",
-  "bearer",
-  "cookie",
-  "credential",
-  "password",
-  "private",
-  "secret",
-  "token",
-  "database",
-] as const;
 
 export function sha256(value: string | Buffer): string {
   return createHash("sha256").update(value).digest("hex");
@@ -151,7 +136,7 @@ function sanitizeValue(
     const output: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
       const childPath = `${path}.${key}`;
-      if (SECRET_KEY_RE.test(key)) {
+      if (shouldRedactSecretKey(key, child)) {
         output[key] = "[REDACTED:secret]";
         redactions.push({ path: childPath, reason: "secret-key" });
         continue;
@@ -176,70 +161,6 @@ function redactString(value: string, path: string, redactions: RedactionRecord[]
     });
   }
   return output;
-}
-
-function redactSecretAssignments(value: string, path: string, redactions: RedactionRecord[]): string {
-  const redactPrivateKeys = value.replace(PRIVATE_KEY_BLOCK_RE, () => {
-    redactions.push({ path, reason: "token-pattern" });
-    return "[REDACTED:secret]";
-  });
-
-  let output = "";
-  let start = 0;
-  while (start < redactPrivateKeys.length) {
-    const newlineIndex = redactPrivateKeys.indexOf("\n", start);
-    const lineEnd = newlineIndex === -1 ? redactPrivateKeys.length : newlineIndex;
-    const hasLineBreak = newlineIndex !== -1;
-    const lineBreakStart = lineEnd > start && redactPrivateKeys.charCodeAt(lineEnd - 1) === 13 ? lineEnd - 1 : lineEnd;
-    const line = redactPrivateKeys.slice(start, lineBreakStart);
-
-    output += redactSecretAssignmentLine(line, path, redactions);
-    if (hasLineBreak) {
-      output += redactPrivateKeys.slice(lineBreakStart, lineEnd + 1);
-    }
-    start = lineEnd + 1;
-  }
-
-  return output;
-}
-
-function redactSecretAssignmentLine(value: string, path: string, redactions: RedactionRecord[]): string {
-  if (!value.includes(":") && !value.includes("=")) return value;
-
-  const lowerValue = value.toLowerCase();
-  if (!SECRET_ASSIGNMENT_HINTS.some((hint) => lowerValue.includes(hint))) return value;
-
-  const colonIndex = value.indexOf(":");
-  const equalsIndex = value.indexOf("=");
-  const separatorIndex = colonIndex === -1 ? equalsIndex : equalsIndex === -1 ? colonIndex : Math.min(colonIndex, equalsIndex);
-  if (separatorIndex === -1) return value;
-
-  const key = value.slice(0, separatorIndex).trim().replace(/^(["'])(.*)\1$/u, "$2");
-  if (!SECRET_ASSIGNMENT_HINTS.some((hint) => key.toLowerCase().includes(hint))) return value;
-
-  let secretStart = separatorIndex + 1;
-  while (secretStart < value.length && /\s/u.test(value[secretStart] ?? "")) secretStart += 1;
-
-  const prefix = value.slice(0, secretStart);
-  const secret = value.slice(secretStart);
-  if (secret.startsWith("[REDACTED:secret]")) return value;
-  if (/^Bearer\s+[^\s"']+/u.test(secret)) {
-    redactions.push({ path, reason: "token-pattern" });
-    return `${prefix}${secret.replace(/^Bearer\s+[^\s"']+/u, "Bearer [REDACTED:token]")}`;
-  }
-
-  const quote = secret[0];
-  if (quote === "\"" || quote === "'") {
-    if (secret.startsWith(`${quote}[REDACTED:secret]`)) return value;
-    const closingQuoteIndex = secret.indexOf(quote, 1);
-    if (closingQuoteIndex === -1) return value;
-    redactions.push({ path, reason: "token-pattern" });
-    return `${prefix}${quote}[REDACTED:secret]${secret.slice(closingQuoteIndex)}`;
-  }
-
-  if (secret.length === 0) return value;
-  redactions.push({ path, reason: "token-pattern" });
-  return `${prefix}[REDACTED:secret]`;
 }
 
 function truncateString(
