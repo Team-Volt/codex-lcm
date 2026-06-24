@@ -63,6 +63,7 @@ export function normalizeHookEvent(args: NormalizeHookEventArgs): NormalizedEven
       originalBytes: Buffer.byteLength(rawInput),
       sanitizedBytes: sanitizedPreview.sanitizedBytes,
       repo: args.repo,
+      limits,
     });
   }
 
@@ -91,6 +92,7 @@ export function normalizeHookEvent(args: NormalizeHookEventArgs): NormalizedEven
     originalBytes: sanitized.originalBytes,
     sanitizedBytes: sanitized.sanitizedBytes,
     repo: args.repo,
+    limits,
   });
 }
 
@@ -128,27 +130,82 @@ function finalizeEvent(args: {
   rawHash: string;
   originalBytes: number;
   sanitizedBytes: number;
+  limits: LcmLimits;
 }): NormalizedEvent {
   const payload = isRecord(args.payload) ? args.payload : { value: args.payload };
+  const metadata = sanitizeEventMetadata({
+    sessionId: args.sessionId,
+    cwd: args.cwd,
+    project: args.project,
+    repo: args.repo,
+    toolName: args.toolName,
+    limits: args.limits,
+  });
   const eventId = sha256(`${args.hookEvent}\0${args.sessionId}\0${args.timestamp}\0${args.rawHash}`);
   return {
     schema_version: 1,
     event_id: eventId,
     timestamp: args.timestamp,
     hook_event: args.hookEvent,
+    session_id: metadata.sessionId,
+    cwd: metadata.cwd,
+    ...(metadata.project ? { project: metadata.project } : {}),
+    ...(metadata.repoRoot ? { repo_root: metadata.repoRoot } : {}),
+    ...(metadata.gitBranch ? { git_branch: metadata.gitBranch } : {}),
+    ...(metadata.toolName ? { tool_name: metadata.toolName } : {}),
+    payload,
+    redactions: [...args.redactions, ...metadata.redactions],
+    truncations: [...args.truncations, ...metadata.truncations],
+    raw_input_sha256: args.rawHash,
+    original_bytes: args.originalBytes,
+    sanitized_bytes: args.sanitizedBytes + metadata.sanitizedBytes,
+  };
+}
+
+function sanitizeEventMetadata(args: {
+  sessionId: string;
+  cwd: string;
+  project?: string;
+  repo?: RepoMetadata;
+  toolName?: string;
+  limits: LcmLimits;
+}): {
+  sessionId: string;
+  cwd: string;
+  project?: string;
+  repoRoot?: string;
+  gitBranch?: string;
+  toolName?: string;
+  redactions: unknown[];
+  truncations: unknown[];
+  sanitizedBytes: number;
+} {
+  const sanitized = sanitizeForStorage({
     session_id: args.sessionId,
     cwd: args.cwd,
     ...(args.project ? { project: args.project } : {}),
     ...(args.repo?.repoRoot ? { repo_root: args.repo.repoRoot } : {}),
     ...(args.repo?.gitBranch ? { git_branch: args.repo.gitBranch } : {}),
     ...(args.toolName ? { tool_name: args.toolName } : {}),
-    payload,
-    redactions: args.redactions,
-    truncations: args.truncations,
-    raw_input_sha256: args.rawHash,
-    original_bytes: args.originalBytes,
-    sanitized_bytes: args.sanitizedBytes,
+  }, args.limits);
+  const metadata = isRecord(sanitized.value) ? sanitized.value : {};
+  return {
+    sessionId: metadataString(metadata.session_id) ?? "[REDACTED:metadata]",
+    cwd: metadataString(metadata.cwd) ?? "[REDACTED:metadata]",
+    ...(metadataString(metadata.project) ? { project: metadataString(metadata.project) } : {}),
+    ...(metadataString(metadata.repo_root) ? { repoRoot: metadataString(metadata.repo_root) } : {}),
+    ...(metadataString(metadata.git_branch) ? { gitBranch: metadataString(metadata.git_branch) } : {}),
+    ...(metadataString(metadata.tool_name) ? { toolName: metadataString(metadata.tool_name) } : {}),
+    redactions: sanitized.redactions,
+    truncations: sanitized.truncations,
+    sanitizedBytes: sanitized.sanitizedBytes,
   };
+}
+
+function metadataString(value: unknown): string | undefined {
+  if (typeof value === "string") return stringValue(value);
+  if (value === undefined || value === null) return undefined;
+  return JSON.stringify(value);
 }
 
 function parseJson(rawInput: string): { ok: true; value: unknown } | { ok: false } {
