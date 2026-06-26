@@ -151,11 +151,14 @@ function postCompactRecoveryOutput(args: {
 }): string {
   if (args.hookEvent === "PostCompact") {
     markPostCompactPending(args.home, args.sessionId);
-    return "";
+    return formatAdditionalContextOutput("PostCompact", buildPostCompactLcmDirective());
   }
-  if (args.hookEvent !== "SessionStart" || args.payload.source !== "compact") return "";
+  if (
+    args.hookEvent !== "UserPromptSubmit" &&
+    (args.hookEvent !== "SessionStart" || (args.payload.source !== "compact" && args.payload.source !== "resume"))
+  ) return "";
   if (!claimPostCompactPending(args.home, args.sessionId)) return "";
-  return formatAdditionalContextOutput("SessionStart", buildPostCompactLcmDirective());
+  return formatAdditionalContextOutput(args.hookEvent, buildPostCompactLcmDirective());
 }
 
 function markPostCompactPending(home: string, sessionId: string): void {
@@ -195,6 +198,8 @@ function buildPostCompactLcmDirective(): string {
     "",
     "Use `lcm_pack_context` for broad recovery of the current task/session.",
     "Use `lcm_expand_query` when you need focused source evidence for a specific prior decision, bug, test result, or implementation detail.",
+    "After recovery, continue unfinished work unless a concrete blocker remains.",
+    "Do not stop or wait for the user merely because compaction occurred.",
     "",
     "Do not rely on memory alone for pre-compaction details that are retrievable through LCM.",
   ].join("\n");

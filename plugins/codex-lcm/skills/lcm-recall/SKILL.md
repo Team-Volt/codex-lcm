@@ -21,6 +21,10 @@ Use this skill when:
 
 Skip it for self-contained requests where prior Codex context cannot affect the answer.
 
+After compaction or interrupted-workflow recovery, continue unfinished work unless
+a concrete blocker remains. Do not stop merely because compaction happened or
+because context had to be recovered.
+
 ## Retrieval Rules
 
 - Use the MCP tools. Do not inspect `~/.codex-lcm`, SQLite, or raw JSONL directly unless the user explicitly asks for storage forensics or MCP itself is broken.
