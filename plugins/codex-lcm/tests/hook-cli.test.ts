@@ -68,7 +68,7 @@ test("hook command captures git metadata as optional session metadata", () => {
   assert.equal(event.git_branch, "feature/test");
 });
 
-test("PostCompact hook output nudges the next compact SessionStart to recall LCM", () => {
+test("PostCompact hook output immediately nudges LCM recall", () => {
   const home = tempHome();
   const env = { CODEX_LCM_HOME: home };
   const postCompact = runCli(["hook", "PostCompact"], {
@@ -82,7 +82,29 @@ test("PostCompact hook output nudges the next compact SessionStart to recall LCM
     env,
   });
   assertCliOk(postCompact);
-  assert.equal(postCompact.stdout, "");
+  const output: unknown = JSON.parse(postCompact.stdout);
+  assertHookAdditionalContextOutput(output);
+  assert.equal(output.hookSpecificOutput.hookEventName, "PostCompact");
+  assert.match(output.hookSpecificOutput.additionalContext, /POST-COMPACTION LCM RECOVERY/u);
+  assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
+  assert.match(output.hookSpecificOutput.additionalContext, /continue unfinished work/u);
+  assert.match(output.hookSpecificOutput.additionalContext, /Do not stop or wait for the user/u);
+});
+
+test("PostCompact pending marker nudges the next compact SessionStart to recall LCM", () => {
+  const home = tempHome();
+  const env = { CODEX_LCM_HOME: home };
+  const postCompact = runCli(["hook", "PostCompact"], {
+    input: JSON.stringify({
+      session_id: "compact-session",
+      turn_id: "turn-1",
+      cwd: "/tmp/compact-project",
+      hook_event_name: "PostCompact",
+      trigger: "auto",
+    }),
+    env,
+  });
+  assertCliOk(postCompact);
 
   const sessionStart = runCli(["hook", "SessionStart"], {
     input: JSON.stringify({
@@ -103,6 +125,38 @@ test("PostCompact hook output nudges the next compact SessionStart to recall LCM
   assert.match(output.hookSpecificOutput.additionalContext, /continue unfinished work/u);
 });
 
+test("PostCompact pending marker nudges the next user prompt when Desktop compact stops", () => {
+  const home = tempHome();
+  const env = { CODEX_LCM_HOME: home };
+  const postCompact = runCli(["hook", "PostCompact"], {
+    input: JSON.stringify({
+      session_id: "manual-compact-session",
+      cwd: "/tmp/manual-compact-project",
+      hook_event_name: "PostCompact",
+      trigger: "manual",
+    }),
+    env,
+  });
+  assertCliOk(postCompact);
+
+  const userPrompt = runCli(["hook", "UserPromptSubmit"], {
+    input: JSON.stringify({
+      session_id: "manual-compact-session",
+      cwd: "/tmp/manual-compact-project",
+      hook_event_name: "UserPromptSubmit",
+      prompt: "continue",
+    }),
+    env,
+  });
+
+  assertCliOk(userPrompt);
+  const output: unknown = JSON.parse(userPrompt.stdout);
+  assertHookAdditionalContextOutput(output);
+  assert.equal(output.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.match(output.hookSpecificOutput.additionalContext, /POST-COMPACTION LCM RECOVERY/u);
+  assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
+});
+
 test("post-compaction LCM nudge is emitted once per compacted session", () => {
   const home = tempHome();
   const env = { CODEX_LCM_HOME: home };
@@ -116,6 +170,7 @@ test("post-compaction LCM nudge is emitted once per compacted session", () => {
     env,
   });
   assertCliOk(postCompact);
+  assert.match(postCompact.stdout, /lcm_pack_context/u);
 
   const payload = JSON.stringify({
     session_id: "compact-once-session",
