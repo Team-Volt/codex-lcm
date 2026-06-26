@@ -100,6 +100,7 @@ test("PostCompact hook output nudges the next compact SessionStart to recall LCM
   assert.equal(output.hookSpecificOutput.hookEventName, "SessionStart");
   assert.match(output.hookSpecificOutput.additionalContext, /POST-COMPACTION LCM RECOVERY/u);
   assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
+  assert.match(output.hookSpecificOutput.additionalContext, /continue unfinished work/u);
 });
 
 test("post-compaction LCM nudge is emitted once per compacted session", () => {

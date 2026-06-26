@@ -195,6 +195,7 @@ function buildPostCompactLcmDirective(): string {
     "",
     "Use `lcm_pack_context` for broad recovery of the current task/session.",
     "Use `lcm_expand_query` when you need focused source evidence for a specific prior decision, bug, test result, or implementation detail.",
+    "After recovery, continue unfinished work unless a concrete blocker remains.",
     "",
     "Do not rely on memory alone for pre-compaction details that are retrievable through LCM.",
   ].join("\n");
