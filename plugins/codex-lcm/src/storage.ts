@@ -139,6 +139,14 @@ export type PackedContext = {
   sources: Array<{ kind: "event" | "note" | "checkpoint" | "summary"; session_id: string; event_id?: string; node_id?: string; timestamp: string }>;
 };
 
+export type PackContextArgs = {
+  query?: string;
+  sessionIds?: string[];
+  currentThreadId?: string;
+  budgetTokens?: number;
+  cwd?: string;
+};
+
 export type QueryExpansionSource = {
   kind: "summary" | "event";
   session_id: string;
@@ -776,6 +784,32 @@ export class LcmStorage {
       LIMIT 1
     `).get(args.cwd ?? null, args.repoRoot ?? null);
     return row ? rowToSessionSummary(row) : undefined;
+  }
+
+  private resolveSessionIdentifier(identifier: string): string | undefined {
+    const trimmed = identifier.trim();
+    if (trimmed.length === 0) return undefined;
+    const direct = this.getSessionSummary(trimmed);
+    if (direct) return direct.session_id;
+    if (!this.db) {
+      const events = readRawEvents(this.config.rawLogPath);
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index];
+        if (event.session_id === trimmed || stringField(event.payload.agent_id) === trimmed || stringField(event.payload.agentId) === trimmed) {
+          return event.session_id;
+        }
+      }
+      return undefined;
+    }
+    const row = this.db.prepare(`
+      SELECT session_id
+      FROM events
+      WHERE json_extract(raw_json, '$.payload.agent_id') = ?1
+         OR json_extract(raw_json, '$.payload.agentId') = ?1
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT 1
+    `).get(trimmed) as { session_id?: string } | undefined;
+    return row?.session_id;
   }
 
   getSession(sessionId: string, args: { limit?: number; cursor?: string } = {}): SessionDetail {
@@ -1432,7 +1466,7 @@ export class LcmStorage {
     };
   }
 
-  packContext(args: { query?: string; sessionIds?: string[]; budgetTokens?: number; cwd?: string } = {}): PackedContext {
+  packContext(args: PackContextArgs = {}): PackedContext {
     const budgetTokens = Math.max(16, args.budgetTokens ?? 1200);
     const budgetChars = budgetTokens * 4;
     const summaryCandidates = new Map<string, SessionMemorySummary>();
@@ -1440,32 +1474,76 @@ export class LcmStorage {
     const summaryNodeCandidates = new Map<string, SummaryNode>();
     const query = args.query?.trim() ?? "";
     const candidateSessionIds = new Set(args.sessionIds ?? []);
+    const explicitSessionIds = args.sessionIds ?? [];
+    const currentThreadId = !explicitSessionIds.length ? args.currentThreadId?.trim() : undefined;
+    const currentSessionId = currentThreadId ? this.resolveSessionIdentifier(currentThreadId) : undefined;
+    const queryTermCount = query.length > 0 ? queryTermHitCount(query, query) : 0;
 
     const addSummaryNode = (node: SummaryNode) => {
+      if (query.length > 0 && queryTermHitCount(summaryNodeSearchText(node), query) === 0) return;
       summaryNodeCandidates.set(node.node_id, node);
       candidateSessionIds.add(node.session_id);
     };
+
+    const addRankedSessionNodes = (sessionId: string, limit: number): number => {
+      const nodes = query.length > 0
+        ? rankSummaryNodesForContext(this.getSummaryNodesForSession(sessionId, Math.max(limit * 8, 24)), query)
+          .filter((node) => queryTermHitCount(summaryNodeSearchText(node), query) > 0)
+          .slice(0, limit)
+        : this.getTopSummaryNodesForSession(sessionId, limit);
+      for (const node of nodes) addSummaryNode(node);
+      return nodes.length;
+    };
+
+    const addSessionIfSummaryMatches = (sessionId: string): void => {
+      if (query.length === 0) {
+        candidateSessionIds.add(sessionId);
+        return;
+      }
+      const summary = this.getSessionMemorySummary(sessionId);
+      if (summary && queryTermHitCount(summarySearchText(summary), query) > 0) {
+        candidateSessionIds.add(sessionId);
+      }
+    };
+
+    if (currentSessionId) {
+      const added = addRankedSessionNodes(currentSessionId, 3);
+      if (added === 0) addSessionIfSummaryMatches(currentSessionId);
+    }
 
     if (query.length > 0) {
       let nodes = this.searchSummaryNodes({
         query,
         cwd: args.cwd,
-        sessionIds: args.sessionIds,
+        sessionIds: explicitSessionIds,
         limit: SUMMARY_NODE_PACK_LIMIT,
       });
-      if (nodes.length === 0 && args.cwd && !args.sessionIds?.length) {
+      if (nodes.length === 0 && args.cwd && !explicitSessionIds.length) {
         nodes = this.searchSummaryNodes({ query, limit: SUMMARY_NODE_PACK_LIMIT });
       }
       for (const node of nodes) addSummaryNode(node);
 
-      if (summaryNodeCandidates.size === 0 && !args.sessionIds?.length) {
+      const bestSummaryHitCount = [...summaryNodeCandidates.values()].reduce(
+        (max, node) => Math.max(max, queryTermHitCount(summaryNodeSearchText(node), query)),
+        0,
+      );
+      const hasWeakScopedMatches = args.cwd && !explicitSessionIds.length && queryTermCount >= 4 && bestSummaryHitCount <= 1;
+      if (hasWeakScopedMatches) {
+        const sessions = this.searchSessions({ query, limit: 8 });
+        for (const session of sessions) {
+          addSessionIfSummaryMatches(session.session_id);
+          addRankedSessionNodes(session.session_id, 2);
+        }
+      }
+
+      if (summaryNodeCandidates.size === 0 && !explicitSessionIds.length) {
         let sessions = this.searchSessions({ query, cwd: args.cwd, limit: 8 });
         if (sessions.length === 0 && args.cwd) {
           sessions = this.searchSessions({ query, limit: 8 });
         }
         for (const session of sessions) {
           candidateSessionIds.add(session.session_id);
-          for (const node of this.getTopSummaryNodesForSession(session.session_id, 2)) addSummaryNode(node);
+          addRankedSessionNodes(session.session_id, 2);
         }
       }
     } else {
@@ -1480,7 +1558,7 @@ export class LcmStorage {
 
     if (candidateSessionIds.size === 0) {
       let sessions = this.searchSessions({ query: args.query, cwd: args.cwd, limit: 8 });
-      if (sessions.length === 0 && query.length > 0 && args.cwd && !args.sessionIds?.length) {
+      if (sessions.length === 0 && query.length > 0 && args.cwd && !explicitSessionIds.length) {
         sessions = this.searchSessions({ query: args.query, limit: 8 });
       }
       for (const session of sessions) candidateSessionIds.add(session.session_id);

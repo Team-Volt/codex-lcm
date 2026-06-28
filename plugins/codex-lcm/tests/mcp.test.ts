@@ -485,6 +485,79 @@ test("MCP expand_query returns recursive evidence for a focused query", () => {
   assert.equal(typeof expansion.truncated, "boolean");
 });
 
+test("MCP pack context biases toward the active thread across cwd mismatches", () => {
+  const home = tempHome();
+  const targetSessionId = "mcp-warp-active-thread";
+  const targetThreadId = "mcp-warp-active-agent";
+  const targetCwd = "/tmp/home";
+  const requestedCwd = "/tmp/projects/warp";
+  const query = "active-thread-needle";
+
+  assert.equal(runCli(["hook", "UserPromptSubmit"], {
+    input: JSON.stringify({
+      session_id: targetSessionId,
+      turn_id: "target-turn",
+      agent_id: targetThreadId,
+      cwd: targetCwd,
+      prompt: "active-thread-needle: Warp issue 12890 PR 12891 implements file path links setting. Commented on spec PR 12977 that the spec matches intent.",
+    }),
+    env: { CODEX_LCM_HOME: home },
+  }).status, 0);
+  assert.equal(runCli(["hook", "UserPromptSubmit"], {
+    input: JSON.stringify({
+      session_id: "mcp-warp-adjacent-hello",
+      cwd: requestedCwd,
+      prompt: "active-thread-needle hello",
+    }),
+    env: { CODEX_LCM_HOME: home },
+  }).status, 0);
+
+  const withoutThread = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_pack_context",
+        arguments: {
+          query,
+          cwd: requestedCwd,
+          budgetTokens: 700,
+        },
+      },
+    },
+  ], { CODEX_LCM_HOME: home });
+  assert.doesNotMatch(
+    withoutThread[1].result.structuredContent.markdown,
+    /Commented on spec PR 12977 that the spec matches intent/u,
+  );
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "lcm_pack_context",
+        arguments: {
+          query,
+          cwd: requestedCwd,
+          budgetTokens: 700,
+        },
+      },
+    },
+  ], { CODEX_LCM_HOME: home, CODEX_THREAD_ID: targetThreadId });
+
+  const packed = responses[1].result.structuredContent;
+  assert.match(packed.markdown, /Commented on spec PR 12977 that the spec matches intent/u);
+  assert.equal(
+    packed.sources.some((source: { session_id: string }) => source.session_id === targetSessionId),
+    true,
+  );
+});
+
 test("MCP describe reports missing sessions instead of fabricating descriptions", () => {
   const home = tempHome();
   const responses = runMcp([
