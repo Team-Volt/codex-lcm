@@ -481,6 +481,7 @@ function callTool(params: Record<string, unknown>) {
         const packed = storage.packContext({
           query: optionalString(args.query),
           sessionIds: optionalStringArray(args.sessionIds),
+          currentThreadId: currentThreadId(),
           budgetTokens: optionalNumber(args.budgetTokens),
           cwd: optionalString(args.cwd),
         });
@@ -548,6 +549,10 @@ function optionalBoolean(value: unknown): boolean | undefined {
 function optionalStringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function currentThreadId(): string | undefined {
+  return optionalString(process.env.CODEX_THREAD_ID);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
