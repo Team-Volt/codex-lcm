@@ -3,6 +3,15 @@ import test from "node:test";
 
 import { clearDerivedSummaries, runCli, runMcp, tempHome } from "./helpers.ts";
 
+type FramedMcpResponse = {
+  readonly id: unknown;
+  readonly result: {
+    readonly serverInfo: { readonly name: string };
+    readonly tools: readonly { readonly name: string }[];
+  };
+  readonly error: { readonly code: number };
+};
+
 test("MCP server initializes and lists LCM tools", () => {
   const home = tempHome();
   const responses = runMcp([
@@ -584,8 +593,8 @@ function framedInput(messages: unknown[]): string {
   }).join("");
 }
 
-function parseFramedOutput(output: string): Array<Record<string, unknown>> {
-  const responses: Array<Record<string, unknown>> = [];
+function parseFramedOutput(output: string): FramedMcpResponse[] {
+  const responses: FramedMcpResponse[] = [];
   let buffer = Buffer.from(output, "utf8");
   while (buffer.length > 0) {
     const headerEnd = buffer.indexOf("\r\n\r\n");
@@ -597,7 +606,7 @@ function parseFramedOutput(output: string): Array<Record<string, unknown>> {
     const bodyStart = headerEnd + 4;
     const bodyEnd = bodyStart + length;
     assert.equal(buffer.length >= bodyEnd, true, output);
-    responses.push(JSON.parse(buffer.subarray(bodyStart, bodyEnd).toString("utf8")) as Record<string, unknown>);
+    responses.push(JSON.parse(buffer.subarray(bodyStart, bodyEnd).toString("utf8")));
     buffer = buffer.subarray(bodyEnd);
   }
   return responses;
