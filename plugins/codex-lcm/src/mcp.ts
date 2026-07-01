@@ -9,7 +9,7 @@ type JsonRpcMessage = {
 };
 
 const SERVER_NAME = "codex-lcm";
-const SERVER_VERSION = "0.2.2";
+const SERVER_VERSION = "0.2.3";
 const HEADER_SEPARATOR = Buffer.from("\r\n\r\n", "utf8");
 const MAX_MESSAGE_BYTES = DEFAULT_LIMITS.maxInputBytes;
 
@@ -241,7 +241,7 @@ const TOOLS = [
 ];
 
 export function startMcpServer(): void {
-  let buffer = Buffer.alloc(0);
+  let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   process.stdin.on("data", (chunk: Buffer | string) => {
     buffer = Buffer.concat([buffer, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8")]);
     if (buffer.length > MAX_MESSAGE_BYTES) {
@@ -253,7 +253,7 @@ export function startMcpServer(): void {
   });
 }
 
-function processInputBuffer(input: Buffer): Buffer {
+function processInputBuffer(input: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> {
   let buffer = input;
   while (buffer.length > 0) {
     if (startsWithHeader(buffer)) {

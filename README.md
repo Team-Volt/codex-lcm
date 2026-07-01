@@ -102,7 +102,7 @@ operation.
 Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.2
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.3
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -119,20 +119,20 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Upgrade an existing GitHub marketplace install to `v0.2.2`:
+Upgrade an existing GitHub marketplace install to `v0.2.3`:
 
 ```sh
 codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.2
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.3
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Upgrade a local checkout install to `v0.2.2` by checking out the release tag,
+Upgrade a local checkout install to `v0.2.3` by checking out the release tag,
 then asking Codex to refresh the installed plugin cache:
 
 ```sh
 git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.2
+git -C /path/to/codex-lcm checkout v0.2.3
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -161,7 +161,7 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Current release: `v0.2.2`.
+Current release: `v0.2.3`.
 
 Codex LCM is a local-first Codex memory plugin with native plugin installation,
 hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
@@ -171,15 +171,15 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions.
 
-### v0.2.2 notes
+### v0.2.3 notes
 
-This patch release tightens recall behavior after compaction and hardens
-redaction/token-budget handling.
+This patch release fixes active-thread context packing when Codex thread IDs
+need to resolve through stored session or agent identifiers.
 
-- Recovers LCM context after compaction and nudges agents to continue
-  unfinished work.
-- Hardens LCM recall output.
-- Preserves token metrics during redaction.
+- Resolves `CODEX_THREAD_ID` to the stored session through `session_id`,
+  `payload.agent_id`, or `payload.agentId`.
+- Keeps explicit `sessionIds` tightly scoped while allowing weak cwd-scoped
+  matches to widen for concrete queries.
 
 Use the [Installation](#installation) section for install and upgrade commands.
 
