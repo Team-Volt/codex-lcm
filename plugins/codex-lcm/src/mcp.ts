@@ -1,15 +1,16 @@
 import { DEFAULT_LIMITS } from "./config.ts";
 import { createStorage } from "./storage.ts";
 
-type JsonRpcMessage = {
-  jsonrpc?: string;
-  id?: string | number | null;
-  method?: string;
-  params?: Record<string, unknown>;
+type JsonRpcRequest = {
+  readonly jsonrpc: "2.0";
+  readonly id?: string | number | null;
+  readonly method: string;
+  readonly params?: Record<string, unknown> | readonly unknown[];
 };
 
 const SERVER_NAME = "codex-lcm";
 const SERVER_VERSION = "0.2.3";
+const SUPPORTED_PROTOCOL_VERSION = "2025-11-25";
 const HEADER_SEPARATOR = Buffer.from("\r\n\r\n", "utf8");
 const MAX_MESSAGE_BYTES = DEFAULT_LIMITS.maxInputBytes;
 
@@ -33,7 +34,7 @@ const TOOLS = [
   {
     name: "lcm_grep",
     title: "LCM Grep",
-    description: "Find relevant sessions by searching summary nodes, session summaries, and high-signal raw events.",
+    description: "Preferred standard workflow step 1 (grep): find relevant sessions by searching summary nodes, session summaries, and high-signal raw events. Codex may surface this tool as mcp__codex_lcm__lcm_grep.",
     inputSchema: {
       type: "object",
       properties: {
@@ -50,7 +51,7 @@ const TOOLS = [
   {
     name: "lcm_describe",
     title: "LCM Describe",
-    description: "Inspect a session, summary node, or file reference, including summary-node depth and source lineage metadata.",
+    description: "Preferred standard workflow step 2 (describe): inspect a session, summary node, or file reference, including summary-node depth and source lineage metadata. Codex may surface this tool as mcp__codex_lcm__lcm_describe.",
     inputSchema: {
       type: "object",
       properties: {
@@ -65,7 +66,7 @@ const TOOLS = [
   {
     name: "lcm_expand",
     title: "LCM Expand",
-    description: "Expand one summary node into bounded source summary nodes and high-signal source events.",
+    description: "Preferred standard workflow step 3 (expand): expand one summary node into bounded source summary nodes and high-signal source events. Codex may surface this tool as mcp__codex_lcm__lcm_expand.",
     inputSchema: {
       type: "object",
       properties: {
@@ -310,7 +311,12 @@ function takeHeaderMessage(buffer: Buffer): ParsedHeaderMessage {
 function handleRawMessage(raw: string): void {
   if (raw.trim().length === 0) return;
   try {
-    handleMessage(JSON.parse(raw) as JsonRpcMessage);
+    const message: unknown = JSON.parse(raw);
+    if (!isJsonRpcRequest(message)) {
+      sendError(null, -32600, "Invalid Request");
+      return;
+    }
+    handleMessage(message);
   } catch (error) {
     if (error instanceof SyntaxError) {
       sendError(null, -32700, "Parse error");
@@ -320,16 +326,23 @@ function handleRawMessage(raw: string): void {
   }
 }
 
-function handleMessage(message: JsonRpcMessage): void {
+function handleMessage(message: JsonRpcRequest): void {
   const { id, method, params } = message;
   if (method === "initialize") {
+    if (!isInitializeParams(params)) {
+      sendError(id, -32602, "Invalid params");
+      return;
+    }
     sendResult(id, {
-      protocolVersion: params?.protocolVersion ?? "2025-11-25",
+      protocolVersion: params.protocolVersion === SUPPORTED_PROTOCOL_VERSION
+        ? params.protocolVersion
+        : SUPPORTED_PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions: [
         "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, summary nodes, and packed context across Codex sessions.",
-        "Use lcm_grep, lcm_describe, and lcm_expand for the standard LCM discovery-inspection-expansion workflow.",
+        "Preferred standard workflow: lcm_grep -> lcm_describe -> lcm_expand.",
+        "Codex may surface these same tools as mcp__codex_lcm__lcm_grep, mcp__codex_lcm__lcm_describe, and mcp__codex_lcm__lcm_expand.",
         "Use lcm_expand_query when a focused query should pick matching summary nodes and recursively expand their source evidence.",
         "Use lcm_context_plan to estimate whether recent context is near or past a caller-provided soft limit; it does not control Codex compaction.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
@@ -348,8 +361,12 @@ function handleMessage(message: JsonRpcMessage): void {
     return;
   }
   if (method === "tools/call") {
+    if (!isToolsCallParams(params)) {
+      sendError(id, -32602, "Invalid params");
+      return;
+    }
     try {
-      sendResult(id, callTool(params ?? {}));
+      sendResult(id, callTool(params));
     } catch (error) {
       sendError(id, -32602, error instanceof Error ? error.message : String(error));
     }
@@ -512,11 +529,13 @@ function send(message: unknown): void {
   process.stdout.write(`${body}\n`);
 }
 
-function sendResult(id: JsonRpcMessage["id"], result: unknown): void {
+function sendResult(id: JsonRpcRequest["id"], result: unknown): void {
+  if (id === undefined) return;
   send({ jsonrpc: "2.0", id, result });
 }
 
-function sendError(id: JsonRpcMessage["id"], code: number, message: string): void {
+function sendError(id: JsonRpcRequest["id"], code: number, message: string): void {
+  if (id === undefined) return;
   send({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
@@ -557,4 +576,25 @@ function currentThreadId(): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isInitializeParams(value: unknown): value is Record<string, unknown> & { readonly protocolVersion: string } {
+  if (!isRecord(value) || typeof value.protocolVersion !== "string" || value.protocolVersion.trim().length === 0) {
+    return false;
+  }
+  if ("capabilities" in value && !isRecord(value.capabilities)) return false;
+  return !("clientInfo" in value && !isRecord(value.clientInfo));
+}
+
+function isToolsCallParams(value: unknown): value is Record<string, unknown> & { readonly name: string } {
+  if (!isRecord(value) || typeof value.name !== "string" || value.name.trim().length === 0) return false;
+  return !("arguments" in value && !isRecord(value.arguments));
+}
+
+function isJsonRpcRequest(value: unknown): value is JsonRpcRequest {
+  if (!isRecord(value) || value.jsonrpc !== "2.0" || typeof value.method !== "string") return false;
+  if ("id" in value && value.id !== null && typeof value.id !== "string" && typeof value.id !== "number") {
+    return false;
+  }
+  return !("params" in value && !isRecord(value.params) && !Array.isArray(value.params));
 }

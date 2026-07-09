@@ -193,6 +193,46 @@ test("packs old matching events from long sessions instead of only the recent ta
   storage.close();
 });
 
+test("active-thread packing ranks relevant summary nodes across the full long session", () => {
+  const storage = createStorage({ home: tempHome() });
+  const sessionId = "active-long-session";
+  const cwd = "/tmp/active-long-session";
+  const query = "PR 35 local installation GitHub CI passed MCP tools exposed";
+  const crowdingPrompt = [
+    "ranking investigation terminal handoff analysis debugging source session",
+    "context recovery evidence report branch plugin codex summary tool",
+  ].join(" ");
+
+  for (let index = 0; index < 208; index += 1) {
+    const chunk = Math.floor(index / 8);
+    const offset = index % 8;
+    let prompt = `filler-${chunk}-${offset} unrelated context`;
+    if (chunk === 0 && offset === 7) prompt = "Local GitHub notes";
+    if (chunk === 24 && offset === 7) prompt = "PR #35 local installation GitHub CI passed";
+    if (chunk === 25 && offset === 0) prompt = query;
+    if (chunk === 25 && offset > 0) prompt = crowdingPrompt;
+    ingest(storage, "UserPromptSubmit", {
+      session_id: sessionId,
+      turn_id: `turn-${index}`,
+      cwd,
+      prompt,
+    }, new Date(Date.UTC(2026, 5, 9, 12, 0, index)).toISOString());
+  }
+
+  const packed = storage.packContext({
+    cwd,
+    query,
+    currentThreadId: sessionId,
+    budgetTokens: 1_200,
+  });
+  const firstSummary = packed.sources.find((source) => source.kind === "summary" && source.node_id);
+
+  assert.ok(firstSummary?.node_id);
+  assert.match(storage.expandMemory({ nodeId: firstSummary.node_id }).node.summary_text, /PR #35 local installation/u);
+
+  storage.close();
+});
+
 test("builds multi-depth summary nodes with source lineage", () => {
   const storage = createStorage({ home: tempHome() });
   const sessionId = "summary-node-session";
