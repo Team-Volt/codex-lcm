@@ -270,6 +270,8 @@ type IndexEventResult = {
   summaryTouched: boolean;
 };
 
+type SummaryRebuildStrategy = "event" | "sessions" | "deferred";
+
 type RawEventIdCache = {
   size: number;
   mtimeMs: number;
@@ -293,7 +295,7 @@ export class LcmStorage {
       return;
     }
     try {
-      this.db = new DatabaseSync(this.config.indexPath, this.readOnly ? { readOnly: true } : {});
+      this.db = new DatabaseSync(this.config.indexPath, { readOnly: this.readOnly, timeout: 5_000 });
       if (!this.readOnly) {
         this.initialize();
         this.replayRawLogToIndex();
@@ -322,12 +324,16 @@ export class LcmStorage {
     if (this.readOnly) {
       throw new Error("Cannot ingest events with read-only storage.");
     }
-    fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(this.config.rawLogPath, `${JSON.stringify(event)}\n`, { mode: 0o600 });
-    if (!this.db) return;
     try {
-      this.indexEvent(event);
+      this.ingestSerialized([event], "event");
     } catch (error) {
+      let rawDurable: boolean;
+      try {
+        rawDurable = readRawEventIds(this.config.rawLogPath).has(event.event_id);
+      } catch {
+        throw error;
+      }
+      if (!rawDurable) throw error;
       this.indexError = error instanceof Error ? error.message : String(error);
     }
   }
@@ -336,11 +342,36 @@ export class LcmStorage {
     if (this.readOnly) {
       throw new Error("Cannot ingest events with read-only storage.");
     }
-    if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
-    const rebuildSummaries = options.rebuildSummaries ?? true;
+    return this.ingestSerialized(events, options.rebuildSummaries ?? true ? "sessions" : "deferred");
+  }
 
-    const rawEventIds = this.readRawEventIds();
-    const indexedEventIds = this.db ? this.knownEventIds(events.map((event) => event.event_id)) : rawEventIds;
+  private ingestSerialized(events: NormalizedEvent[], summaryRebuild: SummaryRebuildStrategy): IngestManyResult {
+    if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
+
+    if (this.db) {
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+      } catch (error) {
+        this.indexError = error instanceof Error ? error.message : String(error);
+        throw error;
+      }
+    }
+
+    let rawEventIds: Set<string>;
+    let indexedEventIds: Set<string>;
+    try {
+      rawEventIds = this.readRawEventIds();
+      indexedEventIds = this.db ? this.knownEventIds(events.map((event) => event.event_id)) : rawEventIds;
+    } catch (error) {
+      if (this.db) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], "Bulk ingest rollback failed after raw-log read or index lookup failure.");
+        }
+      }
+      throw error;
+    }
     const rawSeen = new Set(rawEventIds);
     const indexSeen = new Set(indexedEventIds);
     const eventsToAppend: NormalizedEvent[] = [];
@@ -361,13 +392,24 @@ export class LcmStorage {
       eventsToIndex.push(event);
     }
 
-    if (eventsToAppend.length === 0 && eventsToIndex.length === 0) {
+    if (!this.db && eventsToAppend.length === 0 && eventsToIndex.length === 0) {
       return { imported: 0, skippedDuplicate, touchedSessions: [] };
     }
 
     if (eventsToAppend.length > 0) {
-      fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
-      fs.appendFileSync(this.config.rawLogPath, `${eventsToAppend.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+      try {
+        fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
+        fs.appendFileSync(this.config.rawLogPath, `${eventsToAppend.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+      } catch (error) {
+        if (this.db) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch (rollbackError) {
+            throw new AggregateError([error, rollbackError], "Bulk ingest rollback failed after raw-log append failure.");
+          }
+        }
+        throw error;
+      }
       for (const event of eventsToAppend) {
         rawEventIds.add(event.event_id);
       }
@@ -377,24 +419,24 @@ export class LcmStorage {
 
     const touchedSessions = new Set<string>();
     try {
-      this.db.exec("BEGIN IMMEDIATE");
       for (const event of eventsToIndex) {
-        const result = this.indexEventInTransaction(event, { rebuildSummary: false });
+        const result = this.indexEventInTransaction(event, { rebuildSummary: summaryRebuild === "event" });
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
-      const rebuiltSessions = rebuildSummaries
+      const rebuiltSessions = summaryRebuild === "sessions"
         ? this.rebuildTouchedSummarySessions(touchedSessions)
         : sortedSessionIds(touchedSessions);
       this.db.exec("COMMIT");
       return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
     } catch (error) {
+      let failure = error;
       try {
         this.db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback failures; raw JSONL is still durable and can be replayed.
+      } catch (rollbackError) {
+        failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
       }
-      this.indexError = error instanceof Error ? error.message : String(error);
-      return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
+      this.indexError = failure instanceof Error ? failure.message : String(failure);
+      throw failure;
     }
   }
 
@@ -509,15 +551,20 @@ export class LcmStorage {
 
   private replayRawLogToIndex(): void {
     if (!this.db || !fs.existsSync(this.config.rawLogPath)) return;
-    const rawEvents = readRawEvents(this.config.rawLogPath);
+    const rawLog = readRawLog(this.config.rawLogPath);
+    const rawEvents = rawLog.events;
     const indexedIds = this.indexedEventIds();
+    if (rawLog.malformedLineCount > 0) {
+      const noun = rawLog.malformedLineCount === 1 ? "line" : "lines";
+      this.indexError = `Raw JSONL contains ${rawLog.malformedLineCount} malformed ${noun}; destructive index reconciliation is disabled until the log is repaired.`;
+    }
     if (rawEvents.length === 0) {
-      if (indexedIds.size > 0) this.rebuildIndexFromRawEvents([]);
+      if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([]);
       return;
     }
     const rawIds = new Set(rawEvents.map((event) => event.event_id));
     const hasStaleIndexedRows = [...indexedIds].some((eventId) => !rawIds.has(eventId));
-    if (hasStaleIndexedRows) {
+    if (hasStaleIndexedRows && rawLog.malformedLineCount === 0) {
       this.rebuildIndexFromRawEvents(rawEvents);
       return;
     }
@@ -746,15 +793,13 @@ export class LcmStorage {
         ORDER BY bm25(summary_node_fts) ASC, n.depth DESC, n.latest_at DESC
         LIMIT ?4
       `);
-    searchLoop:
     for (const ftsQuery of toFtsQueries(query)) {
-      for (const statement of [summaryNodeStatement, summaryStatement, eventStatement]) {
-        const candidateRows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50));
-        rows = candidateRows
-          .filter((row) => !excludedSessionIds.has(String((row as { session_id: string }).session_id)))
-          .filter((row) => isSearchDiscoveryRow(row, query));
-        if (rows.length > 0) break searchLoop;
-      }
+      const candidateRows = [summaryNodeStatement, summaryStatement, eventStatement]
+        .flatMap((statement) => statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50)));
+      rows = candidateRows
+        .filter((row) => !excludedSessionIds.has(String((row as { session_id: string }).session_id)))
+        .filter((row) => isSearchDiscoveryRow(row, query));
+      if (rows.length > 0) break;
     }
     return rankSessionRows(rows, query).slice(0, limit);
   }
@@ -1823,22 +1868,6 @@ export class LcmStorage {
     `);
   }
 
-  private indexEvent(event: NormalizedEvent): void {
-    if (!this.db) return;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.indexEventInTransaction(event, { rebuildSummary: true });
-      this.db.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback failures; the original indexing error is more useful.
-      }
-      throw error;
-    }
-  }
-
   private indexEventInTransaction(event: NormalizedEvent, options: { rebuildSummary: boolean }): IndexEventResult {
     if (!this.db) return { inserted: false, summaryTouched: false };
     const raw = JSON.stringify(event);
@@ -2636,6 +2665,7 @@ function graphEdgeKey(edge: Pick<GraphEdge, "from_node_id" | "to_node_id" | "kin
 }
 
 function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
+  const evidenceRows = strongestSessionEvidenceRows(rows, query);
   const sessions = new Map<string, {
     summary: SessionSummary;
     score: number;
@@ -2644,7 +2674,7 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
     firstOrder: number;
     bestMatch?: SessionSearchMatch;
   }>();
-  rows.forEach((row, order) => {
+  evidenceRows.forEach((row, order) => {
     const record = row as Record<string, unknown>;
     const sessionId = String(record.session_id);
     const matchAt = String(record.match_timestamp ?? record.last_seen ?? "");
@@ -2688,6 +2718,38 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
       ...(entry.bestMatch ? { best_match: entry.bestMatch } : {}),
       discovery: entry.discovery,
     }));
+}
+
+function strongestSessionEvidenceRows(rows: unknown[], query: string): unknown[] {
+  const scores = new Map<string, Map<SessionSearchMatch["kind"], { score: number; matchCount: number }>>();
+  for (const row of rows) {
+    const record = row as Record<string, unknown>;
+    const kind = searchMatchKind(record.match_kind);
+    if (!kind) continue;
+    const sessionId = String(record.session_id);
+    const sessionScores = scores.get(sessionId) ?? new Map();
+    const evidence = sessionScores.get(kind) ?? { score: 0, matchCount: 0 };
+    const matchText = typeof record.match_text === "string" ? record.match_text : "";
+    const weight = typeof record.match_weight === "number" ? record.match_weight : 1;
+    evidence.score += queryTermHitCount(matchText, query) * weight;
+    evidence.matchCount += 1;
+    sessionScores.set(kind, evidence);
+    scores.set(sessionId, sessionScores);
+  }
+
+  const selectedKinds = new Map<string, SessionSearchMatch["kind"]>();
+  for (const [sessionId, sessionScores] of scores) {
+    const selected = [...sessionScores.entries()].sort((left, right) =>
+      right[1].score - left[1].score ||
+      right[1].matchCount - left[1].matchCount ||
+      searchMatchKindWeight(right[0]) - searchMatchKindWeight(left[0]))[0];
+    if (selected) selectedKinds.set(sessionId, selected[0]);
+  }
+
+  return rows.filter((row) => {
+    const record = row as Record<string, unknown>;
+    return selectedKinds.get(String(record.session_id)) === searchMatchKind(record.match_kind);
+  });
 }
 
 function sessionDiscovery(entry: {
@@ -3053,18 +3115,23 @@ function checkpointToMarkdown(node: GraphNode): string {
   ].join("\n");
 }
 
+function readRawLog(rawLogPath: string): { events: NormalizedEvent[]; malformedLineCount: number } {
+  if (!fs.existsSync(rawLogPath)) return { events: [], malformedLineCount: 0 };
+  const events: NormalizedEvent[] = [];
+  let malformedLineCount = 0;
+  for (const line of fs.readFileSync(rawLogPath, "utf8").split(/\r?\n/u)) {
+    if (line.trim().length === 0) continue;
+    try {
+      events.push(JSON.parse(line) as NormalizedEvent);
+    } catch {
+      malformedLineCount += 1;
+    }
+  }
+  return { events, malformedLineCount };
+}
+
 function readRawEvents(rawLogPath: string): NormalizedEvent[] {
-  if (!fs.existsSync(rawLogPath)) return [];
-  return fs.readFileSync(rawLogPath, "utf8")
-    .split(/\r?\n/u)
-    .filter((line) => line.trim().length > 0)
-    .flatMap((line) => {
-      try {
-        return [JSON.parse(line) as NormalizedEvent];
-      } catch {
-        return [];
-      }
-    });
+  return readRawLog(rawLogPath).events;
 }
 
 function readRawEventIds(rawLogPath: string): Set<string> {

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
 import { createStorage } from "../src/storage.ts";
@@ -83,6 +84,28 @@ test("read-only storage opens do not rebuild derived indexes", () => {
   assert.equal(stats.summary_count, 0);
   assert.equal(stats.summary_node_count, 0);
   assert.equal(stats.index_error, undefined);
+
+  readOnlyStorage.close();
+});
+
+test("read-only single ingest rejects an event that is already raw-durable", () => {
+  const home = tempHome();
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "read-only-ingest-session",
+      cwd: "/tmp/read-only-ingest",
+      prompt: "existing raw event stays read only",
+    }),
+    env: {},
+    now,
+  });
+  const storage = createStorage({ home });
+  storage.ingest(event);
+  storage.close();
+  const readOnlyStorage = createStorage({ home, readOnly: true });
+
+  assert.throws(() => readOnlyStorage.ingest(event), /read-only storage/u);
 
   readOnlyStorage.close();
 });
@@ -177,6 +200,53 @@ test("writable storage replays raw JSONL events that are missing from SQLite ind
   assert.equal(storage.getSessionMemorySummary("raw-replay-session")?.updated_at, "2026-06-09T12:00:00.000Z");
 
   storage.close();
+});
+
+test("writable storage preserves indexed rows and replays valid events when raw JSONL is partial", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const indexedOnly = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "partial-indexed-session",
+      cwd: "/tmp/partial-indexed",
+      prompt: "keep this usable indexed evidence",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  });
+  const rawOnly = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "partial-raw-session",
+      cwd: "/tmp/partial-raw",
+      prompt: "replay this complete raw evidence",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  });
+
+  storage.ingest(indexedOnly);
+  storage.close();
+  fs.writeFileSync(
+    path.join(home, "events.jsonl"),
+    `${JSON.stringify(rawOnly)}\n{"event_id":"partial`,
+    { mode: 0o600 },
+  );
+
+  const reopened = createStorage({ home });
+  const health = reopened.health();
+
+  assert.equal(health.event_count, 2);
+  assert.match(health.index_error ?? "", /malformed|partial/iu);
+  assert.deepEqual(reopened.searchSessions({ query: "usable indexed evidence", limit: 5 }).map((match) => match.session_id), [
+    "partial-indexed-session",
+  ]);
+  assert.deepEqual(reopened.searchSessions({ query: "complete raw evidence", limit: 5 }).map((match) => match.session_id), [
+    "partial-raw-session",
+  ]);
+
+  reopened.close();
 });
 
 test("writable storage removes stale SQLite rows when raw JSONL is truncated", () => {
@@ -457,7 +527,7 @@ test("bulk ingest appends raw events once and rebuilds summaries once per touche
   storage.close();
 });
 
-test("bulk ingest reuses cached raw event ids across repeated 500-event batches", () => {
+test("bulk ingest reuses the raw event ID cache warmed by single ingest", () => {
   const home = tempHome();
   const storage = createStorage({ home });
   const sessionId = "bulk-cache-session";
@@ -504,7 +574,7 @@ test("bulk ingest reuses cached raw event ids across repeated 500-event batches"
       assert.deepEqual(result.touchedSessions, [sessionId]);
     }
 
-    assert.equal(rawLogReads, 1);
+    assert.equal(rawLogReads, 0);
     assert.equal(storage.health().event_count, 2001);
   } finally {
     fsModule.readFileSync = originalReadFileSync;
@@ -563,11 +633,15 @@ test("bulk ingest retry after SQLite rollback does not duplicate raw JSONL", () 
     throw new Error("forced index failure");
   };
 
-  const failed = storage.ingestMany([event]);
-  internals.indexEventInTransaction = originalIndexEventInTransaction;
+  try {
+    assert.throws(() => storage.ingestMany([event]), /forced index failure/u);
+  } finally {
+    internals.indexEventInTransaction = originalIndexEventInTransaction;
+  }
+  assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
+
   const retried = storage.ingestMany([event]);
 
-  assert.equal(failed.imported, 1);
   assert.equal(retried.imported, 0);
   assert.equal(retried.skippedDuplicate, 1);
   assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
@@ -577,6 +651,145 @@ test("bulk ingest retry after SQLite rollback does not duplicate raw JSONL", () 
   ]);
 
   storage.close();
+});
+
+test("single ingest keeps a raw-durable event when SQLite indexing fails", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "single-index-failure-session",
+      cwd: "/tmp/single-index-failure",
+      prompt: "durable hook survives index failure",
+    }),
+    env: {},
+    now,
+  });
+  const internals = storage as unknown as {
+    indexEventInTransaction: (event: NormalizedEvent, options: { rebuildSummary: boolean }) => unknown;
+  };
+  const originalIndexEventInTransaction = internals.indexEventInTransaction;
+  internals.indexEventInTransaction = () => {
+    throw new Error("forced single index failure");
+  };
+
+  try {
+    assert.doesNotThrow(() => storage.ingest(event));
+  } finally {
+    internals.indexEventInTransaction = originalIndexEventInTransaction;
+  }
+
+  assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
+  assert.match(storage.health().index_error ?? "", /forced single index failure/u);
+
+  storage.close();
+});
+
+test("bulk ingest surfaces SQLite lock timeouts instead of reporting a successful no-op", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const blocker = new DatabaseSync(path.join(home, "index.sqlite"));
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "bulk-lock-timeout-session",
+      cwd: "/tmp/bulk-lock-timeout",
+      prompt: "do not silently drop this locked import",
+    }),
+    env: {},
+    now,
+  });
+
+  blocker.exec("BEGIN IMMEDIATE");
+  try {
+    assert.throws(() => storage.ingestMany([event]), /database is locked/iu);
+    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+  } finally {
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    storage.close();
+  }
+});
+
+test("single ingest surfaces SQLite lock timeouts before raw persistence", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const blocker = new DatabaseSync(path.join(home, "index.sqlite"));
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "single-lock-timeout-session",
+      cwd: "/tmp/single-lock-timeout",
+      prompt: "locked hook must reach the caller",
+    }),
+    env: {},
+    now,
+  });
+
+  blocker.exec("BEGIN IMMEDIATE");
+  try {
+    assert.throws(() => storage.ingest(event), /database is locked/iu);
+    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+  } finally {
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    storage.close();
+  }
+});
+
+test("concurrent bulk ingest writers append an event ID to raw JSONL once", async () => {
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "concurrent-bulk-session",
+      cwd: "/tmp/concurrent-bulk",
+      prompt: "concurrent durable import",
+    }),
+    env: {},
+    now,
+  });
+  const result = await runConcurrentIngestWriters(["bulk", "bulk"], event);
+
+  assert.equal(result.rawEventCount, 1);
+  assert.equal(result.indexedEventCount, 1);
+  assert.equal(result.rawAppendAttempts, 1);
+});
+
+test("concurrent single ingest writers append an event ID to raw JSONL once", async () => {
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "concurrent-single-session",
+      cwd: "/tmp/concurrent-single",
+      prompt: "concurrent single durable hook",
+    }),
+    env: {},
+    now,
+  });
+  const result = await runConcurrentIngestWriters(["single", "single"], event);
+
+  assert.equal(result.rawEventCount, 1);
+  assert.equal(result.indexedEventCount, 1);
+  assert.equal(result.rawAppendAttempts, 1);
+});
+
+test("concurrent single and bulk ingest writers append an event ID to raw JSONL once", async () => {
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "concurrent-mixed-session",
+      cwd: "/tmp/concurrent-mixed",
+      prompt: "concurrent mixed durable hook",
+    }),
+    env: {},
+    now,
+  });
+  const result = await runConcurrentIngestWriters(["single", "bulk"], event);
+
+  assert.equal(result.rawEventCount, 1);
+  assert.equal(result.indexedEventCount, 1);
+  assert.equal(result.rawAppendAttempts, 1);
 });
 
 test("indexes large path-backed tool outputs as file references", () => {
@@ -810,6 +1023,54 @@ test("search sessions ranks substantive broad matches ahead of newer shallow mat
   assert.deepEqual(matches.map((match) => match.session_id), ["substantive-session", "shallow-session"]);
 
   storage.close();
+});
+
+test("search sessions merges summary and raw-event candidates before ranking a query tier", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "summary-candidate",
+      cwd: "/tmp/merged-search",
+      prompt: "merged evidence",
+    }),
+    env: {},
+    now,
+  }));
+  for (let index = 0; index < 5; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: "raw-candidate",
+        cwd: "/tmp/merged-search",
+        prompt: `merged evidence raw occurrence ${index}`,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 1, index)),
+    }));
+  }
+  storage.close();
+
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  try {
+    db.prepare("DELETE FROM event_fts WHERE session_id = ?1").run("summary-candidate");
+    db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run("summary-candidate");
+    db.prepare("DELETE FROM summary_node_fts WHERE session_id = ?1").run("raw-candidate");
+    db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run("raw-candidate");
+  } finally {
+    db.close();
+  }
+
+  const readOnlyStorage = createStorage({ home, readOnly: true });
+  const matches = readOnlyStorage.searchSessions({ query: "merged evidence", limit: 2 });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["raw-candidate", "summary-candidate"]);
+  assert.equal(matches[0].best_match?.kind, "event");
+  assert.equal(matches[0].match_count, 5);
+
+  readOnlyStorage.close();
 });
 
 test("retrieves recent context by explicit session or latest cwd match", () => {
@@ -1401,4 +1662,100 @@ function ingestStatsFixture(storage: ReturnType<typeof createStorage>): void {
     env: {},
     now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, 8)),
   }));
+}
+
+type ConcurrentIngestMode = "single" | "bulk";
+
+async function runConcurrentIngestWriters(
+  modes: readonly [ConcurrentIngestMode, ConcurrentIngestMode],
+  event: NormalizedEvent,
+): Promise<{ rawEventCount: number; indexedEventCount: number; rawAppendAttempts: number }> {
+  const home = tempHome("codex-lcm-concurrent-ingest-");
+  const rawLogPath = path.join(home, "events.jsonl");
+  const initializedStorage = createStorage({ home });
+  initializedStorage.close();
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 5);
+  const state = new Int32Array(barrier);
+  const workerScript = String.raw`
+    const fs = require("node:fs");
+    const { workerData } = require("node:worker_threads");
+    const state = new Int32Array(workerData.barrier);
+    const signal = (index) => {
+      Atomics.add(state, index, 1);
+      Atomics.add(state, 4, 1);
+      Atomics.notify(state, 4);
+    };
+    const originalAppendFileSync = fs.appendFileSync;
+    fs.appendFileSync = (...args) => {
+      if (args[0] === workerData.rawLogPath) {
+        signal(2);
+        while (Atomics.load(state, 2) < 2 && Atomics.load(state, 3) < 2) {
+          const version = Atomics.load(state, 4);
+          if (Atomics.load(state, 2) < 2 && Atomics.load(state, 3) < 2) {
+            Atomics.wait(state, 4, version);
+          }
+        }
+      }
+      return originalAppendFileSync(...args);
+    };
+
+    (async () => {
+      const { createStorage } = await import(workerData.storageUrl);
+      const storage = createStorage({ home: workerData.home });
+      const originalExec = storage.db.exec.bind(storage.db);
+      storage.db.exec = (sql) => {
+        if (sql === "BEGIN IMMEDIATE") signal(3);
+        return originalExec(sql);
+      };
+      const readyWorkers = Atomics.add(state, 0, 1) + 1;
+      if (readyWorkers === 2) {
+        Atomics.store(state, 1, 1);
+        Atomics.notify(state, 1);
+      } else {
+        Atomics.wait(state, 1, 0);
+      }
+      try {
+        if (workerData.mode === "single") {
+          storage.ingest(workerData.event);
+        } else {
+          storage.ingestMany([workerData.event], { rebuildSummaries: false });
+        }
+      } finally {
+        storage.close();
+      }
+    })();
+  `;
+  const workers = modes.map((mode) => new Worker(workerScript, {
+    eval: true,
+    workerData: {
+      barrier,
+      event,
+      home,
+      mode,
+      rawLogPath,
+      storageUrl: new URL("../src/storage.ts", import.meta.url).href,
+    },
+  }));
+
+  try {
+    await Promise.all(workers.map((worker) => new Promise<void>((resolve, reject) => {
+      worker.once("error", reject);
+      worker.once("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ingest worker exited with code ${code}`));
+      });
+    })));
+
+    const reopened = createStorage({ home, readOnly: true });
+    const indexedEventCount = reopened.health().event_count;
+    reopened.close();
+    return {
+      rawEventCount: readJsonl(rawLogPath).length,
+      indexedEventCount,
+      rawAppendAttempts: Atomics.load(state, 2),
+    };
+  } finally {
+    await Promise.all(workers.map((worker) => worker.terminate()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 }
