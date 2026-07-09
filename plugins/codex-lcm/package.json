@@ -9,6 +9,7 @@
     "codex-lcm": "./bin/codex-lcm"
   },
   "scripts": {
+    "typecheck": "npm exec --yes --package=typescript@7.0.2 -- tsc --noEmit",
     "test": "node --no-warnings --test tests/*.test.ts",
     "benchmark:long-context": "node --no-warnings bin/codex-lcm benchmark long-context --json",
     "smoke": "node --no-warnings scripts/smoke-test.ts"
