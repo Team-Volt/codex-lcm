@@ -491,7 +491,7 @@ function signalTerms(text: string, limit: number, unique: boolean): string[] {
 function isSignalTerm(term: string): boolean {
   if (term.length < 2) return false;
   if (COMMON_FUNCTION_TERMS.has(term)) return false;
-  if (/^\d+$/u.test(term)) return term.length >= 4;
+  if (/^\d+$/u.test(term)) return term.length >= 2;
   if (term.includes("-") || /\d/u.test(term)) return true;
   return term.length >= 3;
 }
@@ -516,6 +516,9 @@ function queryTermHitCountFromTerms(text: string, terms: string[]): number {
 }
 
 function textContainsTerm(loweredText: string, term: string): boolean {
+  if (/^\d+$/u.test(term)) {
+    return numericTermOccurrenceCount(loweredText, term) > 0;
+  }
   if (loweredText.includes(term)) return true;
   if (!/[-_]/u.test(term)) return false;
   const normalizedText = loweredText.replace(/[-_]+/gu, " ");
@@ -551,10 +554,15 @@ function directnessScore(loweredText: string, terms: string[], uniqueHitWeight: 
 }
 
 function termOccurrenceCount(loweredText: string, term: string): number {
+  if (/^\d+$/u.test(term)) return numericTermOccurrenceCount(loweredText, term);
   const directCount = countOccurrences(loweredText, term);
   if (directCount > 0) return directCount;
   if (!/[-_]/u.test(term)) return 0;
   return countOccurrences(loweredText.replace(/[-_]+/gu, " "), term.replace(/[-_]+/gu, " "));
+}
+
+function numericTermOccurrenceCount(loweredText: string, term: string): number {
+  return loweredText.match(new RegExp(`(?:^|[^\\p{L}\\p{N}_])${term}(?=$|[^\\p{L}\\p{N}_])`, "gu"))?.length ?? 0;
 }
 
 function countOccurrences(haystack: string, needle: string): number {

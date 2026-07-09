@@ -1532,7 +1532,7 @@ export class LcmStorage {
 
     const addRankedSessionNodes = (sessionId: string, limit: number): number => {
       const nodes = query.length > 0
-        ? rankSummaryNodesForContext(this.getSummaryNodesForSession(sessionId, Math.max(limit * 8, 24)), query)
+        ? rankSummaryNodesForContext(this.getSummaryNodesForSession(sessionId, 2_000), query)
           .filter((node) => queryTermHitCount(summaryNodeSearchText(node), query) > 0)
           .slice(0, limit)
         : this.getTopSummaryNodesForSession(sessionId, limit);
@@ -2709,6 +2709,7 @@ function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
     .sort((a, b) =>
       b.discovery.score - a.discovery.score ||
       b.score - a.score ||
+      (b.bestMatch?.score ?? 0) - (a.bestMatch?.score ?? 0) ||
       b.matchCount - a.matchCount ||
       b.lastMatchAt.localeCompare(a.lastMatchAt) ||
       a.firstOrder - b.firstOrder)

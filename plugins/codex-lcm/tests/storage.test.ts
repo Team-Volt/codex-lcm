@@ -1462,6 +1462,50 @@ test("search sessions rank source-rich implementation history over tiny marker s
   storage.close();
 });
 
+test("search sessions prefer the strongest evidence when aggregate relevance ties", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const cwd = "/tmp/strongest-evidence";
+  const strongSignals = [
+    "alpha beta gamma delta",
+    "epsilon alpha",
+    "gamma",
+    "delta",
+  ];
+
+  for (const [index, prompt] of strongSignals.entries()) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({ session_id: "strong-evidence", cwd, prompt }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+  for (let index = 0; index < 4; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({ session_id: "recent-adjacent", cwd, prompt: "alpha beta" }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 10, 12, 0, index)),
+    }));
+  }
+  storage.close();
+  clearDerivedSummaries(home);
+
+  const readOnlyStorage = createStorage({ home, readOnly: true });
+  const matches = readOnlyStorage.searchSessions({
+    cwd,
+    query: "alpha beta gamma delta epsilon",
+    limit: 5,
+  });
+
+  assert.deepEqual(matches.map((match) => match.session_id), ["strong-evidence", "recent-adjacent"]);
+  assert.equal(matches[0].best_match?.score, 4);
+  assert.equal(matches[1].best_match?.score, 2);
+
+  readOnlyStorage.close();
+});
+
 test("session summary topics prefer signal terms over prompt filler", () => {
   const home = tempHome();
   const storage = createStorage({ home });
