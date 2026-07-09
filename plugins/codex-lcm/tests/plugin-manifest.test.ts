@@ -31,10 +31,14 @@ test("plugin includes a Codex skill that nudges agents to use LCM", () => {
   const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
 
   assert.match(skill, /^---\nname: lcm-recall/mu);
-  assert.match(skill, /lcm_grep/u);
-  assert.match(skill, /lcm_describe/u);
-  assert.match(skill, /lcm_expand/u);
-  assert.match(skill, /lcm_expand_query/u);
+  assert.match(skill, /preferred standard workflow is `lcm_grep` -> `lcm_describe` -> `lcm_expand`/u);
+  assert.match(
+    skill,
+    /`mcp__codex_lcm__lcm_grep` -> `mcp__codex_lcm__lcm_describe` -> `mcp__codex_lcm__lcm_expand` are those same standard tools/u,
+  );
+  assert.match(skill, /Agents must use the host-qualified form Codex shows/u);
+  assert.match(skill, /rather than fall back to lower-level session APIs/u);
+  assert.match(skill, /`lcm_expand_query` as the focused query-first alternative/u);
   assert.match(skill, /lcm_current_session/u);
   assert.match(skill, /lcm_search_sessions/u);
   assert.match(skill, /lcm_pack_context/u);

@@ -12,6 +12,9 @@ type FramedMcpResponse = {
   readonly error: { readonly code: number };
 };
 
+const SUPPORTED_PROTOCOL_VERSION = "2025-11-25";
+const STANDARD_TOOL_NAMES = ["lcm_grep", "lcm_describe", "lcm_expand"] as const;
+
 test("MCP server initializes and lists LCM tools", () => {
   const home = tempHome();
   const responses = runMcp([
@@ -20,7 +23,7 @@ test("MCP server initializes and lists LCM tools", () => {
       id: 1,
       method: "initialize",
       params: {
-        protocolVersion: "2025-11-25",
+        protocolVersion: SUPPORTED_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: "codex-lcm-test", version: "0.1.0" },
       },
@@ -28,9 +31,16 @@ test("MCP server initializes and lists LCM tools", () => {
     { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
   ], { CODEX_LCM_HOME: home });
 
+  assert.equal(responses[0].result.protocolVersion, SUPPORTED_PROTOCOL_VERSION);
   assert.equal(responses[0].result.serverInfo.name, "codex-lcm");
+  assert.match(
+    responses[0].result.instructions,
+    /Preferred standard workflow: lcm_grep -> lcm_describe -> lcm_expand\./u,
+  );
+  assert.match(responses[0].result.instructions, /mcp__codex_lcm__lcm_grep/u);
+  const toolNames = responses[1].result.tools.map((tool: { name: string }) => tool.name);
   assert.deepEqual(
-    responses[1].result.tools.map((tool: { name: string }) => tool.name),
+    toolNames,
     [
       "lcm_health",
       "lcm_stats",
@@ -49,11 +59,158 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_record_note",
     ],
   );
+  for (const name of STANDARD_TOOL_NAMES) {
+    assert.equal(toolNames.includes(name), true, `${name} missing from tools/list`);
+  }
+  const grepTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_grep");
+  assert.match(grepTool.description, /Preferred standard workflow step 1/u);
+  assert.match(grepTool.description, /mcp__codex_lcm__lcm_grep/u);
+  const describeTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_describe");
+  assert.match(describeTool.description, /Preferred standard workflow step 2/u);
+  assert.match(describeTool.description, /mcp__codex_lcm__lcm_describe/u);
+  const expandTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_expand");
+  assert.match(expandTool.description, /Preferred standard workflow step 3/u);
+  assert.match(expandTool.description, /mcp__codex_lcm__lcm_expand/u);
   const expandQueryTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_expand_query");
   assert.equal(expandQueryTool.inputSchema.properties.budgetTokens.default, 2000);
   assert.equal(expandQueryTool.inputSchema.properties.overview.type, "boolean");
   const contextPlanTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_context_plan");
   assert.equal(contextPlanTool.inputSchema.properties.canControlCompaction.const, false);
+});
+
+test("MCP server falls back to its supported protocol version", () => {
+  const responses = runMcp([
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2099-01-01" },
+    },
+  ]);
+
+  assert.equal(responses[0].result.protocolVersion, SUPPORTED_PROTOCOL_VERSION);
+});
+
+test("MCP server rejects invalid initialize params and continues", () => {
+  const invalidParams: readonly unknown[] = [
+    [],
+    undefined,
+    {},
+    { protocolVersion: "" },
+    { protocolVersion: 20251125 },
+    { protocolVersion: SUPPORTED_PROTOCOL_VERSION, capabilities: [] },
+    { protocolVersion: SUPPORTED_PROTOCOL_VERSION, capabilities: null },
+    { protocolVersion: SUPPORTED_PROTOCOL_VERSION, clientInfo: [] },
+    { protocolVersion: SUPPORTED_PROTOCOL_VERSION, clientInfo: null },
+  ];
+  const requests = invalidParams.map((params, index) => ({
+    jsonrpc: "2.0",
+    id: index + 1,
+    method: "initialize",
+    ...(params === undefined ? {} : { params }),
+  }));
+  const responses = runMcp([
+    ...requests,
+    { jsonrpc: "2.0", id: 99, method: "ping", params: [] },
+  ]);
+
+  assert.equal(responses.length, invalidParams.length + 1);
+  for (const [index, response] of responses.slice(0, -1).entries()) {
+    assert.deepEqual(response, {
+      jsonrpc: "2.0",
+      id: index + 1,
+      error: { code: -32602, message: "Invalid params" },
+    });
+  }
+  assert.deepEqual(responses.at(-1), { jsonrpc: "2.0", id: 99, result: {} });
+});
+
+test("MCP server rejects invalid tools/call params and continues", () => {
+  const home = tempHome();
+  const invalidParams: readonly unknown[] = [
+    [],
+    undefined,
+    {},
+    { name: "" },
+    { name: 42 },
+    { name: "lcm_health", arguments: [] },
+    { name: "lcm_health", arguments: null },
+  ];
+  const requests = invalidParams.map((params, index) => ({
+    jsonrpc: "2.0",
+    id: index + 1,
+    method: "tools/call",
+    ...(params === undefined ? {} : { params }),
+  }));
+  const responses = runMcp([
+    ...requests,
+    { jsonrpc: "2.0", id: 98, method: "tools/call", params: { name: "lcm_health" } },
+    { jsonrpc: "2.0", id: 99, method: "ping", params: [] },
+  ], { CODEX_LCM_HOME: home });
+
+  assert.equal(responses.length, invalidParams.length + 2);
+  for (const [index, response] of responses.slice(0, invalidParams.length).entries()) {
+    assert.deepEqual(response, {
+      jsonrpc: "2.0",
+      id: index + 1,
+      error: { code: -32602, message: "Invalid params" },
+    });
+  }
+  assert.equal(responses.at(-2).result.structuredContent.health.event_count, 0);
+  assert.deepEqual(responses.at(-1), { jsonrpc: "2.0", id: 99, result: {} });
+});
+
+test("MCP server stays silent for notifications with invalid method params", () => {
+  const responses = runMcp([
+    { jsonrpc: "2.0", method: "initialize", params: [] },
+    { jsonrpc: "2.0", method: "tools/call", params: [] },
+    { jsonrpc: "2.0", method: "tools/call", params: { name: "" } },
+    { jsonrpc: "2.0", id: 1, method: "ping", params: [] },
+  ]);
+
+  assert.deepEqual(responses, [{ jsonrpc: "2.0", id: 1, result: {} }]);
+});
+
+test("MCP server returns invalid-request errors and continues after non-request JSON", () => {
+  const invalidMessages: readonly unknown[] = [
+    null,
+    [],
+    false,
+    42,
+    "not a request",
+    { method: "ping" },
+    { jsonrpc: "1.0", id: 1, method: "ping" },
+    { jsonrpc: "2.0", id: 2 },
+  ];
+  const ping = { jsonrpc: "2.0", id: 99, method: "ping" };
+  const result = runCli(["mcp"], {
+    input: `${[...invalidMessages, ping].map((message) => JSON.stringify(message)).join("\n")}\n`,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const responses = result.stdout
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
+  assert.equal(responses.length, invalidMessages.length + 1);
+  for (const response of responses.slice(0, -1)) {
+    assert.deepEqual(response, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32600, message: "Invalid Request" },
+    });
+  }
+  assert.deepEqual(responses.at(-1), { jsonrpc: "2.0", id: 99, result: {} });
+});
+
+test("MCP server does not respond to ordinary notifications", () => {
+  const responses = runMcp([
+    { jsonrpc: "2.0", method: "notifications/initialized", params: {} },
+    { jsonrpc: "2.0", method: "ping" },
+    { jsonrpc: "2.0", id: 1, method: "ping" },
+  ]);
+
+  assert.deepEqual(responses, [{ jsonrpc: "2.0", id: 1, result: {} }]);
 });
 
 test("MCP server accepts Content-Length framed requests", () => {
@@ -70,6 +227,22 @@ test("MCP server accepts Content-Length framed requests", () => {
   const responses = parseFramedOutput(result.stdout);
   assert.equal(responses[0].result.serverInfo.name, "codex-lcm");
   assert.equal(responses[1].result.tools.some((tool: { name: string }) => tool.name === "lcm_health"), true);
+});
+
+test("MCP server frames invalid-request errors and continues for Content-Length input", () => {
+  const result = runCli(["mcp"], {
+    input: framedInput([
+      null,
+      { jsonrpc: "2.0", id: 2, method: "ping" },
+    ]),
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const responses = parseFramedOutput(result.stdout);
+  assert.equal(responses[0].id, null);
+  assert.equal(responses[0].error.code, -32600);
+  assert.equal(responses[1].id, 2);
+  assert.deepEqual(responses[1].result, {});
 });
 
 test("MCP server returns parse errors for malformed newline JSON", () => {
