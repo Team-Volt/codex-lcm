@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 
 import { normalizeHookEvent, type NormalizedEvent } from "./events.ts";
 import { type LcmStorage } from "./storage.ts";
@@ -32,13 +34,20 @@ type ImportState = {
   repoRoot?: string;
   gitBranch?: string;
   turnId?: string;
+  unmatchedMessageFingerprints?: Map<string, Record<MessageSource, number>>;
 };
+
+type MessageRole = "assistant" | "user";
+type MessageSource = "event_msg" | "response_item";
 
 export function defaultCodexSessionsPath(): string {
   return path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "sessions");
 }
 
-export function importCodexSessions(storage: LcmStorage, options: ImportCodexSessionsOptions = {}): ImportCodexSessionsReport {
+export async function importCodexSessions(
+  storage: LcmStorage,
+  options: ImportCodexSessionsOptions = {},
+): Promise<ImportCodexSessionsReport> {
   const startedAt = Date.now();
   const source = path.resolve(options.from ?? defaultCodexSessionsPath());
   const report: ImportCodexSessionsReport = {
@@ -83,7 +92,7 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
 
   for (const file of listJsonlFiles(source)) {
     report.files_scanned += 1;
-    importFile(file, report, {
+    await importFile(file, report, {
       onImportableEvent: (event) => {
         if (options.dryRun) {
           if (storage.hasEvent(event.event_id)) {
@@ -104,41 +113,54 @@ export function importCodexSessions(storage: LcmStorage, options: ImportCodexSes
   return report;
 }
 
-function importFile(
+async function importFile(
   file: string,
   report: ImportCodexSessionsReport,
   options: {
     onImportableEvent: (event: NormalizedEvent) => void;
     onProgress: () => void;
   },
-): void {
+): Promise<void> {
   const state: ImportState = {};
-  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/u);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (line.trim().length === 0) continue;
-    report.records_read += 1;
-    let record: Record<string, unknown>;
-    try {
-      const parsed = JSON.parse(line);
-      if (!isRecord(parsed)) throw new Error("record is not an object");
-      record = parsed;
-    } catch (error) {
-      report.records_skipped += 1;
-      report.errors.push({ file, line: index + 1, message: error instanceof Error ? error.message : String(error) });
+  const input = fs.createReadStream(file, { encoding: "utf8" });
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  let lineNumber = 0;
+  try {
+    for await (const line of lines) {
+      lineNumber += 1;
+      if (line.trim().length === 0) continue;
+      report.records_read += 1;
+      let event: NormalizedEvent | undefined;
+      try {
+        const parsed = JSON.parse(line);
+        if (!isRecord(parsed)) throw new Error("record is not an object");
+        event = codexRecordToEvent(parsed, file, state);
+      } catch (error) {
+        report.records_skipped += 1;
+        report.errors.push({ file, line: lineNumber, message: error instanceof Error ? error.message : String(error) });
+        options.onProgress();
+        continue;
+      }
+      if (!event) {
+        report.records_skipped += 1;
+        options.onProgress();
+        continue;
+      }
+      report.events_importable += 1;
+      options.onImportableEvent(event);
       options.onProgress();
-      continue;
     }
-
-    const event = codexRecordToEvent(record, file, state);
-    if (!event) {
-      report.records_skipped += 1;
-      options.onProgress();
-      continue;
-    }
-    report.events_importable += 1;
-    options.onImportableEvent(event);
+  } catch (error) {
+    if (!input.errored) throw error;
+    report.records_skipped += 1;
+    report.errors.push({
+      file,
+      message: error instanceof Error ? error.message : String(error),
+    });
     options.onProgress();
+  } finally {
+    lines.close();
+    input.destroy();
   }
 }
 
@@ -146,6 +168,7 @@ function codexRecordToEvent(record: Record<string, unknown>, file: string, state
   const payload = isRecord(record.payload) ? record.payload : {};
   const type = stringValue(record.type);
   const timestamp = stringValue(record.timestamp) || stringValue(payload.timestamp) || new Date(0).toISOString();
+  if (Number.isNaN(new Date(timestamp).getTime())) throw new Error(`invalid timestamp: ${timestamp}`);
 
   if (type === "session_meta") {
     state.sessionId = stringValue(payload.id) || state.sessionId || sessionIdFromFile(file);
@@ -175,15 +198,61 @@ function codexRecordToEvent(record: Record<string, unknown>, file: string, state
     return undefined;
   }
 
+  if (type === "compacted") {
+    const summary = stringValue(payload.message);
+    if (!summary) return undefined;
+    return normalizeImportEvent({
+      hookEvent: "PostCompact",
+      timestamp,
+      sessionId: state.sessionId || sessionIdFromFile(file),
+      cwd: state.cwd || "",
+      payload: basePayload(file, type, timestamp, state, {
+        summary,
+        ...(payload.window_id !== undefined ? { window_id: payload.window_id } : {}),
+        ...(payload.window_number !== undefined ? { window_number: payload.window_number } : {}),
+      }),
+      state,
+    });
+  }
+
+  if (type === "event_msg") {
+    const eventType = stringValue(payload.type);
+    const role = eventType === "user_message"
+      ? "user"
+      : eventType === "agent_message"
+      ? "assistant"
+      : undefined;
+    const sourceText = typeof payload.message === "string" ? payload.message : "";
+    const text = stringValue(sourceText) || "";
+    if (!role || text.length === 0 || isSyntheticContextText(text)) return undefined;
+    if (isCrossShapeMessageDuplicate(state, "event_msg", role, sourceText)) return undefined;
+    return normalizeImportEvent({
+      hookEvent: role === "user" ? "UserPromptSubmit" : "Stop",
+      timestamp,
+      sessionId: state.sessionId || sessionIdFromFile(file),
+      cwd: state.cwd || "",
+      payload: basePayload(
+        file,
+        type,
+        timestamp,
+        state,
+        role === "user" ? { prompt: text } : { last_assistant_message: text },
+      ),
+      state,
+    });
+  }
+
   if (type !== "response_item") return undefined;
 
   const item = payload;
   const itemType = stringValue(item.type);
   if (itemType === "message") {
+    const sourceText = contentSourceText(item.content);
     const role = stringValue(item.role);
     const text = contentText(item.content);
     if (text.length === 0 || isSyntheticContextText(text)) return undefined;
     if (role === "user") {
+      if (isCrossShapeMessageDuplicate(state, "response_item", "user", sourceText)) return undefined;
       return normalizeImportEvent({
         hookEvent: "UserPromptSubmit",
         timestamp,
@@ -194,6 +263,7 @@ function codexRecordToEvent(record: Record<string, unknown>, file: string, state
       });
     }
     if (role === "assistant") {
+      if (isCrossShapeMessageDuplicate(state, "response_item", "assistant", sourceText)) return undefined;
       return normalizeImportEvent({
         hookEvent: "Stop",
         timestamp,
@@ -206,8 +276,32 @@ function codexRecordToEvent(record: Record<string, unknown>, file: string, state
     return undefined;
   }
 
-  if (itemType === "function_call" || itemType === "tool_search_call") {
-    const toolName = stringValue(item.name) || itemType;
+  if (itemType === "agent_message") {
+    const sourceText = contentSourceText(item.content);
+    const text = contentText(item.content);
+    if (text.length === 0 || isSyntheticContextText(text)) return undefined;
+    if (isCrossShapeMessageDuplicate(state, "response_item", "assistant", sourceText)) return undefined;
+    return normalizeImportEvent({
+      hookEvent: "Stop",
+      timestamp,
+      sessionId: state.sessionId || sessionIdFromFile(file),
+      cwd: state.cwd || "",
+      payload: basePayload(file, type, timestamp, state, {
+        last_assistant_message: text,
+        ...(stringValue(item.author) ? { author: stringValue(item.author) } : {}),
+        ...(stringValue(item.recipient) ? { recipient: stringValue(item.recipient) } : {}),
+      }),
+      state,
+    });
+  }
+
+  if (
+    itemType === "function_call" ||
+    itemType === "tool_search_call" ||
+    itemType === "custom_tool_call" ||
+    itemType === "web_search_call"
+  ) {
+    const toolName = stringValue(item.name) || (itemType === "web_search_call" ? "web_search" : itemType);
     const toolUseId = stringValue(item.call_id) || stringValue(item.id);
     return normalizeImportEvent({
       hookEvent: "PreToolUse",
@@ -217,13 +311,18 @@ function codexRecordToEvent(record: Record<string, unknown>, file: string, state
       payload: basePayload(file, type, timestamp, state, {
         tool_name: toolName,
         tool_use_id: toolUseId,
-        tool_input: parseMaybeJson(item.arguments),
+        tool_input: parseMaybeJson(item.arguments ?? item.input ?? item.action),
+        ...(stringValue(item.status) ? { tool_status: stringValue(item.status) } : {}),
       }),
       state,
     });
   }
 
-  if (itemType === "function_call_output" || itemType === "tool_search_output") {
+  if (
+    itemType === "function_call_output" ||
+    itemType === "tool_search_output" ||
+    itemType === "custom_tool_call_output"
+  ) {
     return normalizeImportEvent({
       hookEvent: "PostToolUse",
       timestamp,
@@ -309,6 +408,14 @@ function contentText(value: unknown): string {
     .trim();
 }
 
+function contentSourceText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry.text !== "string") return [];
+    return [entry.text];
+  }).join("\n\n");
+}
+
 function isSyntheticContextText(text: string): boolean {
   const trimmed = text.trimStart();
   return trimmed.startsWith("<environment_context>") ||
@@ -316,6 +423,27 @@ function isSyntheticContextText(text: string): boolean {
     trimmed.startsWith("<apps_instructions>") ||
     trimmed.startsWith("<skills_instructions>") ||
     trimmed.startsWith("<plugins_instructions>");
+}
+
+function isCrossShapeMessageDuplicate(
+  state: ImportState,
+  source: MessageSource,
+  role: MessageRole,
+  text: string,
+): boolean {
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify([role, state.sessionId || "", state.turnId || "", text]))
+    .digest("hex");
+  const fingerprints = state.unmatchedMessageFingerprints ?? new Map<string, Record<MessageSource, number>>();
+  state.unmatchedMessageFingerprints = fingerprints;
+  const counts = fingerprints.get(fingerprint) ?? { event_msg: 0, response_item: 0 };
+  const opposite: MessageSource = source === "event_msg" ? "response_item" : "event_msg";
+  if (counts[opposite] > 0) {
+    fingerprints.set(fingerprint, { ...counts, [opposite]: counts[opposite] - 1 });
+    return true;
+  }
+  fingerprints.set(fingerprint, { ...counts, [source]: counts[source] + 1 });
+  return false;
 }
 
 function parseMaybeJson(value: unknown): unknown {

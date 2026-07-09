@@ -51,7 +51,7 @@ export async function main(argv: string[]): Promise<void> {
     const showProgress = rest.includes("--progress");
     const storage = createStorage({ config: loadConfig(), readOnly: dryRun });
     try {
-      printObjectOrText(importCodexSessions(storage, {
+      printObjectOrText(await importCodexSessions(storage, {
         from: optionValue(rest, "--from"),
         dryRun,
         batchSize: numberOptionValue(rest, "--batch-size"),
