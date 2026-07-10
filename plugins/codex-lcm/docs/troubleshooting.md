@@ -37,7 +37,7 @@ For native plugin installs, Codex discovers hooks through `.codex-plugin/plugin.
 ```
 
 The hook manifest registers `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-`PostToolUse`, `PreCompact`, `PostCompact`, and `Stop`.
+`PostToolUse`, `PreCompact`, `PostCompact`, `SubagentStop`, and `Stop`.
 
 Some plugin validation tools may lag the live Codex plugin schema and complain
 about the `hooks` field. The live Codex CLI/TUI uses this field for plugin-owned
