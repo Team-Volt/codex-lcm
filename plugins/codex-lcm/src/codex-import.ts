@@ -90,7 +90,11 @@ export async function importCodexSessions(
     emitProgress();
   };
 
-  for (const file of listJsonlFiles(source)) {
+  const files = listJsonlFiles(source);
+  if (files.length === 0) {
+    report.errors.push({ file: source, message: `No JSONL session files found at ${source}` });
+  }
+  for (const file of files) {
     report.files_scanned += 1;
     await importFile(file, report, {
       onImportableEvent: (event) => {
@@ -172,7 +176,15 @@ function codexRecordToEvent(record: Record<string, unknown>, file: string, state
   if (Number.isNaN(new Date(timestamp).getTime())) throw new Error(`invalid timestamp: ${timestamp}`);
 
   if (type === "session_meta") {
-    state.sessionId = stringValue(payload.id) || state.sessionId || sessionIdFromFile(file);
+    const sessionId = stringValue(payload.id);
+    if (sessionId && state.sessionId && sessionId !== state.sessionId) {
+      state.cwd = undefined;
+      state.repoRoot = undefined;
+      state.gitBranch = undefined;
+      state.turnId = undefined;
+      state.unmatchedMessageFingerprints = undefined;
+    }
+    state.sessionId = sessionId || state.sessionId || sessionIdFromFile(file);
     state.cwd = stringValue(payload.cwd) || state.cwd || "";
     return normalizeImportEvent({
       hookEvent: "SessionStart",

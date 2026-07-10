@@ -79,6 +79,16 @@ test("SubagentStop imports only the child portion of a forked rollout", () => {
   const rows = [
     { timestamp: "2026-07-09T18:41:33.000Z", type: "session_meta", payload: { id: parentId, cwd: "/tmp/subagent-capture" } },
     { timestamp: "2026-07-09T18:41:34.000Z", type: "event_msg", payload: { type: "user_message", message: "inherited_parent_needle" } },
+    {
+      timestamp: "2026-07-09T18:41:35.000Z",
+      type: "turn_context",
+      payload: {
+        turn_id: "inherited-parent-turn",
+        cwd: "/tmp/inherited-parent",
+        repo_root: "/tmp/inherited-parent-repo",
+        git_branch: "inherited-parent-branch",
+      },
+    },
     { timestamp: "2026-07-09T18:41:58.000Z", type: "session_meta", payload: { id: childId, session_id: parentId, cwd: "/tmp/subagent-capture" } },
     { timestamp: "2026-07-09T18:41:59.000Z", type: "event_msg", payload: { type: "user_message", message: "child_prompt_needle" } },
     { timestamp: "2026-07-09T18:42:00.000Z", type: "event_msg", payload: { type: "agent_message", message: "child_result_needle" } },
@@ -102,13 +112,44 @@ test("SubagentStop imports only the child portion of a forked rollout", () => {
     session_id: string;
     hook_event: string;
     payload: Record<string, unknown>;
+    repo_root?: string;
+    git_branch?: string;
   }>;
   const childEvents = events.filter((event) => event.session_id === childId);
   assert.deepEqual(childEvents.map((event) => event.hook_event), ["SessionStart", "UserPromptSubmit", "Stop"]);
+  for (const event of childEvents) {
+    assert.equal(event.payload.turn_id, undefined);
+    assert.equal(event.repo_root, undefined);
+    assert.equal(event.git_branch, undefined);
+  }
   assert.match(JSON.stringify(childEvents), /child_prompt_needle/u);
   assert.match(JSON.stringify(childEvents), /child_result_needle/u);
   assert.doesNotMatch(JSON.stringify(events), /inherited_parent_needle/u);
   assert.equal(events.some((event) => event.session_id === parentId && event.hook_event === "SubagentStop"), true);
+});
+
+test("SubagentStop reports a missing transcript without losing the parent event", () => {
+  const home = tempHome();
+  const parentId = "019f482f-65a8-7a31-a79c-2cecf2e87c3e";
+  const transcript = path.join(tempHome("codex-subagent-missing-"), "missing.jsonl");
+  const result = runCli(["hook", "SubagentStop"], {
+    input: JSON.stringify({
+      session_id: parentId,
+      cwd: "/tmp/subagent-capture",
+      hook_event_name: "SubagentStop",
+      agent_transcript_path: transcript,
+    }),
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assertCliOk(result);
+  assert.match(result.stderr, /failed to import subagent transcript/u);
+  assert.equal(result.stderr.includes(transcript), true);
+  const events = readJsonl(path.join(home, "events.jsonl")) as Array<{
+    session_id: string;
+    hook_event: string;
+  }>;
+  assert.deepEqual(events.map((event) => [event.session_id, event.hook_event]), [[parentId, "SubagentStop"]]);
 });
 
 test("PostCompact hook output immediately nudges LCM recall", () => {
