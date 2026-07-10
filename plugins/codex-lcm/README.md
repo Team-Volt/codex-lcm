@@ -105,6 +105,7 @@ Hooks capture the JSON payload Codex sends on stdin for:
 - `PostToolUse`
 - `PreCompact`
 - `PostCompact`
+- `SubagentStop`
 - `Stop`
 
 Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes. Large path-backed outputs are indexed as file references with path, byte count, SHA-256, MIME guess, and a compact exploration summary; the indexed metadata does not reload the full content.
