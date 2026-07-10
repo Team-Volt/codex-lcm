@@ -115,7 +115,10 @@ async function runHook(args: string[]): Promise<void> {
   const hookEvent = args[0];
   if (!hookEvent) throw new Error("Usage: codex-lcm hook <event>");
   const rawInput = await readStdinWithLimit();
-  const payloadCwd = extractCwd(rawInput) ?? process.env.PWD ?? process.cwd();
+  const payloadCwd = extractStringField(rawInput, "cwd") ?? process.env.PWD ?? process.cwd();
+  const transcriptPath = hookEvent === "SubagentStop"
+    ? extractStringField(rawInput, "agent_transcript_path")
+    : undefined;
   const config = loadConfig();
   const event = normalizeHookEvent({
     hookEvent,
@@ -128,6 +131,18 @@ async function runHook(args: string[]): Promise<void> {
   try {
     storage.ingest(event);
     stored = true;
+    if (stored && transcriptPath) {
+      try {
+        const report = await importCodexSessions(storage, { from: transcriptPath });
+        for (const error of report.errors) {
+          process.stderr.write(`codex-lcm: failed to import subagent transcript: ${error.message}\n`);
+        }
+      } catch (error) {
+        process.stderr.write(
+          `codex-lcm: failed to import subagent transcript: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
+      }
+    }
   } catch (error) {
     process.stderr.write(`codex-lcm: failed to store hook event: ${error instanceof Error ? error.message : String(error)}\n`);
   } finally {
@@ -235,10 +250,11 @@ async function readStdinWithLimit(limit = DEFAULT_LIMITS.maxInputBytes): Promise
   return chunks.join("");
 }
 
-function extractCwd(rawInput: string): string | undefined {
+function extractStringField(rawInput: string, key: string): string | undefined {
   try {
-    const payload = JSON.parse(rawInput) as { cwd?: unknown };
-    return typeof payload.cwd === "string" && payload.cwd.trim().length > 0 ? payload.cwd.trim() : undefined;
+    const payload = JSON.parse(rawInput) as Record<string, unknown>;
+    const value = payload[key];
+    return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
   } catch {
     return undefined;
   }

@@ -122,6 +122,7 @@ async function importFile(
   },
 ): Promise<void> {
   const state: ImportState = {};
+  const rolloutSessionId = rolloutSessionIdFromFile(file);
   const input = fs.createReadStream(file, { encoding: "utf8" });
   const lines = readline.createInterface({ input, crlfDelay: Infinity });
   let lineNumber = 0;
@@ -141,7 +142,7 @@ async function importFile(
         options.onProgress();
         continue;
       }
-      if (!event) {
+      if (!event || (rolloutSessionId && event.session_id !== rolloutSessionId)) {
         report.records_skipped += 1;
         options.onProgress();
         continue;
@@ -455,10 +456,13 @@ function parseMaybeJson(value: unknown): unknown {
   }
 }
 
-function sessionIdFromFile(file: string): string {
+function rolloutSessionIdFromFile(file: string): string | undefined {
   const base = path.basename(file, ".jsonl");
-  const match = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu);
-  return match?.[1] || base;
+  return base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu)?.[1];
+}
+
+function sessionIdFromFile(file: string): string {
+  return rolloutSessionIdFromFile(file) || path.basename(file, ".jsonl");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -62,6 +62,16 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/bin/codex-lcm\" hook SubagentStop"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -62,7 +62,16 @@ test("MCP manifest registers the local stdio server", () => {
 
 test("hook manifest registers all required Codex lifecycle hooks", () => {
   const manifest = JSON.parse(fs.readFileSync("hooks/hooks.codex.json", "utf8"));
-  const events = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PreCompact", "PostCompact", "Stop"];
+  const events = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "SubagentStop",
+    "Stop",
+  ];
 
   assert.deepEqual(Object.keys(manifest.hooks), events);
   for (const event of events) {
