@@ -152,7 +152,7 @@ test("SubagentStop reports a missing transcript without losing the parent event"
   assert.deepEqual(events.map((event) => [event.session_id, event.hook_event]), [[parentId, "SubagentStop"]]);
 });
 
-test("PostCompact hook output immediately nudges LCM recall", () => {
+test("PostCompact hook emits no unsupported response", () => {
   const home = tempHome();
   const env = { CODEX_LCM_HOME: home };
   const postCompact = runCli(["hook", "PostCompact"], {
@@ -166,13 +166,7 @@ test("PostCompact hook output immediately nudges LCM recall", () => {
     env,
   });
   assertCliOk(postCompact);
-  const output: unknown = JSON.parse(postCompact.stdout);
-  assertHookAdditionalContextOutput(output);
-  assert.equal(output.hookSpecificOutput.hookEventName, "PostCompact");
-  assert.match(output.hookSpecificOutput.additionalContext, /POST-COMPACTION LCM RECOVERY/u);
-  assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
-  assert.match(output.hookSpecificOutput.additionalContext, /continue unfinished work/u);
-  assert.match(output.hookSpecificOutput.additionalContext, /Do not stop or wait for the user/u);
+  assert.equal(postCompact.stdout, "");
 });
 
 test("PostCompact pending marker nudges the next compact SessionStart to recall LCM", () => {
@@ -254,7 +248,7 @@ test("post-compaction LCM nudge is emitted once per compacted session", () => {
     env,
   });
   assertCliOk(postCompact);
-  assert.match(postCompact.stdout, /lcm_pack_context/u);
+  assert.equal(postCompact.stdout, "");
 
   const payload = JSON.stringify({
     session_id: "compact-once-session",

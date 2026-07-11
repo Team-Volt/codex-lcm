@@ -63,7 +63,7 @@ function postCompactRecoveryOutput(args: {
 }): string {
   if (args.hookEvent === "PostCompact") {
     markPostCompactPending(args.home, args.sessionId);
-    return formatAdditionalContextOutput("PostCompact", buildPostCompactLcmDirective());
+    return "";
   }
   if (
     args.hookEvent !== "UserPromptSubmit" &&
