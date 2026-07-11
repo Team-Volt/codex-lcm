@@ -512,6 +512,62 @@ test("incremental replay reports source-less raw Memory poisoning as invalid_pay
   reopened.close();
 });
 
+test("reopening indexed storage reads only the raw-log checkpoint fingerprint", () => {
+  const home = tempHome("codex-lcm-incremental-raw-log-");
+  const storage = createStorage({ home });
+  const events = Array.from({ length: 64 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "incremental-raw-log", cwd: "/tmp/incremental-raw-log", prompt: `raw checkpoint filler ${index}` }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+  }));
+  storage.ingestMany(events);
+  storage.close();
+
+  let bytesRead = 0;
+  const originalReadSync = fs.readSync;
+  fs.readSync = ((...args: Parameters<typeof fs.readSync>) => {
+    const result = originalReadSync(...args);
+    if (typeof result === "number") bytesRead += result;
+    return result;
+  }) as typeof fs.readSync;
+  try {
+    createStorage({ home }).close();
+  } finally {
+    fs.readSync = originalReadSync;
+  }
+  assert.equal(fs.statSync(path.join(home, "events.jsonl")).size > 4_096, true);
+  assert.equal(bytesRead <= 4_096, true, `expected checkpoint-only read, got ${bytesRead} bytes`);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("summary rebuild preserves unchanged node rows", () => {
+  const home = tempHome("codex-lcm-incremental-summary-");
+  const sessionId = "incremental-summary";
+  const storage = createStorage({ home });
+  const events = Array.from({ length: 16 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd: "/tmp/incremental-summary", prompt: `summary source ${index}` }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+  }));
+  storage.ingestMany(events);
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  const unchanged = db.prepare("SELECT rowid, node_id FROM summary_nodes WHERE session_id = ?1 AND depth = 0 ORDER BY earliest_at LIMIT 1").get(sessionId) as { rowid: number; node_id: string };
+
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd: "/tmp/incremental-summary", last_assistant_message: "latest summary outcome" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:05:00.000Z"),
+  }));
+
+  assert.equal(db.prepare("SELECT rowid FROM summary_nodes WHERE node_id = ?1").get(unchanged.node_id)?.rowid, unchanged.rowid);
+  db.close();
+  storage.close();
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("legacy Note search and packing survive raw-index fallback", () => {
   const home = tempHome();
   const storage = createStorage({ home });

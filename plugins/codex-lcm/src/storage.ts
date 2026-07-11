@@ -1,6 +1,7 @@
 // allow: SIZE_OK - legacy multi-responsibility file predates this feature; durable-memory API is 193 pure LOC and memory modules are <=188; broader splitting is an unrelated high-risk refactor.
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import { loadConfig, type LcmConfig } from "./config.ts";
@@ -297,6 +298,8 @@ const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
 const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
 const MEMORY_PROJECTION_KEY = "memory_projection_v1";
+const RAW_LOG_CHECKPOINT_KEY = "raw_log_checkpoint_v1";
+const RAW_LOG_FINGERPRINT_BYTES = 4_096;
 
 type IndexEventResult = {
   inserted: boolean;
@@ -316,6 +319,14 @@ type RawEventIdCache = {
   size: number;
   mtimeMs: number;
   eventIds: Set<string>;
+};
+
+type RawLogCheckpoint = {
+  dev: number;
+  ino: number;
+  size: number;
+  tail_sha256: string;
+  invalid_memory_events?: Record<string, number>;
 };
 
 export class LcmStorage {
@@ -414,8 +425,8 @@ export class LcmStorage {
     let rawEventIds: Set<string>;
     let indexedEventIds: Set<string>;
     try {
-      rawEventIds = this.readRawEventIds();
-      indexedEventIds = this.db ? this.knownEventIds(events.map((event) => event.event_id)) : rawEventIds;
+      indexedEventIds = this.db ? this.knownEventIds(events.map((event) => event.event_id)) : this.readRawEventIds();
+      rawEventIds = this.db && !this.indexError ? indexedEventIds : this.readRawEventIds();
     } catch (error) {
       if (this.db) {
         try {
@@ -490,6 +501,7 @@ export class LcmStorage {
         ? this.rebuildTouchedSummarySessions(touchedSessions)
         : sortedSessionIds(touchedSessions);
       if (projectBeforeAppend) this.appendRawEvents(eventsToAppend, rawEventIds);
+      if (eventsToAppend.length > 0) this.storeRawLogCheckpoint();
       this.db.exec("COMMIT");
       return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
     } catch (error) {
@@ -508,7 +520,8 @@ export class LcmStorage {
     fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
     fs.appendFileSync(this.config.rawLogPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
     for (const event of events) rawEventIds.add(event.event_id);
-    this.storeRawEventIds(rawEventIds);
+    if (this.db) this.rawEventIdCache = undefined;
+    else this.storeRawEventIds(rawEventIds);
   }
 
   private validateMemoryEventsForAppend(events: NormalizedEvent[]): void {
@@ -674,6 +687,21 @@ export class LcmStorage {
 
   private replayRawLogToIndex(): void {
     if (!this.db || !fs.existsSync(this.config.rawLogPath)) return;
+    const checkpoint = this.rawLogCheckpoint();
+    const stat = fs.statSync(this.config.rawLogPath);
+    const incremental = checkpoint && this.canResumeRawLog(checkpoint, stat)
+      ? readRawLog(this.config.rawLogPath, checkpoint.size)
+      : undefined;
+    if (checkpoint && incremental && incremental.malformedLineCount === 0) {
+      for (const [category, count] of Object.entries(checkpoint.invalid_memory_events ?? {})) {
+        this.invalidMemoryEvents.set(category, count);
+      }
+      if (incremental.events.length === 0) return;
+      if (!this.indexReplayedEvents(incremental.events)) return;
+      this.storeRawLogCheckpoint(stat);
+      return;
+    }
+
     const rawLog = readRawLog(this.config.rawLogPath);
     const rawEvents = rawLog.events;
     const indexedIds = this.indexedEventIds();
@@ -685,28 +713,43 @@ export class LcmStorage {
     }
     if (rawEvents.length === 0) {
       if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([]);
+      if (rawLog.malformedLineCount === 0) this.storeRawLogCheckpoint(stat);
       return;
     }
     if (inspection.hasMemoryEvents && !this.memoryProjectionReady()) {
       this.rebuildIndexFromRawEvents(rawEvents);
+      if (!this.indexError) this.storeRawLogCheckpoint(stat);
       return;
     }
     const hasStaleIndexedRows = [...indexedIds].some((eventId) => !inspection.rawIds.has(eventId));
     if (hasStaleIndexedRows && rawLog.malformedLineCount === 0) {
       this.rebuildIndexFromRawEvents(rawEvents);
+      if (!this.indexError) this.storeRawLogCheckpoint(stat);
       return;
     }
-    if (inspection.missingEvents.length === 0) return;
+    if (inspection.missingEvents.length === 0) {
+      this.storeRawLogCheckpoint(stat);
+      return;
+    }
+
+    if (!this.indexReplayedEvents(inspection.missingEvents)) return;
+    this.replaceInvalidMemoryEvents(inspection.invalidMemoryEvents);
+    this.storeRawLogCheckpoint(stat);
+  }
+
+  private indexReplayedEvents(events: readonly NormalizedEvent[]): boolean {
+    if (!this.db) return false;
 
     const touchedSessions = new Set<string>();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      for (const event of inspection.missingEvents) {
+      for (const event of events) {
         const result = this.indexEventInTransaction(event, { rebuildSummary: false });
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
       this.db.exec("COMMIT");
+      return true;
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
@@ -714,9 +757,40 @@ export class LcmStorage {
         // Ignore rollback failures; the original replay error is more useful.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
-    } finally {
-      this.replaceInvalidMemoryEvents(inspection.invalidMemoryEvents);
+      return false;
     }
+  }
+
+  private rawLogCheckpoint(): RawLogCheckpoint | undefined {
+    if (!this.db) return undefined;
+    const value = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(RAW_LOG_CHECKPOINT_KEY)?.value;
+    if (typeof value !== "string") return undefined;
+    try {
+      const parsed = JSON.parse(value) as Partial<RawLogCheckpoint>;
+      return typeof parsed.dev === "number" && typeof parsed.ino === "number" && typeof parsed.size === "number" && typeof parsed.tail_sha256 === "string"
+        ? parsed as RawLogCheckpoint
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private canResumeRawLog(checkpoint: RawLogCheckpoint, stat: fs.Stats): boolean {
+    if (checkpoint.dev !== stat.dev || checkpoint.ino !== stat.ino || checkpoint.size > stat.size) return false;
+    return rawLogTailHash(this.config.rawLogPath, checkpoint.size) === checkpoint.tail_sha256;
+  }
+
+  private storeRawLogCheckpoint(stat = fs.statSync(this.config.rawLogPath)): void {
+    this.db?.prepare(`
+      INSERT INTO index_metadata (key, value) VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(RAW_LOG_CHECKPOINT_KEY, JSON.stringify({
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      tail_sha256: rawLogTailHash(this.config.rawLogPath, stat.size),
+      invalid_memory_events: Object.fromEntries(this.invalidMemoryEvents),
+    } satisfies RawLogCheckpoint));
   }
 
   private rebuildIndexFromRawEvents(rawEvents: NormalizedEvent[]): void {
@@ -1663,13 +1737,17 @@ export class LcmStorage {
   }
 
   private getTopSummaryNodesForSession(sessionId: string, limit = 3): SummaryNode[] {
-    const nodes = this.getSummaryNodesForSession(sessionId, 2_000);
-    if (nodes.length === 0) return [];
-    const maxDepth = Math.max(...nodes.map((node) => node.depth));
-    return nodes
-      .filter((node) => node.depth === maxDepth)
-      .sort((a, b) => b.latest_at.localeCompare(a.latest_at))
-      .slice(0, clampLimit(limit, 3, 20));
+    if (!this.db) return [];
+    return this.db.prepare(`
+      SELECT node_id, session_id, depth, summary_text, token_count, source_token_count, source_type,
+             source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
+             cwd, repo_root, git_branch, topics_json
+      FROM summary_nodes
+      WHERE session_id = ?1
+        AND depth = (SELECT MAX(depth) FROM summary_nodes WHERE session_id = ?1)
+      ORDER BY latest_at DESC
+      LIMIT ?2
+    `).all(sessionId, clampLimit(limit, 3, 20)).map(rowToSummaryNode);
   }
 
   private getSummaryNodesForGraph(sessionId: string, limit = 50): SummaryNode[] {
@@ -2939,25 +3017,39 @@ export class LcmStorage {
   private rebuildSummaryNodes(sessionId: string): void {
     if (!this.db) return;
     const sourceEvents = this.getAllSummarySourceEventsForSession(sessionId);
-    this.db.prepare("DELETE FROM summary_node_fts WHERE session_id = ?1").run(sessionId);
-    this.db.prepare("DELETE FROM summary_nodes WHERE session_id = ?1").run(sessionId);
-    this.db.prepare("DELETE FROM graph_edges WHERE session_id = ?1 AND kind = 'summary_source'").run(sessionId);
-    if (sourceEvents.length === 0) return;
-
     let previousDepth = chunkArray(sourceEvents, SUMMARY_NODE_CHUNK_SIZE)
       .map((events) => buildLeafSummaryNode(events));
     const nodes: SummaryNode[] = [];
-    for (const node of previousDepth) this.insertSummaryNode(node);
     nodes.push(...previousDepth);
 
     for (let depth = 1; depth <= SUMMARY_NODE_MAX_DEPTH && previousDepth.length > 1; depth += 1) {
       const condensed = chunkArray(previousDepth, SUMMARY_NODE_FANOUT)
         .map((nodes) => buildCondensedSummaryNode(nodes, depth));
-      for (const node of condensed) this.insertSummaryNode(node);
       nodes.push(...condensed);
       previousDepth = condensed;
     }
-    for (const node of nodes) this.insertSummarySourceEdges(node);
+
+    const existing = new Map((this.db.prepare(`
+      SELECT node_id, summary_version FROM summary_nodes WHERE session_id = ?1
+    `).all(sessionId) as Array<{ node_id: string; summary_version: number }>)
+      .map((row) => [row.node_id, row.summary_version]));
+    const nextIds = new Set(nodes.map((node) => node.node_id));
+    const deleteFts = this.db.prepare("DELETE FROM summary_node_fts WHERE node_id = ?1");
+    const deleteNode = this.db.prepare("DELETE FROM summary_nodes WHERE node_id = ?1");
+    const deleteEdges = this.db.prepare("DELETE FROM graph_edges WHERE session_id = ?1 AND kind = 'summary_source' AND (from_node_id = ?2 OR to_node_id = ?2)");
+    for (const nodeId of existing.keys()) {
+      if (nextIds.has(nodeId)) continue;
+      deleteFts.run(nodeId);
+      deleteNode.run(nodeId);
+      deleteEdges.run(sessionId, nodeId);
+    }
+    for (const node of nodes) {
+      if (existing.get(node.node_id) === SUMMARY_NODE_VERSION) continue;
+      deleteFts.run(node.node_id);
+      deleteEdges.run(sessionId, node.node_id);
+      this.insertSummaryNode(node);
+      this.insertSummarySourceEdges(node);
+    }
   }
 
   private insertSummaryNode(node: SummaryNode): void {
@@ -3651,11 +3743,21 @@ function checkpointToMarkdown(node: GraphNode): string {
   ].join("\n");
 }
 
-function readRawLog(rawLogPath: string): { events: NormalizedEvent[]; malformedLineCount: number } {
+function readRawLog(rawLogPath: string, start = 0): { events: NormalizedEvent[]; malformedLineCount: number } {
   if (!fs.existsSync(rawLogPath)) return { events: [], malformedLineCount: 0 };
   const events: NormalizedEvent[] = [];
   let malformedLineCount = 0;
-  for (const line of fs.readFileSync(rawLogPath, "utf8").split(/\r?\n/u)) {
+  const size = fs.statSync(rawLogPath).size;
+  const buffer = Buffer.alloc(Math.max(0, size - start));
+  if (buffer.length > 0) {
+    const fd = fs.openSync(rawLogPath, "r");
+    try {
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  for (const line of buffer.toString("utf8").split(/\r?\n/u)) {
     if (line.trim().length === 0) continue;
     try {
       events.push(JSON.parse(line) as NormalizedEvent);
@@ -3664,6 +3766,20 @@ function readRawLog(rawLogPath: string): { events: NormalizedEvent[]; malformedL
     }
   }
   return { events, malformedLineCount };
+}
+
+function rawLogTailHash(rawLogPath: string, size: number): string {
+  const length = Math.min(size, RAW_LOG_FINGERPRINT_BYTES);
+  const buffer = Buffer.alloc(length);
+  if (length > 0) {
+    const fd = fs.openSync(rawLogPath, "r");
+    try {
+      fs.readSync(fd, buffer, 0, length, size - length);
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+  return createHash("sha256").update(buffer).digest("hex");
 }
 
 function readRawEvents(rawLogPath: string): NormalizedEvent[] {
