@@ -104,6 +104,7 @@ test("rebuilds durable memory projection", () => {
 
 test("searches applicable memories and omits inactive state from packs", () => {
   const home = tempHome();
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_MEMORY_ENABLED=1\n", "utf8");
   const storage = createStorage({ home });
   const sourceEventId = seedMemorySource(storage, "memory-query", "/tmp/memory-query");
   const global = storage.createMemory({
@@ -128,6 +129,7 @@ test("searches applicable memories and omits inactive state from packs", () => {
 
 test("default memory search uses repo and global scopes without cwd inside a repository", () => {
   const home = tempHome("codex-lcm-memory-default-scope-");
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_MEMORY_ENABLED=1\n", "utf8");
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "codex-lcm-memory-default-repo-"));
   assert.equal(spawnSync("git", ["init", "-q", repo]).status, 0);
   const storage = createStorage({ home });
@@ -208,6 +210,7 @@ test("projection failure leaves raw memory unchanged and permits the same expect
 
 test("packed durable memory free-form text and rationale are quoted as untrusted historical data within budget", () => {
   const home = tempHome("codex-lcm-memory-untrusted-pack-");
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_MEMORY_ENABLED=1\n", "utf8");
   const storage = createStorage({ home });
   const cwd = "/tmp/memory-untrusted-pack";
   const sourceEventId = seedMemorySource(storage, "memory-untrusted-pack", cwd);

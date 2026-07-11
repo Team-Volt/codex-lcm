@@ -104,6 +104,48 @@ test("MCP server initializes and lists LCM tools", () => {
   assert.equal(contextPlanTool.inputSchema.properties.canControlCompaction.const, false);
 });
 
+test("MCP hides durable memory unless enabled by environment or the LCM home .env", () => {
+  const home = tempHome();
+  const listRequest = { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} };
+  const callRequest = { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_search_memories", arguments: {} } };
+
+  const disabled = runMcp([listRequest, callRequest], { CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: "0" });
+  assert.equal(disabled[0].result.tools.some((tool: { name: string }) => tool.name === "lcm_search_memories"), false);
+  assert.equal(disabled[1].error.code, -32602);
+
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_MEMORY_ENABLED=1\nCODEX_LCM_MEMORY_ENABLED=0\n", "utf8");
+  const duplicateDisabled = runMcp([listRequest], { CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: undefined });
+  assert.equal(duplicateDisabled[0].result.tools.some((tool: { name: string }) => tool.name === "lcm_search_memories"), false);
+
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_MEMORY_ENABLED=true\n", "utf8");
+  const enabled = runMcp([listRequest], { CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: undefined });
+  assert.equal(enabled[0].result.tools.some((tool: { name: string }) => tool.name === "lcm_search_memories"), true);
+
+  const sourceEventId = seedMemorySource(home, "disabled-memory-pack", "/tmp/disabled-memory-pack");
+  runMcp([{ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_create_memory", arguments: {
+    sessionId: "disabled-memory-pack", cwd: "/tmp/disabled-memory-pack", text: "disabled-memory-pack-marker",
+    kind: "fact", rationale: "Verify disabled packed context.", sourceEventIds: [sourceEventId],
+  } } }], { CODEX_LCM_HOME: home });
+  const packed = runMcp([{ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "lcm_pack_context", arguments: {
+    query: "disabled-memory-pack-marker", cwd: "/tmp/disabled-memory-pack",
+  } } }], { CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: "0" });
+  assert.doesNotMatch(packed[0].result.structuredContent.markdown, /disabled-memory-pack-marker/u);
+});
+
+test("optional memory .env failures do not break unrelated CLI commands", () => {
+  const home = tempHome();
+  fs.mkdirSync(path.join(home, ".env"));
+
+  const result = runCli(["--version"], { env: { CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: undefined } });
+  const mcp = runMcp([{ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }], {
+    CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: undefined,
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^0\.2\.4$/mu);
+  assert.equal(mcp[0].result.tools.some((tool: { name: string }) => tool.name === "lcm_search_memories"), false);
+});
+
 test("MCP creates and revises durable memories", () => {
   const home = tempHome();
   const memoryId = "44444444-4444-4444-8444-444444444444";

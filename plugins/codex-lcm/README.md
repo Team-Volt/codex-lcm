@@ -114,6 +114,18 @@ The `lcm-memory` skill owns durable write policy and lifecycle guidance. It
 triggers for decisions, preferences, facts, workflows, corrections, lessons
 learned, and explicit requests to remember something.
 
+Durable memory is disabled by default. Enable it in `.env` under the LCM home,
+which defaults to `~/.codex-lcm/.env`:
+
+```sh
+CODEX_LCM_MEMORY_ENABLED=1
+```
+
+If `CODEX_LCM_HOME` is set, LCM reads `$CODEX_LCM_HOME/.env` instead. An
+explicitly set process environment variable takes precedence over the file.
+When disabled, memory tools are not exposed and packed context excludes durable
+memories; session capture and recall continue normally.
+
 ## What Is Captured
 
 Hooks capture the JSON payload Codex sends on stdin for:

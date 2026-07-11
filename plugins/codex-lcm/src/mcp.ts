@@ -1,4 +1,4 @@
-import { DEFAULT_LIMITS } from "./config.ts";
+import { DEFAULT_LIMITS, loadConfig } from "./config.ts";
 import { callMemoryTool, isMemoryTool, MEMORY_TOOLS } from "./memory-mcp.ts";
 import { createStorage } from "./storage.ts";
 
@@ -14,6 +14,7 @@ const SERVER_VERSION = "0.2.4";
 const SUPPORTED_PROTOCOL_VERSION = "2025-11-25";
 const HEADER_SEPARATOR = Buffer.from("\r\n\r\n", "utf8");
 const MAX_MESSAGE_BYTES = DEFAULT_LIMITS.maxInputBytes;
+const MEMORY_ENABLED = loadConfig().memoryEnabled;
 
 let responseFraming: "line" | "header" = "line";
 
@@ -243,7 +244,7 @@ const CORE_TOOLS = [
   },
 ];
 
-const TOOLS = CORE_TOOLS.flatMap((tool) => tool.name === "lcm_record_note"
+const TOOLS = CORE_TOOLS.flatMap((tool) => MEMORY_ENABLED && tool.name === "lcm_record_note"
   ? [...MEMORY_TOOLS, tool]
   : [tool]);
 
@@ -384,6 +385,7 @@ function handleMessage(message: JsonRpcRequest): void {
 function callTool(params: Record<string, unknown>) {
   const name = stringArg(params.name, "name");
   const args = isRecord(params.arguments) ? params.arguments : {};
+  if (!MEMORY_ENABLED && isMemoryTool(name)) throw new Error(`Unknown tool: ${name}`);
   const storage = createStorage({ readOnly: !["lcm_record_note", "lcm_create_memory", "lcm_revise_memory", "lcm_deprecate_memory", "lcm_delete_memory"].includes(name) });
   try {
     if (isMemoryTool(name)) return callMemoryTool(storage, name, args);

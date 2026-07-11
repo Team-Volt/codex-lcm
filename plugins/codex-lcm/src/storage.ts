@@ -2045,7 +2045,7 @@ export class LcmStorage {
         const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents, query });
         return { node, sourceEvents, text, compactText };
       });
-    const memoryItems = this.searchMemories({ query, cwd: args.cwd, repoRoot: args.repoRoot })
+    const memoryItems = (this.config.memoryEnabled ? this.searchMemories({ query, cwd: args.cwd, repoRoot: args.repoRoot }) : [])
       .map((memory) => ({
         memory,
         text: [

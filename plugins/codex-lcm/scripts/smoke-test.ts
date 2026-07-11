@@ -205,7 +205,7 @@ function runMcp(requests: unknown[]) {
     cwd: root,
     input: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
     encoding: "utf8",
-    env: { ...process.env, CODEX_LCM_HOME: home },
+    env: { ...process.env, CODEX_LCM_HOME: home, CODEX_LCM_MEMORY_ENABLED: "1" },
   });
   assert.equal(result.status, 0, result.stderr);
   return result.stdout

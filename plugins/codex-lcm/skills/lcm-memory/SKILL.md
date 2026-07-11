@@ -7,6 +7,9 @@ description: Use when Codex should preserve or update a durable decision, prefer
 
 Use versioned durable memories for concise state that will predictably help future sessions. Do not use them as a task log, transcript archive, or substitute for current repository evidence.
 
+If the memory MCP tools are unavailable, durable memory is disabled. Do not
+attempt memory reads or writes; continue with ordinary LCM session recall.
+
 ```json durable-memory-policy
 {
   "automatic_write": { "enabled": true, "requires": ["concise", "durable", "source_backed", "future_useful"], "trusted_authority": ["direct_user_instruction", "verified_local_evidence"] },

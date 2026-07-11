@@ -40,7 +40,7 @@ export function assertCliOk(result: ReturnType<typeof runCli>): void {
 export function runMcp(requests: unknown[], env: NodeJS.ProcessEnv = {}) {
   const result = runCli(["mcp"], {
     input: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
-    env,
+    env: { CODEX_LCM_MEMORY_ENABLED: "1", ...env },
     timeout: 5_000,
   });
   assertCliOk(result);

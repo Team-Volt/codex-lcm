@@ -178,6 +178,10 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions. The `lcm-memory` skill governs automatic durable writes, source
 linkage, search-before-create, and versioned lifecycle operations.
+Durable memory is opt-in: set `CODEX_LCM_MEMORY_ENABLED=1` in the LCM home
+`.env` (`~/.codex-lcm/.env` by default, or `$CODEX_LCM_HOME/.env`). When
+disabled, the memory tools are hidden and ordinary LCM session capture and
+recall remain available.
 
 ### v0.2.4 notes
 
