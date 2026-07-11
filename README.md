@@ -67,6 +67,7 @@ plugins/codex-lcm/
   .mcp.json                   MCP server registration
   hooks/hooks.codex.json      Codex hook registration
   skills/lcm-recall/          Codex skill for retrieval guidance
+  skills/lcm-memory/          Codex skill for durable write policy
   src/                        TypeScript implementation
   tests/                      Node test suite
 ```
@@ -81,6 +82,11 @@ Storage defaults to `~/.codex-lcm`:
 
 `events.jsonl` is the source of truth. The SQLite database is rebuildable and is
 allowed to fail without losing raw events.
+
+Durable memories are append-only `Memory` revisions in the same JSONL log. SQLite
+projects latest scoped active state for retrieval and context packing; delete writes a
+tombstone rather than physically erasing history. Memory writes fail closed when the
+index is unavailable. `lcm_record_note` remains the legacy note API.
 
 ## Privacy And Safety
 
@@ -114,7 +120,8 @@ codex plugin add codex-lcm@codex-lcm
 ```
 
 The native plugin manifest wires the MCP server, lifecycle hooks, and
-`lcm-recall` skill. No separate `codex-lcm` CLI install step is required.
+`lcm-recall` and `lcm-memory` skills. No separate `codex-lcm` CLI install step
+is required.
 
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
@@ -169,7 +176,8 @@ deterministic summaries, recursive summary-node expansion, context packing,
 health/stats diagnostics, post-compaction capture, and Codex session import
 tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
-sessions.
+sessions. The `lcm-memory` skill governs automatic durable writes, source
+linkage, search-before-create, and versioned lifecycle operations.
 
 ### v0.2.4 notes
 

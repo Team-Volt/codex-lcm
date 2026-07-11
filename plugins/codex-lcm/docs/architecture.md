@@ -18,7 +18,8 @@ Codex LCM is packaged as a native Codex plugin. The manifest at
 
 - `mcpServers`: points to `.mcp.json`, which starts `node ./bin/codex-lcm mcp`.
 - `hooks`: points to `hooks/hooks.codex.json`, which registers the lifecycle hooks.
-- `skills`: points to `skills/`, which exposes `lcm-recall`.
+- `skills`: points to `skills/`, which exposes `lcm-recall` for retrieval and
+  `lcm-memory` for durable write policy and lifecycle operations.
 
 After `codex plugin add codex-lcm@codex-lcm`, these plugin-owned resources are
 the active install surface. No separate `codex-lcm` CLI install step is needed.
@@ -57,11 +58,33 @@ Default home:
 
 `events.jsonl` is the source of truth. `index.sqlite` is derived and can be deleted or rebuilt later.
 
+Durable memories are schema-version-1 `Memory` events in the same JSONL log. Every
+revision records `source_event_ids`; creates require 1–32 same-session IDs; revises
+may inherit or explicitly clear; transitions inherit. SQLite folds them into
+`memories` and `memory_fts`, which contain only latest state. Delete appends a
+`deleted` tombstone and never erases raw history. Replay follows JSONL line order,
+skips invalid revision chains, and keeps the raw events for inspection.
+
+Create requires one to 32 same-session source event IDs. Revise inherits the current
+pointers when omitted and explicitly clears them with `[]`. Deprecate and delete
+inherit current pointers and do not accept replacements. Replay rejects source-less
+creates or cross-session Memory rows as `invalid_payload`. An explicit repo scope
+must exactly match the canonical root resolved from the write operation's cwd.
+`lcm_get_memory` pages newest revisions with `historyLimit` and `historyCursor`; each
+page returns one deduplicated event collection plus revision/source references.
+
+Memory writes require an available SQLite index, so conflicts cannot append to JSONL.
+Search defaults to active state applicable to the exact repo or cwd plus global scope.
+Packed context can include fitting active durable memories before session summaries;
+ordinary event discovery and summary generation exclude Memory text.
+
 SQLite tables:
 
 - `sessions`
 - `events`
 - `event_fts`
+- `memories`
+- `memory_fts`
 - `session_summaries`
 - `session_summary_fts`
 - `summary_nodes`

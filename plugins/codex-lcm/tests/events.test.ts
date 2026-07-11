@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizeHookEvent } from "../src/events.ts";
+import { createMemoryEvent, normalizeHookEvent } from "../src/events.ts";
 
 const fixedNow = () => new Date("2026-06-09T12:00:00.000Z");
 
@@ -122,4 +122,90 @@ test("redacts secret-shaped top-level metadata before persistence", () => {
   assert.match(event.repo_root ?? "", /Bearer \[REDACTED:token\]/u);
   assert.match(event.git_branch ?? "", /ghp_\[REDACTED:token\]/u);
   assert.equal(event.payload.tool_response, "Authorization: Bearer [REDACTED:token]");
+});
+
+test("defaults memory scope to repo and normalizes deterministic tags", () => {
+  const event = createMemoryEvent({
+    sessionId: "session-123",
+    cwd: "/tmp/repo/project",
+    text: "Use the existing migration path.",
+    kind: "decision",
+    tags: ["  UI Design  ", "ui design", "ＦＡＣＴ"],
+    rationale: "The user explicitly chose this path.",
+    sourceEventIds: ["event-1"],
+    memoryId: "11111111-1111-4111-8111-111111111111",
+    now: fixedNow,
+    repo: { repoRoot: "/tmp/repo" },
+  });
+
+  assert.equal(event.hook_event, "Memory");
+  assert.equal(event.payload.operation, "create");
+  assert.equal(event.payload.memory_id, "11111111-1111-4111-8111-111111111111");
+  assert.equal(event.payload.revision, 1);
+  assert.deepEqual(event.payload.scope, { kind: "repo", key: "/tmp/repo" });
+  assert.deepEqual(event.payload.tags, ["fact", "ui-design"]);
+});
+
+test("defaults projectless memory scope to global", () => {
+  const event = createMemoryEvent({
+    sessionId: "session-123",
+    cwd: "/tmp/projectless",
+    text: "Prefer explicit errors.",
+    kind: "lesson",
+    rationale: "Observed in the current session.",
+    sourceEventIds: ["event-1"],
+    memoryId: "22222222-2222-4222-8222-222222222222",
+    now: fixedNow,
+  });
+
+  assert.deepEqual(event.payload.scope, { kind: "global" });
+});
+
+test("rejects invalid memory fields", () => {
+  const base = {
+    sessionId: "session-123",
+    cwd: "/tmp/projectless",
+    text: "Remember this.",
+    kind: "fact",
+    rationale: "Observed in the current session.",
+    sourceEventIds: ["event-1"],
+  } as const;
+
+  assert.throws(() => createMemoryEvent({ ...base, kind: "invalid" }), /Invalid memory kind: invalid/u);
+  assert.throws(() => createMemoryEvent({ ...base, tags: ["   "] }), /Memory tag must not be empty after normalization./u);
+  assert.throws(() => createMemoryEvent({ ...base, tags: ["x".repeat(65)] }), /Memory tag exceeds 64 Unicode code points./u);
+  assert.throws(() => createMemoryEvent({ ...base, sourceEventIds: [""] }), /Memory source event ID must be a non-empty string./u);
+  assert.throws(() => createMemoryEvent({ ...base, sourceEventIds: [] }), /Memory source event IDs must not be empty./u);
+  assert.throws(
+    () => createMemoryEvent({ ...base, sourceEventIds: Array.from({ length: 33 }, (_, index) => `event-${index}`) }),
+    /Memory source event IDs exceed 32 values./u,
+  );
+  assert.throws(
+    () => createMemoryEvent({ ...base, tags: Array.from({ length: 33 }, (_, index) => `tag-${index}`) }),
+    /Memory tags exceed 32 unique values./u,
+  );
+});
+
+test("legacy note envelope remains unchanged", () => {
+  const event = normalizeHookEvent({
+    hookEvent: "Note",
+    rawInput: JSON.stringify({ session_id: "session-123", cwd: "/tmp/projectless", note: "legacy note" }),
+    env: {},
+    now: fixedNow,
+  });
+
+  assert.deepEqual(event, {
+    schema_version: 1,
+    event_id: "ce6b15eaa40e8b3af1160ca332f824791a9ef22fff8d679f5f2485f47aeb15a0",
+    timestamp: "2026-06-09T12:00:00.000Z",
+    hook_event: "Note",
+    session_id: "session-123",
+    cwd: "/tmp/projectless",
+    payload: { session_id: "session-123", cwd: "/tmp/projectless", note: "legacy note" },
+    redactions: [],
+    truncations: [],
+    raw_input_sha256: "b9f92d1c293a0f10add06842d4c5a6b48e69e037b7e2c06f9a5fc4806d4d8ddc",
+    original_bytes: 74,
+    sanitized_bytes: 127,
+  });
 });

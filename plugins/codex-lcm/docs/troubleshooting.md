@@ -52,7 +52,8 @@ Native plugin installation loads skills from:
 "skills": "./skills/"
 ```
 
-The installed skill is `lcm-recall`.
+The installed skills are `lcm-recall` for retrieval and `lcm-memory` for
+durable write policy and lifecycle operations.
 
 ## Marketplace Upgrade Says It Is Not A Git Marketplace
 
@@ -86,6 +87,10 @@ CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm stats --json
 ```
 
 If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and falls back to raw-log scanning.
+Durable memory writes are the exception: create, revise, deprecate, and delete
+fail with `Durable memory writes require an available index.` so a conflict cannot
+append an unprojectable revision. Restore or rebuild `index.sqlite` first; the
+existing append-only log remains authoritative.
 Use `stats --json` when you need aggregate hook-event, summary-depth,
 graph-count, and freshness checks without opening the SQLite database directly.
 For compaction hook verification, check `hook_event_counts.PreCompact` and

@@ -56,6 +56,14 @@ test("redacts obvious bearer and provider tokens inside strings", () => {
   assert.equal(result.redactions.length, 2);
 });
 
+test("preserves bearer terminology in skill prose", () => {
+  const text = "Bearer strings should preserve `Bearer` and redact the following token value.";
+  const result = sanitizeForStorage({ text });
+
+  assert.deepEqual(result.value, { text });
+  assert.equal(result.redactions.length, 0);
+});
+
 test("redacts secret-like assignments inside strings", () => {
   const result = sanitizeForStorage({
     env: [

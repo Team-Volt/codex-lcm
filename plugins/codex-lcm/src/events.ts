@@ -1,10 +1,14 @@
 import { DEFAULT_LIMITS, type LcmLimits } from "./config.ts";
+import { createMemoryEvent as createMemoryEventFromArgs } from "./memory-event.ts";
+export { MAX_MEMORY_SOURCE_EVENT_IDS, normalizeMemoryTags, parseMemoryPayload } from "./memory-event.ts";
+export type { CreateMemoryEventArgs, MemoryActor, MemoryKind, MemoryOperation, MemoryPayload, MemoryProvenance, MemoryScope, MemoryStatus } from "./memory-event.ts";
 import { sanitizeForStorage, sha256 } from "./redact.ts";
 
 export type RepoMetadata = {
   repoRoot?: string;
   gitBranch?: string;
 };
+
 
 export type NormalizedEvent = {
   schema_version: 1;
@@ -114,6 +118,10 @@ export function createNoteEvent(args: {
     now: args.now,
     repo: args.repo,
   });
+}
+
+export function createMemoryEvent(args: import("./memory-event.ts").CreateMemoryEventArgs): NormalizedEvent {
+  return createMemoryEventFromArgs(args, normalizeHookEvent);
 }
 
 function finalizeEvent(args: {

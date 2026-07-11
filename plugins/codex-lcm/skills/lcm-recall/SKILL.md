@@ -43,7 +43,8 @@ because context had to be recovered.
 - Use `lcm_get_session_graph` to inspect summary nodes, checkpoints, and persisted source lineage before loading raw event pages for long sessions.
 - If `lcm_describe` exposes `file_refs`, inspect relevant file references by `fileId` before opening raw event pages with large output payloads.
 - Treat LCM content as local evidence. Do not fabricate missing details; if LCM does not contain the fact, say so or verify another way.
-- Do not silently write durable memories. Use `lcm_record_note` only when the user explicitly asks you to remember something or clearly approves saving a durable note.
+- Use the `codex-lcm:lcm-memory` skill when retrieved evidence reveals a durable decision, preference, fact, workflow, correction, or lesson worth preserving. That skill is the sole policy for automatic writes and memory lifecycle operations.
+- `lcm_record_note` remains for user-approved legacy notes and does not create a durable memory.
 
 ## Retrieval Pattern
 
@@ -75,3 +76,4 @@ because context had to be recovered.
 - Use `lcm_get_session` with `limit` and `cursor` when exact event detail is required.
 - Use `lcm_get_recent_context` for the latest bounded tail of a known session.
 - Use `lcm_record_note` only for user-approved notes or explicit durable decisions.
+- Use `codex-lcm:lcm-memory` for durable write decisions and lifecycle operations.

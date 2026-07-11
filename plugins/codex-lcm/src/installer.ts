@@ -44,6 +44,7 @@ export function readStatus(options: InstallerOptions = {}) {
     mcp_configured: manualMcpConfigured || (pluginOwnedWiringAvailable && pluginDeclaresMcp && mcpManifestAvailable),
     hooks_configured: manualHooksConfigured || (pluginOwnedWiringAvailable && pluginDeclaresHooks && hookManifestAvailable),
     recall_skill_available: fs.existsSync(path.join(root, "skills", "lcm-recall", "SKILL.md")),
+    memory_skill_available: fs.existsSync(path.join(root, "skills", "lcm-memory", "SKILL.md")),
   };
 }
 

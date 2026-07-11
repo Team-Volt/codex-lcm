@@ -1,10 +1,39 @@
+// allow: SIZE_OK - legacy multi-responsibility file predates this feature; durable-memory API is 193 pure LOC and memory modules are <=188; broader splitting is an unrelated high-risk refactor.
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { loadConfig, type LcmConfig } from "./config.ts";
-import { createNoteEvent, type NormalizedEvent } from "./events.ts";
+import {
+  createMemoryEvent,
+  createNoteEvent,
+  type NormalizedEvent,
+} from "./events.ts";
 import { extractFileReferences, type FileReference } from "./file-refs.ts";
+import { resolveGitMetadata } from "./git.ts";
+import {
+  resolveMemoryScope,
+  rowToDurableMemory,
+  type CreateMemoryArgs,
+  type DurableMemory,
+  type MemoryDetail,
+  type MemoryReadArgs,
+  type MemoryRevision,
+  type MemorySearchArgs,
+  type MemorySourceContext,
+  type MemorySourceReference,
+  type MemoryTransitionArgs,
+  type ReviseMemoryArgs,
+} from "./memory-domain.ts";
+import { indexedMemorySourceContext, memoryApplies, memoryHistoryEnd, memoryHistoryLimit, memoryHistoryOffset, memoryScopeRank, memorySearchScore, memorySourceContext } from "./memory-query.ts";
+import {
+  acceptMemoryEvent,
+  foldMemoryEvents,
+  memoryRevisionFromAcceptedMemoryEvent,
+  memoryRevisions,
+  replayMemoryEvents,
+  type MemoryAcceptance,
+} from "./memory-replay.ts";
 import {
   SUMMARY_ALGORITHM_VERSION,
   SUMMARY_NODE_CHUNK_SIZE,
@@ -65,6 +94,8 @@ export type SearchSessionArgs = {
   excludeCurrentSession?: boolean;
   excludeSessionIds?: string[];
 };
+
+export type { CreateMemoryArgs, DurableMemory, MemoryDetail, MemoryRevision, MemorySearchArgs, MemorySourceContext, MemorySourceReference, MemoryTransitionArgs, ReviseMemoryArgs } from "./memory-domain.ts";
 
 type SummaryNodeSearchArgs = SearchSessionArgs & {
   sessionIds?: string[];
@@ -136,7 +167,7 @@ export type ContextPlan = {
 export type PackedContext = {
   markdown: string;
   estimated_tokens: number;
-  sources: Array<{ kind: "event" | "note" | "checkpoint" | "summary"; session_id: string; event_id?: string; node_id?: string; timestamp: string }>;
+  sources: Array<{ kind: "event" | "note" | "checkpoint" | "summary" | "memory"; session_id: string; event_id?: string; node_id?: string; memory_id?: string; timestamp: string }>;
 };
 
 export type PackContextArgs = {
@@ -145,6 +176,7 @@ export type PackContextArgs = {
   currentThreadId?: string;
   budgetTokens?: number;
   cwd?: string;
+  repoRoot?: string;
 };
 
 export type QueryExpansionSource = {
@@ -264,10 +296,18 @@ const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
 const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
+const MEMORY_PROJECTION_KEY = "memory_projection_v1";
 
 type IndexEventResult = {
   inserted: boolean;
   summaryTouched: boolean;
+};
+
+type RawReplayInspection = {
+  rawIds: Set<string>;
+  missingEvents: NormalizedEvent[];
+  hasMemoryEvents: boolean;
+  invalidMemoryEvents: Map<string, number>;
 };
 
 type SummaryRebuildStrategy = "event" | "sessions" | "deferred";
@@ -282,7 +322,9 @@ export class LcmStorage {
   readonly config: LcmConfig;
   private db?: DatabaseSync;
   private indexError?: string;
+  private readonly invalidMemoryEvents = new Map<string, number>();
   private readonly readOnly: boolean;
+  private readOnlyReplayInspected = false;
   private rawEventIdCache?: RawEventIdCache;
 
   constructor(options: StorageOptions = {}) {
@@ -298,6 +340,7 @@ export class LcmStorage {
       this.db = new DatabaseSync(this.config.indexPath, { readOnly: this.readOnly, timeout: 5_000 });
       if (!this.readOnly) {
         this.initialize();
+        this.invalidMemoryEvents.clear();
         this.replayRawLogToIndex();
         this.backfillGraph();
         this.backfillFileRefs();
@@ -335,6 +378,14 @@ export class LcmStorage {
       }
       if (!rawDurable) throw error;
       this.indexError = error instanceof Error ? error.message : String(error);
+      if (event.hook_event === "Memory") {
+        this.replayRawLogToIndex();
+        if (!this.hasEvent(event.event_id)) {
+          this.db?.close();
+          this.db = undefined;
+        }
+        throw error;
+      }
     }
   }
 
@@ -347,6 +398,9 @@ export class LcmStorage {
 
   private ingestSerialized(events: NormalizedEvent[], summaryRebuild: SummaryRebuildStrategy): IngestManyResult {
     if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
+    if (events.some((event) => event.hook_event === "Memory") && !this.db) {
+      throw new Error("Durable memory writes require an available index.");
+    }
 
     if (this.db) {
       try {
@@ -392,14 +446,27 @@ export class LcmStorage {
       eventsToIndex.push(event);
     }
 
+    try {
+      this.validateMemoryEventsForAppend(eventsToAppend);
+    } catch (error) {
+      if (this.db) {
+        try {
+          this.db.exec("ROLLBACK");
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], "Bulk ingest rollback failed after memory validation failure.");
+        }
+      }
+      throw error;
+    }
+
     if (!this.db && eventsToAppend.length === 0 && eventsToIndex.length === 0) {
       return { imported: 0, skippedDuplicate, touchedSessions: [] };
     }
 
-    if (eventsToAppend.length > 0) {
+    const projectBeforeAppend = eventsToAppend.some((event) => event.hook_event === "Memory");
+    if (eventsToAppend.length > 0 && !projectBeforeAppend) {
       try {
-        fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
-        fs.appendFileSync(this.config.rawLogPath, `${eventsToAppend.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+        this.appendRawEvents(eventsToAppend, rawEventIds);
       } catch (error) {
         if (this.db) {
           try {
@@ -410,10 +477,6 @@ export class LcmStorage {
         }
         throw error;
       }
-      for (const event of eventsToAppend) {
-        rawEventIds.add(event.event_id);
-      }
-      this.storeRawEventIds(rawEventIds);
     }
     if (!this.db) return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
 
@@ -426,18 +489,58 @@ export class LcmStorage {
       const rebuiltSessions = summaryRebuild === "sessions"
         ? this.rebuildTouchedSummarySessions(touchedSessions)
         : sortedSessionIds(touchedSessions);
+      if (projectBeforeAppend) this.appendRawEvents(eventsToAppend, rawEventIds);
       this.db.exec("COMMIT");
       return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
     } catch (error) {
       let failure = error;
       try {
         this.db.exec("ROLLBACK");
-      } catch (rollbackError) {
+      } catch (rollbackError) { // no-excuse-ok: catch - preserve the index failure with its rollback failure.
         failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
       }
       this.indexError = failure instanceof Error ? failure.message : String(failure);
       throw failure;
     }
+  }
+
+  private appendRawEvents(events: readonly NormalizedEvent[], rawEventIds: Set<string>): void {
+    fs.mkdirSync(path.dirname(this.config.rawLogPath), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(this.config.rawLogPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+    for (const event of events) rawEventIds.add(event.event_id);
+    this.storeRawEventIds(rawEventIds);
+  }
+
+  private validateMemoryEventsForAppend(events: NormalizedEvent[]): void {
+    const staged = new Map<string, DurableMemory>();
+    const batchSources = new Map<string, NormalizedEvent>();
+    for (const event of events) {
+      if (event.hook_event === "Memory") {
+        const accepted = acceptMemoryEvent(event, {
+          currentMemory: (memoryId) => staged.get(memoryId) ?? this.getLatestMemory(memoryId),
+          sourceEvent: (eventId) => batchSources.get(eventId) ?? this.memorySourceInIndex(eventId),
+        });
+        if (!accepted.accepted) throw this.memoryAppendError(accepted);
+        staged.set(accepted.memory.memory_id, accepted.memory);
+        continue;
+      }
+      batchSources.set(event.event_id, event);
+    }
+  }
+
+  private memoryAppendError(accepted: Exclude<MemoryAcceptance, { readonly accepted: true }>): Error {
+    const payload = accepted.payload;
+    if (accepted.reason === "lineage") return new Error("Memory source event must exist in session.");
+    if (payload?.operation === "create" && accepted.current) {
+      return new Error(`Memory already exists: ${payload.memory_id}.`);
+    }
+    if (payload && payload.operation !== "create" && !accepted.current && accepted.category === "gap") {
+      return new Error(`Memory not found: ${payload.memory_id}`);
+    }
+    if (accepted.category === "stale_expected_revision" && payload?.expected_revision !== undefined && accepted.current) {
+      return new Error(`Memory revision conflict: expected ${payload.expected_revision}, current ${accepted.current.revision}.`);
+    }
+    return new Error(`Invalid Memory event: ${accepted.category}.`);
   }
 
   private readRawEventIds(): Set<string> {
@@ -495,7 +598,7 @@ export class LcmStorage {
       let rollbackError: unknown;
       try {
         this.db.exec("ROLLBACK");
-      } catch (caught) {
+      } catch (caught) { // no-excuse-ok: catch - report the completed rebuild failure after rollback recovery.
         rollbackError = caught;
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -505,6 +608,7 @@ export class LcmStorage {
   }
 
   health(): Health {
+    this.inspectReadOnlyReplay();
     if (!this.db) return this.rawHealth();
     try {
       return {
@@ -514,7 +618,7 @@ export class LcmStorage {
         raw_log_exists: fs.existsSync(this.config.rawLogPath),
         index_exists: fs.existsSync(this.config.indexPath),
         index_available: true,
-        ...(this.indexError ? { index_error: this.indexError } : {}),
+        ...(this.indexError ?? this.memoryReplayError() ? { index_error: this.indexError ?? this.memoryReplayError() } : {}),
         event_count: Number(this.scalar("SELECT COUNT(*) AS count FROM events")),
         session_count: Number(this.scalar("SELECT COUNT(*) AS count FROM sessions")),
         graph_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_nodes")),
@@ -526,7 +630,7 @@ export class LcmStorage {
       this.indexError = error instanceof Error ? error.message : String(error);
       try {
         this.db.close();
-      } catch {
+      } catch { // no-excuse-ok: catch - the storage is intentionally discarded for raw-log fallback.
         // Ignore close errors while degrading to raw JSONL health.
       }
       this.db = undefined;
@@ -543,10 +647,29 @@ export class LcmStorage {
       raw_log_exists: fs.existsSync(this.config.rawLogPath),
       index_exists: fs.existsSync(this.config.indexPath),
       index_available: false,
-      ...(this.indexError ? { index_error: this.indexError } : {}),
+      ...(this.indexError ?? this.memoryReplayError() ? { index_error: this.indexError ?? this.memoryReplayError() } : {}),
       event_count: rawEvents.length,
       session_count: summarizeSessions(rawEvents).length,
     };
+  }
+
+  private inspectReadOnlyReplay(): void {
+    if (!this.readOnly || this.readOnlyReplayInspected) return;
+    this.readOnlyReplayInspected = true;
+    if (!fs.existsSync(this.config.rawLogPath)) return;
+    const rawLog = readRawLog(this.config.rawLogPath);
+    this.replaceInvalidMemoryEvents(this.inspectRawReplay(rawLog.events, this.indexedEventIds()).invalidMemoryEvents);
+  }
+
+  private memoryReplayError(): string | undefined {
+    if (this.invalidMemoryEvents.size === 0) return undefined;
+    const categories = [...this.invalidMemoryEvents.entries()]
+      .filter(([, count]) => count > 0)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([category, count]) => `${category}=${count}`)
+      .join(", ");
+    const count = [...this.invalidMemoryEvents.values()].reduce((total, value) => total + value, 0);
+    return `Ignored ${count} invalid Memory events during replay (${categories}).`;
   }
 
   private replayRawLogToIndex(): void {
@@ -554,6 +677,8 @@ export class LcmStorage {
     const rawLog = readRawLog(this.config.rawLogPath);
     const rawEvents = rawLog.events;
     const indexedIds = this.indexedEventIds();
+    const inspection = this.inspectRawReplay(rawEvents, indexedIds);
+    this.replaceInvalidMemoryEvents(inspection.invalidMemoryEvents);
     if (rawLog.malformedLineCount > 0) {
       const noun = rawLog.malformedLineCount === 1 ? "line" : "lines";
       this.indexError = `Raw JSONL contains ${rawLog.malformedLineCount} malformed ${noun}; destructive index reconciliation is disabled until the log is repaired.`;
@@ -562,19 +687,21 @@ export class LcmStorage {
       if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([]);
       return;
     }
-    const rawIds = new Set(rawEvents.map((event) => event.event_id));
-    const hasStaleIndexedRows = [...indexedIds].some((eventId) => !rawIds.has(eventId));
+    if (inspection.hasMemoryEvents && !this.memoryProjectionReady()) {
+      this.rebuildIndexFromRawEvents(rawEvents);
+      return;
+    }
+    const hasStaleIndexedRows = [...indexedIds].some((eventId) => !inspection.rawIds.has(eventId));
     if (hasStaleIndexedRows && rawLog.malformedLineCount === 0) {
       this.rebuildIndexFromRawEvents(rawEvents);
       return;
     }
-    const missingEvents = rawEvents.filter((event) => !indexedIds.has(event.event_id));
-    if (missingEvents.length === 0) return;
+    if (inspection.missingEvents.length === 0) return;
 
     const touchedSessions = new Set<string>();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      for (const event of missingEvents) {
+      for (const event of inspection.missingEvents) {
         const result = this.indexEventInTransaction(event, { rebuildSummary: false });
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
@@ -583,15 +710,19 @@ export class LcmStorage {
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
-      } catch {
+      } catch { // no-excuse-ok: catch - retain the primary replay failure for health reporting.
         // Ignore rollback failures; the original replay error is more useful.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.replaceInvalidMemoryEvents(inspection.invalidMemoryEvents);
     }
   }
 
   private rebuildIndexFromRawEvents(rawEvents: NormalizedEvent[]): void {
     if (!this.db) return;
+    const inspection = this.inspectRawReplay(rawEvents, new Set());
+    this.replaceInvalidMemoryEvents(inspection.invalidMemoryEvents);
     const touchedSessions = new Set<string>();
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -600,22 +731,27 @@ export class LcmStorage {
         const result = this.indexEventInTransaction(event, { rebuildSummary: false });
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
+      if (inspection.hasMemoryEvents) this.markMemoryProjectionReady();
       this.rebuildTouchedSummarySessions(touchedSessions);
       this.db.exec("COMMIT");
     } catch (error) {
       let rollbackError: unknown;
       try {
         this.db.exec("ROLLBACK");
-      } catch (caught) {
+      } catch (caught) { // no-excuse-ok: catch - preserve the primary rebuild failure after rollback recovery.
         rollbackError = caught;
       }
       const message = error instanceof Error ? error.message : String(error);
       this.indexError = rollbackError === undefined ? message : `${message}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+    } finally {
+      this.replaceInvalidMemoryEvents(inspection.invalidMemoryEvents);
     }
   }
 
   private clearDerivedIndex(): void {
     if (!this.db) return;
+    this.db.prepare("DELETE FROM memory_fts").run();
+    this.db.prepare("DELETE FROM memories").run();
     this.db.prepare("DELETE FROM summary_node_fts").run();
     this.db.prepare("DELETE FROM session_summary_fts").run();
     this.db.prepare("DELETE FROM event_fts").run();
@@ -1001,7 +1137,7 @@ export class LcmStorage {
       this.indexError = error instanceof Error ? error.message : String(error);
       try {
         this.db?.close();
-      } catch {
+      } catch { // no-excuse-ok: catch - context planning intentionally falls back to raw JSONL.
         // Ignore close errors while degrading to raw JSONL context planning.
       }
       this.db = undefined;
@@ -1061,6 +1197,192 @@ export class LcmStorage {
     });
     this.ingest(event);
     return event;
+  }
+
+  createMemory(args: CreateMemoryArgs): DurableMemory {
+    const scope = args.scope === undefined ? undefined : resolveMemoryScope(args.cwd, args.scope);
+    const event = createMemoryEvent({
+      sessionId: args.sessionId,
+      cwd: args.cwd,
+      text: args.text,
+      kind: args.kind,
+      tags: args.tags,
+      scope,
+      sourceEventIds: args.sourceEventIds,
+      rationale: args.rationale,
+      memoryId: args.memoryId,
+      repo: scope?.kind === "repo" ? { repoRoot: scope.key } : undefined,
+    });
+    this.ingest(event);
+    return this.requireMemory(String(event.payload.memory_id));
+  }
+
+  reviseMemory(args: ReviseMemoryArgs): DurableMemory {
+    if (!this.db) throw new Error("Durable memory writes require an available index.");
+    const current = this.requireMemory(args.memoryId, args.cwd);
+    const scope = args.scope === undefined ? current.scope : resolveMemoryScope(args.cwd, args.scope);
+    const event = createMemoryEvent({
+      operation: "revise",
+      sessionId: args.sessionId,
+      cwd: args.cwd,
+      text: args.text,
+      kind: args.kind ?? current.kind,
+      tags: args.tags ?? current.tags,
+      scope,
+      sourceEventIds: args.sourceEventIds ?? current.source_event_ids,
+      rationale: args.reason,
+      reason: args.reason,
+      expectedRevision: args.expectedRevision,
+      revision: current.revision + 1,
+      memoryId: args.memoryId,
+      repo: scope.kind === "repo" ? { repoRoot: scope.key } : undefined,
+    });
+    this.ingest(event);
+    return this.requireMemory(args.memoryId);
+  }
+
+  deprecateMemory(args: MemoryTransitionArgs): DurableMemory {
+    return this.transitionMemory("deprecate", args);
+  }
+
+  deleteMemory(args: MemoryTransitionArgs): DurableMemory {
+    return this.transitionMemory("delete", args);
+  }
+
+  private transitionMemory(operation: "deprecate" | "delete", args: MemoryTransitionArgs): DurableMemory {
+    if (!this.db) throw new Error("Durable memory writes require an available index.");
+    const current = this.requireMemory(args.memoryId, args.cwd);
+    const event = createMemoryEvent({
+      operation,
+      sessionId: args.sessionId,
+      cwd: args.cwd,
+      kind: current.kind,
+      tags: current.tags,
+      scope: current.scope,
+      sourceEventIds: current.source_event_ids,
+      rationale: args.reason,
+      reason: args.reason,
+      expectedRevision: args.expectedRevision,
+      revision: current.revision + 1,
+      memoryId: args.memoryId,
+      repo: current.scope.kind === "repo" ? { repoRoot: current.scope.key } : undefined,
+    });
+    this.ingest(event);
+    return this.requireMemory(args.memoryId);
+  }
+
+  searchMemories(args: MemorySearchArgs = {}): DurableMemory[] {
+    const query = args.query?.trim().toLocaleLowerCase() ?? "";
+    const cwd = args.cwd === undefined ? undefined : path.resolve(args.cwd);
+    const repoRoot = this.resolveMemoryReadRepoRoot(cwd, args.repoRoot);
+    const defaultScopeKinds: DurableMemory["scope"]["kind"][] = repoRoot ? ["repo", "global"] : cwd ? ["cwd", "global"] : ["global"];
+    const scopeKinds = args.scopeKinds ? defaultScopeKinds.filter((kind) => args.scopeKinds?.includes(kind)) : defaultScopeKinds;
+    const allowedStatuses = new Set(args.statuses ?? ["active"]);
+    const allowedKinds = args.kinds ? new Set(args.kinds) : undefined;
+    const requiredTags = args.tags ? new Set(args.tags.map((tag) => tag.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/gu, "-"))) : undefined;
+    const accepts = (memory: DurableMemory): boolean =>
+      allowedStatuses.has(memory.status)
+      && memoryApplies(memory, cwd, repoRoot, scopeKinds)
+      && (!allowedKinds || allowedKinds.has(memory.kind))
+      && (!requiredTags || [...requiredTags].every((tag) => memory.tags.includes(tag)))
+      && (query.length === 0 || memorySearchScore(memory, query) > 0);
+    let memories: DurableMemory[] | IterableIterator<DurableMemory>;
+    if (this.db && this.hasMemoryProjection() && query.length > 0) {
+      const statement = this.db.prepare(`
+        SELECT m.memory_id, m.revision_event_id, m.session_id, m.updated_at, m.revision, m.kind, m.scope_kind, m.scope_key,
+               m.status, m.text, m.tags_json, m.provenance_json, m.source_event_ids_json
+        FROM memory_fts f JOIN memories m ON m.memory_id = f.memory_id
+        WHERE memory_fts MATCH ?1
+      `);
+      memories = [];
+      for (const ftsQuery of toFtsQueries(query)) {
+        const matches = statement.all(ftsQuery).map(rowToDurableMemory).filter(accepts);
+        if (matches.length > 0) {
+          memories = matches;
+          break;
+        }
+      }
+    } else if (this.db && this.hasMemoryProjection()) {
+      memories = this.db.prepare(`
+          SELECT memory_id, revision_event_id, session_id, updated_at, revision, kind, scope_kind, scope_key,
+                 status, text, tags_json, provenance_json, source_event_ids_json
+          FROM memories
+        `).all().map(rowToDurableMemory);
+    } else {
+      memories = foldMemoryEvents(readRawEvents(this.config.rawLogPath)).values();
+    }
+    const all = Array.isArray(memories) ? memories : [...memories];
+    return all
+      .filter(accepts)
+      .sort((left, right) => memoryScopeRank(right, cwd, repoRoot) - memoryScopeRank(left, cwd, repoRoot)
+        || memorySearchScore(right, query) - memorySearchScore(left, query)
+        || right.updated_at.localeCompare(left.updated_at)
+        || left.memory_id.localeCompare(right.memory_id))
+      .slice(0, clampLimit(args.limit, 10));
+  }
+
+  getMemory(memoryId: string, args: MemoryReadArgs = {}): MemoryDetail {
+    let rawEvents: NormalizedEvent[] | undefined;
+    const indexedMemory = this.getLatestMemory(memoryId);
+    const memory = indexedMemory ?? foldMemoryEvents(rawEvents = readRawEvents(this.config.rawLogPath)).get(memoryId);
+    if (!memory) throw new Error(`Memory not found: ${memoryId}`);
+    const cwd = args.cwd === undefined ? undefined : path.resolve(args.cwd);
+    const repoRoot = this.resolveMemoryReadRepoRoot(cwd, args.repoRoot);
+    if (memory.scope.kind !== "global" && !memoryApplies(memory, cwd, repoRoot, undefined)) {
+      throw new Error("Memory is not accessible from the requested scope.");
+    }
+    const indexedHistory = this.getIndexedMemoryRevisions(memoryId, memory, args.historyLimit, args.historyCursor);
+    const history = indexedHistory?.revisions ?? memoryRevisions(rawEvents ??= readRawEvents(this.config.rawLogPath), memoryId);
+    const legacyHistoryEnd = memoryHistoryEnd(args.historyCursor, history.length);
+    const legacyHistoryStart = Math.max(0, legacyHistoryEnd - memoryHistoryLimit(args.historyLimit));
+    const revisions = indexedHistory?.revisions ?? history.slice(legacyHistoryStart, legacyHistoryEnd);
+    const includeContext = args.includeContext ?? true;
+    return {
+      memory,
+      revisions,
+      source_context: includeContext
+        ? indexedHistory && this.db
+          ? indexedMemorySourceContext(this.db, revisions, args.before, args.after)
+          : memorySourceContext(revisions, rawEvents ??= readRawEvents(this.config.rawLogPath), args.before, args.after)
+        : { events: [], sources: [] },
+      ...(indexedHistory?.nextCursor !== undefined ? { next_history_cursor: indexedHistory.nextCursor } : legacyHistoryStart > 0 ? { next_history_cursor: String(legacyHistoryStart) } : {}),
+    };
+  }
+
+  private resolveMemoryReadRepoRoot(cwd: string | undefined, repoRoot: string | undefined): string | undefined {
+    const suppliedRepoRoot = repoRoot === undefined ? undefined : path.resolve(repoRoot);
+    if (!cwd) return suppliedRepoRoot === undefined ? undefined : resolveGitMetadata(suppliedRepoRoot).repoRoot ?? suppliedRepoRoot;
+    const canonicalRepoRoot = resolveGitMetadata(cwd).repoRoot;
+    if (suppliedRepoRoot !== undefined && (!canonicalRepoRoot || suppliedRepoRoot !== canonicalRepoRoot)) {
+      throw new Error("repoRoot must equal the canonical repository root resolved from cwd.");
+    }
+    return canonicalRepoRoot;
+  }
+
+  private getIndexedMemoryRevisions(memoryId: string, memory: DurableMemory, limit: number | undefined, cursor: string | undefined): { revisions: MemoryRevision[]; nextCursor?: string } | undefined {
+    if (!this.db || !this.memoryProjectionReady()) return undefined;
+    const historyLimit = memoryHistoryLimit(limit);
+    const offset = memoryHistoryOffset(cursor);
+    const rows = this.db.prepare(`
+      SELECT raw_json FROM events
+      WHERE memory_id = ?1
+      ORDER BY memory_revision DESC, timestamp DESC, rowid DESC
+      LIMIT ?2 OFFSET ?3
+    `).all(memoryId, historyLimit + 1, offset) as Array<{ raw_json: string }>;
+    const page = rows.slice(0, historyLimit).flatMap((row) => {
+      const revision = memoryRevisionFromAcceptedMemoryEvent(JSON.parse(row.raw_json) as NormalizedEvent, memory);
+      return revision ? [revision] : [];
+    }).reverse();
+    return { revisions: page, ...(rows.length > historyLimit ? { nextCursor: String(offset + historyLimit) } : {}) };
+  }
+
+  private requireMemory(memoryId: string, cwd?: string): DurableMemory {
+    const memory = this.getLatestMemory(memoryId);
+    if (!memory) throw new Error(`Memory not found: ${memoryId}`);
+    if (cwd !== undefined && !memoryApplies(memory, cwd, resolveGitMetadata(cwd).repoRoot, undefined)) {
+      throw new Error("Memory is not accessible from the operation scope.");
+    }
+    return memory;
   }
 
   getSessionMemorySummary(sessionId: string): SessionMemorySummary | undefined {
@@ -1512,6 +1834,7 @@ export class LcmStorage {
   }
 
   packContext(args: PackContextArgs = {}): PackedContext {
+    this.resolveMemoryReadRepoRoot(args.cwd, args.repoRoot);
     const budgetTokens = Math.max(16, args.budgetTokens ?? 1200);
     const budgetChars = budgetTokens * 4;
     const summaryCandidates = new Map<string, SessionMemorySummary>();
@@ -1644,6 +1967,23 @@ export class LcmStorage {
         const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents, query });
         return { node, sourceEvents, text, compactText };
       });
+    const memoryItems = this.searchMemories({ query, cwd: args.cwd, repoRoot: args.repoRoot })
+      .map((memory) => ({
+        memory,
+        text: [
+          `- [${memory.kind}] ${HISTORICAL_SOURCE_TEXT_NOTICE}`,
+          quoteHistoricalText(memory.text),
+          `  scope: ${memory.scope.kind}${memory.scope.kind === "global" ? "" : `:${memory.scope.key}`} | tags: ${memory.tags.join(", ") || "none"} | revision: ${memory.revision}`,
+          `  provenance: ${memory.provenance.actor}:\n${quoteHistoricalText(memory.provenance.rationale)}`,
+        ].join("\n"),
+      }));
+    const rawNoteItems = this.db ? [] : readRawEvents(this.config.rawLogPath)
+      .filter((event) => event.hook_event === "Note")
+      .filter((event) => !args.cwd || event.cwd === args.cwd)
+      .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
+      .filter((event) => query.length === 0 || matchesQueryText(eventSearchText(event), query))
+      .slice(0, 10)
+      .map((event) => ({ event, text: `- ${String(event.payload.note ?? eventSearchText(event))}` }));
 
     const addCheckpointItems = () => {
       for (const { checkpoint, text } of checkpointItems) {
@@ -1676,6 +2016,56 @@ export class LcmStorage {
       }
     };
 
+    const addMemoryItems = () => {
+      if (memoryItems.length === 0) return;
+      const header = "## Durable Memories\n";
+      const accepted: typeof memoryItems = [];
+      let memoryChars = header.length;
+      for (const item of memoryItems) {
+        if (chars + memoryChars + item.text.length + 1 > budgetChars) continue;
+        accepted.push(item);
+        memoryChars += item.text.length + 1;
+      }
+      if (accepted.length === 0) return;
+      lines.push(header.trimEnd());
+      chars += header.length;
+      for (const { memory, text } of accepted) {
+        lines.push(text);
+        chars += text.length + 1;
+        sources.push({
+          kind: "memory",
+          memory_id: memory.memory_id,
+          session_id: memory.session_id,
+          event_id: memory.revision_event_id,
+          timestamp: memory.updated_at,
+        });
+      }
+      lines.push("");
+      chars += 1;
+    };
+
+    const addRawNoteItems = () => {
+      if (rawNoteItems.length === 0) return;
+      const header = "## Notes\n";
+      const accepted: typeof rawNoteItems = [];
+      let noteChars = header.length;
+      for (const item of rawNoteItems) {
+        if (chars + noteChars + item.text.length + 1 > budgetChars) continue;
+        accepted.push(item);
+        noteChars += item.text.length + 1;
+      }
+      if (accepted.length === 0) return;
+      lines.push(header.trimEnd());
+      chars += header.length;
+      for (const { event, text } of accepted) {
+        lines.push(text);
+        chars += text.length + 1;
+        sources.push({ kind: "note", session_id: event.session_id, event_id: event.event_id, timestamp: event.timestamp });
+      }
+      lines.push("");
+      chars += 1;
+    };
+
     const addSummaryNodeItems = () => {
       for (const { node, sourceEvents, text, compactText } of summaryNodeItems) {
         const remainingChars = budgetChars - chars;
@@ -1705,15 +2095,11 @@ export class LcmStorage {
       }
     };
 
-    if (query.length > 0) {
-      addSummaryNodeItems();
-      addSummaryItems();
-      addCheckpointItems();
-    } else {
-      addSummaryNodeItems();
-      addSummaryItems();
-      addCheckpointItems();
-    }
+    addRawNoteItems();
+    addSummaryNodeItems();
+    addMemoryItems();
+    addSummaryItems();
+    addCheckpointItems();
 
     return {
       markdown: lines.join("\n"),
@@ -1745,6 +2131,8 @@ export class LcmStorage {
         git_branch TEXT,
         turn_id TEXT,
         tool_use_id TEXT,
+        memory_id TEXT,
+        memory_revision INTEGER,
         text TEXT NOT NULL,
         raw_json TEXT NOT NULL
       );
@@ -1755,6 +2143,30 @@ export class LcmStorage {
         repo_root,
         hook_event,
         content
+      );
+      CREATE TABLE IF NOT EXISTS memories (
+        memory_id TEXT PRIMARY KEY,
+        revision_event_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        scope_kind TEXT NOT NULL,
+        scope_key TEXT,
+        status TEXT NOT NULL,
+        text TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        source_event_ids_json TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+        memory_id UNINDEXED,
+        text,
+        tags,
+        kind,
+        scope_kind,
+        scope_key,
+        status
       );
       CREATE TABLE IF NOT EXISTS graph_nodes (
         node_id TEXT PRIMARY KEY,
@@ -1856,15 +2268,19 @@ export class LcmStorage {
       CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_latest ON summary_nodes(session_id, latest_at);
       CREATE INDEX IF NOT EXISTS idx_file_refs_session_time ON file_refs(session_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_file_refs_path ON file_refs(path);
+      CREATE INDEX IF NOT EXISTS idx_memories_scope_status_updated ON memories(scope_kind, scope_key, status, updated_at DESC);
     `);
     this.ensureColumn("events", "turn_id", "TEXT");
     this.ensureColumn("events", "tool_use_id", "TEXT");
+    this.ensureColumn("events", "memory_id", "TEXT");
+    this.ensureColumn("events", "memory_revision", "INTEGER");
     this.ensureColumn("session_summaries", "summary_version", "INTEGER");
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_events_session_turn ON events(session_id, turn_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_tool_use ON events(session_id, tool_use_id, hook_event, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_session_hook_time ON events(session_id, hook_event, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_session_time ON events(session_id, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_events_memory_history ON events(memory_id, memory_revision DESC, timestamp DESC);
     `);
   }
 
@@ -1875,8 +2291,8 @@ export class LcmStorage {
     const metadata = extractEventMetadata(event);
     const insert = this.db.prepare(`
       INSERT OR IGNORE INTO events
-        (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, text, raw_json)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, memory_id, memory_revision, text, raw_json)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10, ?11)
     `).run(
       event.event_id,
       event.session_id,
@@ -1909,17 +2325,21 @@ export class LcmStorage {
       event.repo_root ?? null,
       event.git_branch ?? null,
     );
+    if (event.hook_event === "Memory") {
+      this.projectMemoryEvent(event);
+      return { inserted: true, summaryTouched: false };
+    }
     this.db.prepare(`
-      INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-    `).run(
-      event.event_id,
-      event.session_id,
-      event.cwd,
-      event.repo_root ?? "",
-      event.hook_event,
-      text,
-    );
+        INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      `).run(
+        event.event_id,
+        event.session_id,
+        event.cwd,
+        event.repo_root ?? "",
+        event.hook_event,
+        text,
+      );
     const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
     const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
     this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
@@ -1929,6 +2349,121 @@ export class LcmStorage {
       this.rebuildSessionMemorySummary(event.session_id);
     }
     return { inserted: true, summaryTouched };
+  }
+
+  private projectMemoryEvent(event: NormalizedEvent): void {
+    const accepted = acceptMemoryEvent(event, {
+      currentMemory: (memoryId) => this.getLatestMemory(memoryId),
+      sourceEvent: (eventId) => this.memorySourceInIndex(eventId),
+    });
+    if (!accepted.accepted) {
+      this.countInvalidMemory(accepted.category);
+      return;
+    }
+    const next = accepted.memory;
+    this.db?.prepare(`
+      INSERT INTO memories
+        (memory_id, revision_event_id, session_id, updated_at, revision, kind, scope_kind, scope_key,
+         status, text, tags_json, provenance_json, source_event_ids_json)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+      ON CONFLICT(memory_id) DO UPDATE SET
+        revision_event_id = excluded.revision_event_id,
+        session_id = excluded.session_id,
+        updated_at = excluded.updated_at,
+        revision = excluded.revision,
+        kind = excluded.kind,
+        scope_kind = excluded.scope_kind,
+        scope_key = excluded.scope_key,
+        status = excluded.status,
+        text = excluded.text,
+        tags_json = excluded.tags_json,
+        provenance_json = excluded.provenance_json,
+        source_event_ids_json = excluded.source_event_ids_json
+    `).run(
+      next.memory_id,
+      next.revision_event_id,
+      next.session_id,
+      next.updated_at,
+      next.revision,
+      next.kind,
+      next.scope.kind,
+      next.scope.kind === "global" ? null : next.scope.key,
+      next.status,
+      next.text,
+      JSON.stringify(next.tags),
+      JSON.stringify(next.provenance),
+      JSON.stringify(next.source_event_ids),
+    );
+    this.db?.prepare("UPDATE events SET memory_id = ?1, memory_revision = ?2 WHERE event_id = ?3").run(next.memory_id, next.revision, event.event_id);
+    this.markMemoryProjectionReady();
+    this.db?.prepare("DELETE FROM memory_fts WHERE memory_id = ?1").run(next.memory_id);
+    this.db?.prepare(`
+      INSERT INTO memory_fts (memory_id, text, tags, kind, scope_kind, scope_key, status)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+    `).run(
+      next.memory_id,
+      next.text,
+      next.tags.join(" "),
+      next.kind,
+      next.scope.kind,
+      next.scope.kind === "global" ? "" : next.scope.key,
+      next.status,
+    );
+  }
+
+  private inspectRawReplay(events: readonly NormalizedEvent[], indexedIds: ReadonlySet<string>): RawReplayInspection {
+    const rawIds = new Set<string>();
+    const missingEvents: NormalizedEvent[] = [];
+    for (const event of events) {
+      rawIds.add(event.event_id);
+      if (!indexedIds.has(event.event_id)) missingEvents.push(event);
+    }
+    const replay = replayMemoryEvents(events);
+    return {
+      rawIds,
+      missingEvents,
+      hasMemoryEvents: events.some((event) => event.hook_event === "Memory"),
+      invalidMemoryEvents: replay.invalidMemoryEvents,
+    };
+  }
+
+  private replaceInvalidMemoryEvents(counts: ReadonlyMap<string, number>): void {
+    this.invalidMemoryEvents.clear();
+    for (const [category, count] of counts) this.invalidMemoryEvents.set(category, count);
+  }
+
+  private memorySourceInIndex(eventId: string): NormalizedEvent | undefined {
+    if (!this.db) return undefined;
+    const row = this.db.prepare("SELECT raw_json FROM events WHERE event_id = ?1").get(eventId) as { raw_json?: string } | undefined;
+    return row?.raw_json === undefined ? undefined : JSON.parse(row.raw_json) as NormalizedEvent;
+  }
+
+  private countInvalidMemory(category: string): void {
+    this.invalidMemoryEvents.set(category, (this.invalidMemoryEvents.get(category) ?? 0) + 1);
+  }
+
+  private getLatestMemory(memoryId: string): DurableMemory | undefined {
+    if (!this.db || !this.hasMemoryProjection()) return undefined;
+    const row = this.db.prepare(`
+      SELECT memory_id, revision_event_id, session_id, updated_at, revision, kind, scope_kind, scope_key,
+             status, text, tags_json, provenance_json, source_event_ids_json
+      FROM memories WHERE memory_id = ?1
+    `).get(memoryId);
+    return row ? rowToDurableMemory(row) : undefined;
+  }
+
+  private hasMemoryProjection(): boolean {
+    return this.db?.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = 'memories' LIMIT 1").get() !== undefined
+      && this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'memory_fts' LIMIT 1").get() !== undefined;
+  }
+
+  private memoryProjectionReady(): boolean {
+    return this.hasMemoryProjection()
+      && this.db?.prepare("SELECT value FROM index_metadata WHERE key = ?1 LIMIT 1").get(MEMORY_PROJECTION_KEY)?.value === "2";
+  }
+
+  private markMemoryProjectionReady(): void {
+    this.db?.prepare("INSERT INTO index_metadata (key, value) VALUES (?1, '2') ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(MEMORY_PROJECTION_KEY);
   }
 
   private indexGraphForEvent(event: NormalizedEvent, eventCount: number, currentRowId = 0): void {
@@ -2217,7 +2752,7 @@ export class LcmStorage {
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
-      } catch {
+      } catch { // no-excuse-ok: catch - retain the primary graph-backfill failure for health reporting.
         // Ignore rollback failures; the original backfill error is more useful.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
@@ -2258,7 +2793,7 @@ export class LcmStorage {
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
-      } catch {
+      } catch { // no-excuse-ok: catch - retain the primary file-reference backfill failure for health reporting.
         // Ignore rollback failures; the original backfill error is more useful.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
@@ -2295,7 +2830,7 @@ export class LcmStorage {
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
-      } catch {
+      } catch { // no-excuse-ok: catch - retain the primary summary-backfill failure for health reporting.
         // Ignore rollback failures; the original backfill error is more useful.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
@@ -2964,9 +3499,9 @@ function rowToGraphEdge(row: unknown): GraphEdge {
 function parseMetadata(value: unknown): Record<string, unknown> {
   if (typeof value !== "string") return {};
   try {
-    const parsed = JSON.parse(value) as unknown;
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
-  } catch {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? Object.fromEntries(Object.entries(parsed)) : {};
+  } catch { // no-excuse-ok: catch - invalid persisted metadata is safely treated as empty.
     return {};
   }
 }
@@ -2974,9 +3509,9 @@ function parseMetadata(value: unknown): Record<string, unknown> {
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== "string") return [];
   try {
-    const parsed = JSON.parse(value) as unknown;
+    const parsed: unknown = JSON.parse(value);
     return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
-  } catch {
+  } catch { // no-excuse-ok: catch - invalid persisted arrays are safely treated as empty.
     return [];
   }
 }

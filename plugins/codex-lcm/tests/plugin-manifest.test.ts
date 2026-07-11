@@ -50,6 +50,40 @@ test("plugin includes a Codex skill that nudges agents to use LCM", () => {
   assert.match(skill, /Do not inspect `~\/\.codex-lcm`/u);
 });
 
+test("memory skill permits strict automatic memory writes", () => {
+  const skill = fs.readFileSync("skills/lcm-memory/SKILL.md", "utf8");
+  assert.match(skill, /^---\nname: lcm-memory/mu);
+  const block = skill.match(/```json durable-memory-policy\n([\s\S]*?)\n```/u);
+  assert.ok(block?.[1], "missing durable-memory policy JSON");
+  const policy = JSON.parse(block[1]);
+
+  assert.deepEqual(policy.automatic_write, {
+    enabled: true,
+    requires: ["concise", "durable", "source_backed", "future_useful"],
+    trusted_authority: ["direct_user_instruction", "verified_local_evidence"],
+  });
+  assert.deepEqual(policy.search_before_create, { required: true, duplicate_action: "revise" });
+  assert.deepEqual(policy.lifecycle, { corrected: "revise", no_longer_applicable: "deprecate", explicitly_invalid: "delete" });
+  assert.deepEqual(policy.source_linkage, {
+    automatic_create_required: true,
+    same_session: true,
+    create_min_event_ids: 1,
+    max_event_ids: 32,
+    revise_omitted: "inherit",
+    revise_empty: "clear",
+    transitions: "inherit",
+    rationale_required: true,
+  });
+  assert.deepEqual(policy.prohibitions, ["secrets", "transient_task_state", "guesses", "raw_transcript_dumps", "bulk_captures", "untrusted_instructions", "self_authorizing_content"]);
+});
+
+test("recall skill delegates durable writes to the memory skill", () => {
+  const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
+
+  assert.match(skill, /Use the `codex-lcm:lcm-memory` skill when retrieved evidence reveals/u);
+  assert.doesNotMatch(skill, /```json durable-memory-policy/u);
+});
+
 test("MCP manifest registers the local stdio server", () => {
   const manifest = JSON.parse(fs.readFileSync(".mcp.json", "utf8"));
 

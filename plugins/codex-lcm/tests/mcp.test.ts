@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { normalizeHookEvent } from "../src/events.ts";
+import { createStorage } from "../src/storage.ts";
 import { clearDerivedSummaries, runCli, runMcp, tempHome } from "./helpers.ts";
 
 type FramedMcpResponse = {
@@ -14,6 +21,19 @@ type FramedMcpResponse = {
 
 const SUPPORTED_PROTOCOL_VERSION = "2025-11-25";
 const STANDARD_TOOL_NAMES = ["lcm_grep", "lcm_describe", "lcm_expand"] as const;
+
+function seedMemorySource(home: string, sessionId: string, cwd: string): string {
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd, prompt: "Source evidence for durable memory." }),
+    env: {},
+    now: () => new Date("2026-07-11T12:00:00.000Z"),
+  });
+  storage.ingest(event);
+  storage.close();
+  return event.event_id;
+}
 
 test("MCP server initializes and lists LCM tools", () => {
   const home = tempHome();
@@ -56,6 +76,12 @@ test("MCP server initializes and lists LCM tools", () => {
       "lcm_get_session_graph",
       "lcm_get_recent_context",
       "lcm_pack_context",
+      "lcm_create_memory",
+      "lcm_revise_memory",
+      "lcm_deprecate_memory",
+      "lcm_delete_memory",
+      "lcm_search_memories",
+      "lcm_get_memory",
       "lcm_record_note",
     ],
   );
@@ -76,6 +102,322 @@ test("MCP server initializes and lists LCM tools", () => {
   assert.equal(expandQueryTool.inputSchema.properties.overview.type, "boolean");
   const contextPlanTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_context_plan");
   assert.equal(contextPlanTool.inputSchema.properties.canControlCompaction.const, false);
+});
+
+test("MCP creates and revises durable memories", () => {
+  const home = tempHome();
+  const memoryId = "44444444-4444-4444-8444-444444444444";
+  const sourceEventId = seedMemorySource(home, "mcp-memory", "/tmp/mcp-memory");
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_create_memory", arguments: { sessionId: "mcp-memory", cwd: "/tmp/mcp-memory", text: "Initial memory text.", kind: "decision", rationale: "User selected this path.", sourceEventIds: [sourceEventId], memoryId } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { sessionId: "mcp-memory", cwd: "/tmp/mcp-memory", memoryId, expectedRevision: 1, text: "Replacement memory text.", reason: "User corrected the path.", sourceEventIds: [sourceEventId] } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId, cwd: "/tmp/mcp-memory", includeContext: false } } },
+  ], { CODEX_LCM_HOME: home });
+
+  assert.equal(responses[0].result.structuredContent.memory.revision, 1);
+  assert.equal(responses[1].result.structuredContent.memory.revision, 2);
+  assert.equal(responses[2].result.structuredContent.memory.revisions.length, 2);
+  assert.equal(responses[2].result.structuredContent.memory.memory.text, "Replacement memory text.");
+});
+
+test("MCP revision lineage inherits when omitted, clears on empty revise, and transitions cannot replace it", () => {
+  const home = tempHome();
+  const memoryId = "45454545-4545-4454-8454-454545454545";
+  const sessionId = "mcp-memory-lineage";
+  const cwd = "/tmp/mcp-memory-lineage";
+  const firstSource = seedMemorySource(home, sessionId, cwd);
+  const secondSource = seedMemorySource(home, sessionId, cwd);
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_create_memory", arguments: { sessionId, cwd, text: "Lineage revision one.", kind: "decision", rationale: "Initial source.", sourceEventIds: [firstSource], memoryId } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { sessionId, cwd, memoryId, expectedRevision: 1, text: "Lineage revision two.", reason: "Inherit source." } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { sessionId, cwd, memoryId, expectedRevision: 2, text: "Lineage revision three.", reason: "Clear source.", sourceEventIds: [] } } },
+    { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "lcm_deprecate_memory", arguments: { sessionId, cwd, memoryId, expectedRevision: 3, reason: "Deprecate without replacement.", sourceEventIds: [secondSource] } } },
+    { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "lcm_delete_memory", arguments: { sessionId, cwd, memoryId, expectedRevision: 4, reason: "Delete without replacement.", sourceEventIds: [secondSource] } } },
+    { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId, cwd, includeContext: false } } },
+  ], { CODEX_LCM_HOME: home });
+
+  assert.deepEqual(responses.slice(0, 5).map((response) => response.error?.message), [undefined, undefined, undefined, undefined, undefined]);
+  assert.deepEqual(responses[1].result.structuredContent.memory.source_event_ids, [firstSource]);
+  assert.deepEqual(responses[2].result.structuredContent.memory.source_event_ids, []);
+  assert.deepEqual(responses[3].result.structuredContent.memory.source_event_ids, []);
+  assert.deepEqual(responses[4].result.structuredContent.memory.source_event_ids, []);
+  assert.deepEqual(responses[5].result.structuredContent.memory.revisions.map((revision: { source_event_ids: string[] }) => revision.source_event_ids), [[firstSource], [firstSource], [], [], []]);
+});
+
+test("MCP rejects stale memory revisions", () => {
+  const home = tempHome();
+  const memoryId = "55555555-5555-4555-8555-555555555555";
+  const sourceEventId = seedMemorySource(home, "mcp-stale", "/tmp/mcp-stale");
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_create_memory", arguments: { sessionId: "mcp-stale", cwd: "/tmp/mcp-stale", text: "Current memory.", kind: "fact", rationale: "Observed evidence.", sourceEventIds: [sourceEventId], memoryId } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { sessionId: "mcp-stale", cwd: "/tmp/mcp-stale", memoryId, expectedRevision: 1, text: "Revision two.", reason: "More precise evidence.", sourceEventIds: [sourceEventId] } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { sessionId: "mcp-stale", cwd: "/tmp/mcp-stale", memoryId, expectedRevision: 1, text: "Stale revision.", reason: "Stale evidence.", sourceEventIds: [sourceEventId] } } },
+  ], { CODEX_LCM_HOME: home });
+
+  assert.equal(responses[2].error.code, -32602);
+  assert.equal(responses[2].error.message, "Memory revision conflict: expected 1, current 2.");
+});
+
+test("MCP rejects malformed durable-memory boundaries, forged user provenance, and arbitrary repo scopes", () => {
+  const home = tempHome();
+  const sessionId = "mcp-boundary";
+  const cwd = "/tmp/mcp-boundary";
+  const sourceEventId = seedMemorySource(home, sessionId, cwd);
+  const create = {
+    sessionId,
+    cwd,
+    text: "Source-backed durable fact.",
+    kind: "fact",
+    rationale: "The source event supports this durable fact.",
+    sourceEventIds: [sourceEventId],
+  };
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 0, method: "tools/call", params: { name: "lcm_create_memory", arguments: { ...create, memoryId: 7 } } },
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_create_memory", arguments: { ...create, memoryId: "12121212-1212-4121-8121-121212121212", sourceEventIds: [sourceEventId, 7] } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_create_memory", arguments: { ...create, memoryId: "13131313-1313-4131-8131-131313131313", actor: "user" } } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_create_memory", arguments: { ...create, memoryId: "14141414-1414-4141-8141-141414141414", scope: { kind: "repo", key: "/definitely/not/a/repository" } } } },
+    { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "lcm_search_memories", arguments: { kinds: ["fact", "invalid"] } } },
+    { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "lcm_search_memories", arguments: { statuses: ["invalid"] } } },
+    { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "lcm_search_memories", arguments: { scopeKinds: ["repo", 7] } } },
+    { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "lcm_create_memory", arguments: { ...create, memoryId: "15151515-1515-4151-8151-151515151515", sourceEventIds: Array.from({ length: 33 }, () => sourceEventId) } } },
+  ], { CODEX_LCM_HOME: home });
+
+  for (const response of responses) assert.equal(response.error?.code, -32602);
+  assert.equal(fs.readFileSync(path.join(home, "events.jsonl"), "utf8").split("\n").filter((line) => line.includes('"hook_event":"Memory"')).length, 0);
+});
+
+test("MCP memory write schemas expose create lineage, optional clearable revise lineage, and inherited transitions", () => {
+  const responses = runMcp([{ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }]);
+  const tools = responses[0].result.tools as Array<{
+    name: string;
+    inputSchema: { required: string[]; properties: Record<string, { minItems?: number; maxItems?: number; maximum?: number; type?: string; items?: { enum?: string[] }; oneOf?: readonly unknown[] }> };
+    annotations: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean };
+  }>;
+  for (const name of ["lcm_create_memory", "lcm_revise_memory", "lcm_deprecate_memory", "lcm_delete_memory"]) {
+    const tool = tools.find((candidate) => candidate.name === name);
+    assert.ok(tool, `missing ${name}`);
+    assert.equal(tool.inputSchema.required.includes("sourceEventIds"), name === "lcm_create_memory");
+    assert.equal(tool.inputSchema.properties.sourceEventIds?.minItems, name === "lcm_create_memory" ? 1 : name === "lcm_revise_memory" ? 0 : undefined);
+    assert.equal(tool.inputSchema.properties.sourceEventIds?.maxItems, name === "lcm_create_memory" || name === "lcm_revise_memory" ? 32 : undefined);
+    if ("scope" in tool.inputSchema.properties) assert.equal(tool.inputSchema.properties.scope?.oneOf?.length, 3);
+    assert.equal("actor" in tool.inputSchema.properties, false);
+    assert.deepEqual(tool.annotations, {
+      readOnlyHint: false,
+      destructiveHint: name === "lcm_delete_memory",
+      idempotentHint: false,
+      openWorldHint: false,
+    });
+  }
+  const get = tools.find((candidate) => candidate.name === "lcm_get_memory");
+  assert.ok(get, "missing lcm_get_memory");
+  assert.equal(get.inputSchema.required.includes("cwd"), true);
+  assert.equal(get.inputSchema.properties.cwd?.type, "string");
+  assert.equal(get.inputSchema.properties.repoRoot?.type, "string");
+  assert.equal(get.inputSchema.properties.historyLimit?.maximum, 100);
+  assert.equal(get.inputSchema.properties.historyCursor?.type, "string");
+  const pack = tools.find((candidate) => candidate.name === "lcm_pack_context");
+  assert.ok(pack, "missing lcm_pack_context");
+  assert.equal(pack.inputSchema.properties.repoRoot?.type, "string");
+  const search = tools.find((candidate) => candidate.name === "lcm_search_memories");
+  assert.ok(search, "missing lcm_search_memories");
+  assert.deepEqual(search.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+  for (const key of ["kinds", "statuses", "scopeKinds"] as const) {
+    assert.deepEqual(search.inputSchema.properties[key]?.items?.enum, key === "kinds"
+      ? ["preference", "decision", "lesson", "fact", "workflow"]
+      : key === "statuses"
+        ? ["active", "deprecated", "deleted"]
+        : ["global", "repo", "cwd"]);
+  }
+});
+
+test("MCP rejects a valid foreign repository scope instead of accepting cross-repo memory poisoning", () => {
+  const home = tempHome();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-lcm-memory-repos-"));
+  const repoA = path.join(root, "repo-a");
+  const repoB = path.join(root, "repo-b");
+  try {
+    for (const repo of [repoA, repoB]) {
+      fs.mkdirSync(repo);
+      assert.equal(spawnSync("git", ["init", "--quiet"], { cwd: repo }).status, 0);
+    }
+    const sourceEventId = seedMemorySource(home, "mcp-cross-repo", repoA);
+    const responses = runMcp([
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: "lcm_create_memory",
+          arguments: {
+            sessionId: "mcp-cross-repo",
+            cwd: repoA,
+            text: "Foreign repo poison.",
+            kind: "fact",
+            rationale: "A source event exists, but only in repo A.",
+            sourceEventIds: [sourceEventId],
+            scope: { kind: "repo", key: repoB },
+            memoryId: "23232323-2323-4232-8232-232323232323",
+          },
+        },
+      },
+    ], { CODEX_LCM_HOME: home });
+    assert.equal(responses[0].error.code, -32602);
+    assert.match(responses[0].error.message, /operation cwd repository root/u);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP rejects cross-scope durable-memory transitions without appending events", () => {
+  const home = tempHome("codex-lcm-memory-transition-repos-");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-lcm-memory-transition-repos-"));
+  const repoA = path.join(root, "repo-a");
+  const repoB = path.join(root, "repo-b");
+  try {
+    for (const repo of [repoA, repoB]) {
+      fs.mkdirSync(repo);
+      assert.equal(spawnSync("git", ["init", "--quiet"], { cwd: repo }).status, 0);
+    }
+    const sessionId = "mcp-transition-scope";
+    const sourceEventId = seedMemorySource(home, sessionId, repoA);
+    const create = (memoryId: string, text: string, scope?: { kind: "global" } | { kind: "cwd"; key: string }) => ({
+      sessionId, cwd: repoA, memoryId, text, kind: "fact", rationale: "Repository A source.", sourceEventIds: [sourceEventId], ...(scope ? { scope } : {}),
+    });
+    const [repoRevised, repoDeprecated, repoDeleted, globalRevised, globalDeprecated, globalDeleted, cwdRevised] = [
+      "45454545-4545-4545-8454-454545454545", "46464646-4646-4646-8464-464646464646", "47474747-4747-4747-8474-474747474747",
+      "48484848-4848-4848-8484-484848484848", "49494949-4949-4949-8494-494949494949", "50505050-5050-4050-8050-505050505050",
+      "51515151-5151-4151-8151-515151515151",
+    ];
+    const responses = runMcp([
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(repoRevised, "Repo revise.") } },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(repoDeprecated, "Repo deprecate.") } },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(repoDeleted, "Repo delete.") } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(globalRevised, "Global revise.", { kind: "global" }) } },
+      { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(globalDeprecated, "Global deprecate.", { kind: "global" }) } },
+      { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(globalDeleted, "Global delete.", { kind: "global" }) } },
+      { jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "lcm_create_memory", arguments: create(cwdRevised, "Cwd revise.", { kind: "cwd", key: repoA }) } },
+      { jsonrpc: "2.0", id: 8, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { memoryId: repoRevised, expectedRevision: 1, sessionId, cwd: repoB, text: "Forbidden repo revision.", reason: "Cross-repo.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "lcm_deprecate_memory", arguments: { memoryId: repoDeprecated, expectedRevision: 1, sessionId, cwd: repoB, reason: "Cross-repo.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "lcm_delete_memory", arguments: { memoryId: repoDeleted, expectedRevision: 1, sessionId, cwd: repoB, reason: "Cross-repo.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 11, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { memoryId: cwdRevised, expectedRevision: 1, sessionId, cwd: repoB, text: "Forbidden cwd revision.", reason: "Cross-cwd.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 12, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { memoryId: repoRevised, expectedRevision: 1, sessionId, cwd: repoA, text: "Allowed repo revision.", reason: "Same repo.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 13, method: "tools/call", params: { name: "lcm_deprecate_memory", arguments: { memoryId: repoDeprecated, expectedRevision: 1, sessionId, cwd: repoA, reason: "Same repo.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 14, method: "tools/call", params: { name: "lcm_delete_memory", arguments: { memoryId: repoDeleted, expectedRevision: 1, sessionId, cwd: repoA, reason: "Same repo.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 15, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { memoryId: globalRevised, expectedRevision: 1, sessionId, cwd: repoB, text: "Allowed global revision.", reason: "Global scope.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 16, method: "tools/call", params: { name: "lcm_deprecate_memory", arguments: { memoryId: globalDeprecated, expectedRevision: 1, sessionId, cwd: repoB, reason: "Global scope.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 17, method: "tools/call", params: { name: "lcm_delete_memory", arguments: { memoryId: globalDeleted, expectedRevision: 1, sessionId, cwd: repoB, reason: "Global scope.", sourceEventIds: [sourceEventId] } } },
+      { jsonrpc: "2.0", id: 18, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { memoryId: cwdRevised, expectedRevision: 1, sessionId, cwd: repoA, text: "Allowed cwd revision.", reason: "Same cwd.", sourceEventIds: [sourceEventId] } } },
+    ], { CODEX_LCM_HOME: home });
+
+    for (const response of responses.slice(7, 11)) assert.equal(response.error?.code, -32602);
+    assert.equal(responses[11].result.structuredContent.memory.revision, 2);
+    assert.equal(responses[12].result.structuredContent.memory.status, "deprecated");
+    assert.equal(responses[13].result.structuredContent.memory.status, "deleted");
+    assert.equal(responses[14].result.structuredContent.memory.revision, 2);
+    assert.equal(responses[15].result.structuredContent.memory.status, "deprecated");
+    assert.equal(responses[16].result.structuredContent.memory.status, "deleted");
+    assert.equal(responses[17].result.structuredContent.memory.revision, 2);
+    assert.equal(fs.readFileSync(path.join(home, "events.jsonl"), "utf8").trim().split(/\r?\n/u).length, 15);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP requires durable-memory read context and isolates repository reads", () => {
+  const home = tempHome("codex-lcm-durable-cross-repo-");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-lcm-memory-read-repos-"));
+  const repoA = path.join(root, "repo-a");
+  const repoB = path.join(root, "repo-b");
+  try {
+    for (const repo of [repoA, repoB]) {
+      fs.mkdirSync(repo);
+      assert.equal(spawnSync("git", ["init", "--quiet"], { cwd: repo }).status, 0);
+    }
+    const sessionId = "mcp-cross-repo-read";
+    const sourceEventId = seedMemorySource(home, sessionId, repoA);
+    const storage = createStorage({ home });
+    const repoMemory = storage.createMemory({
+      sessionId, cwd: repoA, text: "Repository A durable fact.", kind: "fact",
+      rationale: "Repository A source.", sourceEventIds: [sourceEventId],
+      memoryId: "34343434-3434-4343-8343-343434343434",
+    });
+    const globalMemory = storage.createMemory({
+      sessionId, cwd: repoA, text: "Global durable fact.", kind: "fact",
+      scope: { kind: "global" }, rationale: "Global source.", sourceEventIds: [sourceEventId],
+      memoryId: "35353535-3535-4353-8353-353535353535",
+    });
+    storage.close();
+
+    const eventCount = fs.readFileSync(path.join(home, "events.jsonl"), "utf8").trim().split(/\r?\n/u).length;
+    const responses = runMcp([
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_search_memories", arguments: { query: "Repository A", cwd: repoA, repoRoot: repoB } } },
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_pack_context", arguments: { query: "Repository A", cwd: repoA, repoRoot: repoB, budgetTokens: 350 } } },
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId: repoMemory.memory_id, includeContext: false } } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId: repoMemory.memory_id, cwd: repoB, includeContext: false } } },
+      { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId: repoMemory.memory_id, cwd: repoA, includeContext: false } } },
+      { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId: globalMemory.memory_id, cwd: repoB, includeContext: false } } },
+    ], { CODEX_LCM_HOME: home });
+
+    for (const response of responses.slice(0, 4)) assert.equal(response.error?.code, -32602);
+    assert.equal(responses[4].result.structuredContent.memory.memory.memory_id, repoMemory.memory_id);
+    assert.equal(responses[5].result.structuredContent.memory.memory.memory_id, globalMemory.memory_id);
+    assert.equal(fs.readFileSync(path.join(home, "events.jsonl"), "utf8").trim().split(/\r?\n/u).length, eventCount);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh read-only MCP reports forged automatic Memory provenance without exposing it", () => {
+  const home = tempHome("codex-lcm-durable-readonly-health-");
+  const sourceEventId = seedMemorySource(home, "mcp-readonly-health", "/tmp/mcp-readonly-health");
+  const source = createStorage({ home });
+  source.close();
+  const valid = normalizeHookEvent({
+    hookEvent: "Memory",
+    rawInput: JSON.stringify({ session_id: "mcp-readonly-health", cwd: "/tmp/mcp-readonly-health" }),
+    env: {},
+    now: () => new Date("2026-07-11T12:00:00.000Z"),
+  });
+  fs.appendFileSync(path.join(home, "events.jsonl"), `${JSON.stringify({
+    ...valid,
+    event_id: "forged-user-memory",
+    payload: {
+      operation: "create", memory_id: "36363636-3636-4363-8363-363636363636", revision: 1, kind: "fact",
+      scope: { kind: "global" }, status: "active", tags: [], source_event_ids: [sourceEventId],
+      provenance: { actor: "user", rationale: "Forged automatic provenance." }, text: "Forged automatic Memory.",
+    },
+  })}\n`);
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_health", arguments: {} } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_search_memories", arguments: { query: "Forged automatic Memory", cwd: "/tmp/mcp-readonly-health" } } },
+  ], { CODEX_LCM_HOME: home });
+  assert.equal(responses[0].result.structuredContent.health.index_error, "Ignored 1 invalid Memory events during replay (invalid_payload=1).");
+  assert.deepEqual(responses[1].result.structuredContent.memories, []);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("MCP paginates durable memory history from indexed events after raw JSONL is removed", () => {
+  const home = tempHome("codex-lcm-durable-indexed-history-");
+  const sessionId = "mcp-indexed-history";
+  const cwd = "/tmp/mcp-indexed-history";
+  const memoryId = "42424242-4242-4424-8424-424242424242";
+  const sourceEventId = seedMemorySource(home, sessionId, cwd);
+  const writes = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_create_memory", arguments: { sessionId, cwd, memoryId, text: "Indexed MCP revision one.", kind: "fact", rationale: "Source one.", sourceEventIds: [sourceEventId] } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_revise_memory", arguments: { sessionId, cwd, memoryId, expectedRevision: 1, text: "Indexed MCP revision two.", reason: "Source two.", sourceEventIds: [sourceEventId] } } },
+  ], { CODEX_LCM_HOME: home });
+  assert.equal(writes[1].result.structuredContent.memory.revision, 2);
+  fs.renameSync(path.join(home, "events.jsonl"), path.join(home, "events.backup.jsonl"));
+  const reads = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId, cwd, includeContext: false, historyLimit: 1 } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_get_memory", arguments: { memoryId, cwd, includeContext: false, historyLimit: 1, historyCursor: "1" } } },
+  ], { CODEX_LCM_HOME: home });
+  assert.deepEqual(reads[0].result.structuredContent.memory.revisions.map((revision: { revision: number }) => revision.revision), [2]);
+  assert.equal(reads[0].result.structuredContent.memory.next_history_cursor, "1");
+  assert.deepEqual(reads[1].result.structuredContent.memory.revisions.map((revision: { revision: number }) => revision.revision), [1]);
+  fs.rmSync(home, { recursive: true, force: true });
 });
 
 test("MCP server falls back to its supported protocol version", () => {

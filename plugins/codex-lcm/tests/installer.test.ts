@@ -29,6 +29,7 @@ test("status reads Codex home and reports absent wiring", () => {
   assert.equal(status.mcp_configured, false);
   assert.equal(status.hooks_configured, false);
   assert.equal(status.recall_skill_available, true);
+  assert.equal(status.memory_skill_available, true);
 });
 
 test("status recognizes Codex-native plugin wiring", () => {
@@ -64,4 +65,5 @@ test("status recognizes Codex-native plugin wiring", () => {
   assert.equal(status.mcp_configured, true);
   assert.equal(status.hooks_configured, true);
   assert.equal(status.recall_skill_available, true);
+  assert.equal(status.memory_skill_available, true);
 });

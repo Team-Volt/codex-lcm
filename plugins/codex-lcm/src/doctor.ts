@@ -38,6 +38,14 @@ export function buildDoctorReport(args: {
       "Reinstall the plugin with `codex plugin add codex-lcm@codex-lcm`.",
     ),
     check(
+      "memory-skill",
+      "LCM memory skill",
+      booleanValue(args.status.memory_skill_available),
+      "The lcm-memory skill is available.",
+      "The lcm-memory skill is missing from the plugin root.",
+      "Reinstall the plugin with `codex plugin add codex-lcm@codex-lcm`.",
+    ),
+    check(
       "storage-index",
       "Storage index",
       args.health.index_available,

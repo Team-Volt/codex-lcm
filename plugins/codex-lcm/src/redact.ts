@@ -36,7 +36,7 @@ const TOKEN_PATTERNS: TokenPattern[] = [
     replacement: "Authorization: Bearer [REDACTED:token]",
   },
   {
-    regex: /\bBearer\s+(?!\[REDACTED:token\])[^\s"']+/gu,
+    regex: /\bBearer\s+(?!\[REDACTED:token\])(?![A-Za-z]+\s+(?:are|can|is|means|must|refers|should|will)\b)[^\s"']+/gu,
     replacement: "Bearer [REDACTED:token]",
   },
   {

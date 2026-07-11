@@ -1,4 +1,5 @@
 import { DEFAULT_LIMITS } from "./config.ts";
+import { callMemoryTool, isMemoryTool, MEMORY_TOOLS } from "./memory-mcp.ts";
 import { createStorage } from "./storage.ts";
 
 type JsonRpcRequest = {
@@ -16,7 +17,7 @@ const MAX_MESSAGE_BYTES = DEFAULT_LIMITS.maxInputBytes;
 
 let responseFraming: "line" | "header" = "line";
 
-const TOOLS = [
+const CORE_TOOLS = [
   {
     name: "lcm_health",
     title: "LCM Health",
@@ -220,6 +221,7 @@ const TOOLS = [
         sessionIds: { type: "array", items: { type: "string" } },
         budgetTokens: { type: "number", default: 1200 },
         cwd: { type: "string" },
+        repoRoot: { type: "string" },
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -240,6 +242,10 @@ const TOOLS = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
 ];
+
+const TOOLS = CORE_TOOLS.flatMap((tool) => tool.name === "lcm_record_note"
+  ? [...MEMORY_TOOLS, tool]
+  : [tool]);
 
 export function startMcpServer(): void {
   let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -378,8 +384,9 @@ function handleMessage(message: JsonRpcRequest): void {
 function callTool(params: Record<string, unknown>) {
   const name = stringArg(params.name, "name");
   const args = isRecord(params.arguments) ? params.arguments : {};
-  const storage = createStorage({ readOnly: name !== "lcm_record_note" });
+  const storage = createStorage({ readOnly: !["lcm_record_note", "lcm_create_memory", "lcm_revise_memory", "lcm_deprecate_memory", "lcm_delete_memory"].includes(name) });
   try {
+    if (isMemoryTool(name)) return callMemoryTool(storage, name, args);
     switch (name) {
       case "lcm_health": {
         const health = storage.health();
@@ -501,6 +508,7 @@ function callTool(params: Record<string, unknown>) {
           currentThreadId: currentThreadId(),
           budgetTokens: optionalNumber(args.budgetTokens),
           cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
         });
         return toolResult(packed.markdown, packed);
       }
@@ -566,8 +574,11 @@ function optionalBoolean(value: unknown): boolean | undefined {
 }
 
 function optionalStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new Error("value must be an array of non-empty strings.");
+  }
+  return value.map((item) => item.trim());
 }
 
 function currentThreadId(): string | undefined {

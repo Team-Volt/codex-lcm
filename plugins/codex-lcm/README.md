@@ -73,6 +73,20 @@ Diagnostics and lower-level tools:
 - `lcm_get_recent_context`
 - `lcm_record_note`
 
+### Durable memories
+
+`lcm_create_memory`, `lcm_revise_memory`, `lcm_deprecate_memory`,
+`lcm_delete_memory`, `lcm_search_memories`, and `lcm_get_memory` manage
+append-only durable memory revisions. `events.jsonl` remains authoritative;
+SQLite projects latest state for active scoped search and packing. Delete is a
+retained tombstone, and writes fail closed when the index is unavailable.
+Create supplies one to 32 same-session source event IDs. Revise inherits the
+current pointers when `sourceEventIds` is omitted and clears them when it is
+`[]`. Deprecate and delete inherit the current pointers and do not accept
+replacements. `lcm_get_memory` returns the latest page of ordered revisions with
+`next_history_cursor`; its source context deduplicates event bodies and references
+them from each revision/source pointer.
+
 ## Installing
 
 Use the root [Installation](../../README.md#installation) section for install,
@@ -86,6 +100,7 @@ The native Codex plugin files are:
 - `.mcp.json`
 - `hooks/hooks.codex.json`
 - `skills/lcm-recall/SKILL.md`
+- `skills/lcm-memory/SKILL.md`
 
 The repository also includes `.agents/plugins/marketplace.json`, which lets
 Codex treat this checkout as a plugin marketplace source during development or
@@ -94,6 +109,10 @@ local installs.
 The `lcm-recall` skill is loaded by native plugin installation and nudges Codex
 to use LCM on resumes, compaction recovery, long-running work, and questions
 that depend on prior local session context.
+
+The `lcm-memory` skill owns durable write policy and lifecycle guidance. It
+triggers for decisions, preferences, facts, workflows, corrections, lessons
+learned, and explicit requests to remember something.
 
 ## What Is Captured
 
