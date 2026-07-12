@@ -160,6 +160,23 @@ test("MCP server rejects invalid tools/call params and continues", () => {
   assert.deepEqual(responses.at(-1), { jsonrpc: "2.0", id: 99, result: {} });
 });
 
+test("MCP rejects malformed optional string arrays", () => {
+  // Given
+  const home = tempHome();
+
+  // When
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "lcm_pack_context", arguments: { sessionIds: "not-an-array" } } },
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "lcm_pack_context", arguments: { sessionIds: ["valid", ""] } } },
+  ], { CODEX_LCM_HOME: home });
+
+  // Then
+  assert.deepEqual(responses.map((response) => response.error), [
+    { code: -32602, message: "value must be an array of non-empty strings." },
+    { code: -32602, message: "value must be an array of non-empty strings." },
+  ]);
+});
+
 test("MCP server stays silent for notifications with invalid method params", () => {
   const responses = runMcp([
     { jsonrpc: "2.0", method: "initialize", params: [] },
