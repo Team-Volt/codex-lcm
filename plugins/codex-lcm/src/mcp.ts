@@ -566,8 +566,11 @@ function optionalBoolean(value: unknown): boolean | undefined {
 }
 
 function optionalStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.trim().length === 0)) {
+    throw new Error("value must be an array of non-empty strings.");
+  }
+  return value.map((item) => item.trim());
 }
 
 function currentThreadId(): string | undefined {

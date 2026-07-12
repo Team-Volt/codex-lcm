@@ -553,7 +553,8 @@ export class LcmStorage {
     if (!this.db || !fs.existsSync(this.config.rawLogPath)) return;
     const rawLog = readRawLog(this.config.rawLogPath);
     const rawEvents = rawLog.events;
-    const indexedIds = this.indexedEventIds();
+    const indexedEvents = this.indexedEventsById();
+    const indexedIds = new Set(indexedEvents.keys());
     if (rawLog.malformedLineCount > 0) {
       const noun = rawLog.malformedLineCount === 1 ? "line" : "lines";
       this.indexError = `Raw JSONL contains ${rawLog.malformedLineCount} malformed ${noun}; destructive index reconciliation is disabled until the log is repaired.`;
@@ -564,7 +565,11 @@ export class LcmStorage {
     }
     const rawIds = new Set(rawEvents.map((event) => event.event_id));
     const hasStaleIndexedRows = [...indexedIds].some((eventId) => !rawIds.has(eventId));
-    if (hasStaleIndexedRows && rawLog.malformedLineCount === 0) {
+    const hasChangedIndexedRows = rawEvents.some((event) => {
+      const indexedRaw = indexedEvents.get(event.event_id);
+      return indexedRaw !== undefined && indexedRaw !== JSON.stringify(event);
+    });
+    if ((hasStaleIndexedRows || hasChangedIndexedRows) && rawLog.malformedLineCount === 0) {
       this.rebuildIndexFromRawEvents(rawEvents);
       return;
     }
@@ -648,10 +653,10 @@ export class LcmStorage {
     return known;
   }
 
-  private indexedEventIds(): Set<string> {
-    if (!this.db) return new Set();
-    const rows = this.db.prepare("SELECT event_id FROM events").all() as Array<{ event_id: string }>;
-    return new Set(rows.map((row) => row.event_id));
+  private indexedEventsById(): Map<string, string> {
+    if (!this.db) return new Map();
+    const rows = this.db.prepare("SELECT event_id, raw_json FROM events").all() as Array<{ event_id: string; raw_json: string }>;
+    return new Map(rows.map((row) => [row.event_id, row.raw_json]));
   }
 
   private rebuildTouchedSummarySessions(sessionIds: Iterable<string>): string[] {
@@ -1341,13 +1346,17 @@ export class LcmStorage {
   }
 
   private getTopSummaryNodesForSession(sessionId: string, limit = 3): SummaryNode[] {
-    const nodes = this.getSummaryNodesForSession(sessionId, 2_000);
-    if (nodes.length === 0) return [];
-    const maxDepth = Math.max(...nodes.map((node) => node.depth));
-    return nodes
-      .filter((node) => node.depth === maxDepth)
-      .sort((a, b) => b.latest_at.localeCompare(a.latest_at))
-      .slice(0, clampLimit(limit, 3, 20));
+    if (!this.db) return [];
+    return this.db.prepare(`
+      SELECT node_id, session_id, depth, summary_text, token_count, source_token_count, source_type,
+             source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
+             cwd, repo_root, git_branch, topics_json
+      FROM summary_nodes
+      WHERE session_id = ?1
+        AND depth = (SELECT MAX(depth) FROM summary_nodes WHERE session_id = ?1)
+      ORDER BY latest_at DESC
+      LIMIT ?2
+    `).all(sessionId, clampLimit(limit, 3, 20)).map(rowToSummaryNode);
   }
 
   private getSummaryNodesForGraph(sessionId: string, limit = 50): SummaryNode[] {
@@ -1644,7 +1653,6 @@ export class LcmStorage {
         const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents, query });
         return { node, sourceEvents, text, compactText };
       });
-
     const addCheckpointItems = () => {
       for (const { checkpoint, text } of checkpointItems) {
         if (chars + text.length > budgetChars) continue;
@@ -1705,15 +1713,9 @@ export class LcmStorage {
       }
     };
 
-    if (query.length > 0) {
-      addSummaryNodeItems();
-      addSummaryItems();
-      addCheckpointItems();
-    } else {
-      addSummaryNodeItems();
-      addSummaryItems();
-      addCheckpointItems();
-    }
+    addSummaryNodeItems();
+    addSummaryItems();
+    addCheckpointItems();
 
     return {
       markdown: lines.join("\n"),
@@ -2404,25 +2406,42 @@ export class LcmStorage {
   private rebuildSummaryNodes(sessionId: string): void {
     if (!this.db) return;
     const sourceEvents = this.getAllSummarySourceEventsForSession(sessionId);
-    this.db.prepare("DELETE FROM summary_node_fts WHERE session_id = ?1").run(sessionId);
-    this.db.prepare("DELETE FROM summary_nodes WHERE session_id = ?1").run(sessionId);
-    this.db.prepare("DELETE FROM graph_edges WHERE session_id = ?1 AND kind = 'summary_source'").run(sessionId);
-    if (sourceEvents.length === 0) return;
-
     let previousDepth = chunkArray(sourceEvents, SUMMARY_NODE_CHUNK_SIZE)
       .map((events) => buildLeafSummaryNode(events));
     const nodes: SummaryNode[] = [];
-    for (const node of previousDepth) this.insertSummaryNode(node);
     nodes.push(...previousDepth);
 
     for (let depth = 1; depth <= SUMMARY_NODE_MAX_DEPTH && previousDepth.length > 1; depth += 1) {
       const condensed = chunkArray(previousDepth, SUMMARY_NODE_FANOUT)
         .map((nodes) => buildCondensedSummaryNode(nodes, depth));
-      for (const node of condensed) this.insertSummaryNode(node);
       nodes.push(...condensed);
       previousDepth = condensed;
     }
-    for (const node of nodes) this.insertSummarySourceEdges(node);
+
+    const existing = new Map((this.db.prepare(`
+      SELECT node_id, summary_version FROM summary_nodes WHERE session_id = ?1
+    `).all(sessionId) as Array<{ node_id: string; summary_version: number }>)
+      .map((row) => [row.node_id, row.summary_version]));
+    const nextIds = new Set(nodes.map((node) => node.node_id));
+    const deleteFts = this.db.prepare("DELETE FROM summary_node_fts WHERE node_id = ?1");
+    const deleteNode = this.db.prepare("DELETE FROM summary_nodes WHERE node_id = ?1");
+    const deleteEdges = this.db.prepare("DELETE FROM graph_edges WHERE session_id = ?1 AND kind = 'summary_source' AND (from_node_id = ?2 OR to_node_id = ?2)");
+    for (const nodeId of existing.keys()) {
+      if (nextIds.has(nodeId)) continue;
+      deleteFts.run(nodeId);
+      deleteNode.run(nodeId);
+      deleteEdges.run(sessionId, nodeId);
+    }
+    for (const node of nodes) {
+      const existingVersion = existing.get(node.node_id);
+      if (existingVersion === SUMMARY_NODE_VERSION) continue;
+      if (existingVersion !== undefined) {
+        deleteFts.run(node.node_id);
+        deleteEdges.run(sessionId, node.node_id);
+      }
+      this.insertSummaryNode(node);
+      this.insertSummarySourceEdges(node);
+    }
   }
 
   private insertSummaryNode(node: SummaryNode): void {

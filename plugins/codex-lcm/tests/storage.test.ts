@@ -394,6 +394,104 @@ test("tool chatter does not rebuild session summaries until a landmark event", (
   storage.close();
 });
 
+test("reopening indexed storage reconciles same-ID raw-log payload edits", () => {
+  // Given
+  const home = tempHome("codex-lcm-raw-prefix-edit-");
+  const storage = createStorage({ home });
+  const events = Array.from({ length: 30 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "raw-prefix-edit",
+      cwd: "/tmp/raw-prefix-edit",
+      prompt: `original-${String(index).padStart(3, "0")}-${"x".repeat(150)}`,
+    }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+  }));
+  storage.ingestMany(events);
+  storage.close();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const lines = fs.readFileSync(rawLogPath, "utf8").trimEnd().split(/\r?\n/u);
+  const replacement = JSON.parse(lines[0]) as NormalizedEvent;
+  lines[0] = JSON.stringify({
+    ...replacement,
+    payload: { ...replacement.payload, prompt: String(replacement.payload.prompt).replace("original-000", "modified-000") },
+  });
+  fs.writeFileSync(rawLogPath, `${lines.join("\n")}\n`);
+
+  // When
+  const reopened = createStorage({ home });
+
+  // Then
+  assert.equal(reopened.searchSessions({ query: "original-000" }).length, 0);
+  assert.deepEqual(reopened.searchSessions({ query: "modified-000" }).map((session) => session.session_id), ["raw-prefix-edit"]);
+  reopened.close();
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("ingest restores a raw event removed while storage remains open", () => {
+  // Given
+  const home = tempHome("codex-lcm-live-raw-truncate-");
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "live-raw-truncate", cwd: "/tmp/live-raw-truncate", prompt: "restore raw source" }),
+    env: {},
+    now,
+  });
+  storage.ingest(event);
+  fs.truncateSync(path.join(home, "events.jsonl"), 0);
+
+  // When
+  storage.ingest(event);
+
+  // Then
+  const rawEvents = readJsonl(path.join(home, "events.jsonl"));
+  assert.equal(rawEvents.length, 1);
+  assert.match(JSON.stringify(rawEvents[0]), new RegExp(event.event_id, "u"));
+  storage.close();
+});
+
+test("summary rebuild preserves unchanged node rows", () => {
+  // Given
+  const home = tempHome("codex-lcm-incremental-summary-");
+  const sessionId = "incremental-summary";
+  const storage = createStorage({ home });
+  const events = Array.from({ length: 16 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd: "/tmp/incremental-summary", prompt: `summary source ${index}` }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+  }));
+  storage.ingestMany(events);
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  const unchanged = db.prepare("SELECT rowid, node_id FROM summary_nodes WHERE session_id = ?1 AND depth = 0 ORDER BY earliest_at LIMIT 1").get(sessionId) as { rowid: number; node_id: string };
+  db.exec(`
+    CREATE TABLE summary_node_audit (action TEXT NOT NULL, node_id TEXT NOT NULL);
+    CREATE TRIGGER audit_summary_node_delete AFTER DELETE ON summary_nodes BEGIN
+      INSERT INTO summary_node_audit (action, node_id) VALUES ('delete', OLD.node_id);
+    END;
+    CREATE TRIGGER audit_summary_node_insert AFTER INSERT ON summary_nodes BEGIN
+      INSERT INTO summary_node_audit (action, node_id) VALUES ('insert', NEW.node_id);
+    END;
+  `);
+
+  // When
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({ session_id: sessionId, cwd: "/tmp/incremental-summary", last_assistant_message: "latest summary outcome" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:05:00.000Z"),
+  }));
+
+  // Then
+  assert.equal(db.prepare("SELECT rowid FROM summary_nodes WHERE node_id = ?1").get(unchanged.node_id)?.rowid, unchanged.rowid);
+  assert.deepEqual(db.prepare("SELECT action FROM summary_node_audit WHERE node_id = ?1").all(unchanged.node_id), []);
+  db.close();
+  storage.close();
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
 test("coalesces prompt-only summary rebuilds but keeps stop freshness", () => {
   const home = tempHome();
   const storage = createStorage({ home });
