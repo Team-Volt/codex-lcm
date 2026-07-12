@@ -65,6 +65,17 @@ function postCompactRecoveryOutput(args: {
     markPostCompactPending(args.home, args.sessionId);
     return "";
   }
+  if (args.hookEvent === "PostToolUse" && hasPostCompactPending(args.home, args.sessionId)) {
+    const toolName = args.payload.tool_name;
+    if (typeof toolName === "string" && toolName.endsWith("lcm_pack_context")) {
+      claimPostCompactPending(args.home, args.sessionId);
+      return "";
+    }
+    return formatAdditionalContextOutput(args.hookEvent, buildPostCompactLcmDirective());
+  }
+  if (args.hookEvent === "Stop" && hasPostCompactPending(args.home, args.sessionId)) {
+    return `${JSON.stringify({ decision: "block", reason: buildPostCompactLcmDirective() })}\n`;
+  }
   if (
     args.hookEvent !== "UserPromptSubmit" &&
     (args.hookEvent !== "SessionStart" || (args.payload.source !== "compact" && args.payload.source !== "resume"))
@@ -83,6 +94,10 @@ function claimPostCompactPending(home: string, sessionId: string): boolean {
   if (!fs.existsSync(markerPath)) return false;
   fs.unlinkSync(markerPath);
   return true;
+}
+
+function hasPostCompactPending(home: string, sessionId: string): boolean {
+  return fs.existsSync(postCompactRecoveryPath(home, sessionId));
 }
 
 function postCompactRecoveryPath(home: string, sessionId: string): string {

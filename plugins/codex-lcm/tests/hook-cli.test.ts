@@ -235,6 +235,57 @@ test("PostCompact pending marker nudges the next user prompt when Desktop compac
   assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
 });
 
+test("PostCompact pending marker nudges the next same-turn tool result", () => {
+  // Given
+  const home = tempHome();
+  const env = { CODEX_LCM_HOME: home };
+  assertCliOk(runCli(["hook", "PostCompact"], {
+    input: JSON.stringify({ session_id: "same-turn-session", cwd: "/tmp/same-turn", trigger: "auto" }),
+    env,
+  }));
+
+  // When
+  const postToolUse = runCli(["hook", "PostToolUse"], {
+    input: JSON.stringify({
+      session_id: "same-turn-session",
+      cwd: "/tmp/same-turn",
+      tool_name: "Bash",
+      tool_input: { command: "pwd" },
+      tool_response: "/tmp/same-turn",
+    }),
+    env,
+  });
+
+  // Then
+  assertCliOk(postToolUse);
+  const output: unknown = JSON.parse(postToolUse.stdout);
+  assertHookAdditionalContextOutput(output);
+  assert.equal(output.hookSpecificOutput.hookEventName, "PostToolUse");
+  assert.match(output.hookSpecificOutput.additionalContext, /lcm_pack_context/u);
+});
+
+test("PostCompact pending marker blocks same-turn completion until LCM recovery", () => {
+  // Given
+  const home = tempHome();
+  const env = { CODEX_LCM_HOME: home };
+  assertCliOk(runCli(["hook", "PostCompact"], {
+    input: JSON.stringify({ session_id: "same-turn-stop-session", cwd: "/tmp/same-turn-stop", trigger: "auto" }),
+    env,
+  }));
+
+  // When
+  const stop = runCli(["hook", "Stop"], {
+    input: JSON.stringify({ session_id: "same-turn-stop-session", cwd: "/tmp/same-turn-stop" }),
+    env,
+  });
+
+  // Then
+  assertCliOk(stop);
+  const output = JSON.parse(stop.stdout) as { readonly decision: string; readonly reason: string };
+  assert.equal(output.decision, "block");
+  assert.match(output.reason, /lcm_pack_context/u);
+});
+
 test("post-compaction LCM nudge is emitted once per compacted session", () => {
   const home = tempHome();
   const env = { CODEX_LCM_HOME: home };
