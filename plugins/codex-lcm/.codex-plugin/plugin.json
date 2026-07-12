@@ -1,6 +1,6 @@
 {
   "name": "codex-lcm",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Codex-native session-first lossless context memory with hook ingestion and MCP retrieval.",
   "author": {
     "name": "Team Volt"

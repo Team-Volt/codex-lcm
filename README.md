@@ -102,7 +102,7 @@ operation.
 Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.4
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.5
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -119,20 +119,20 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Upgrade an existing GitHub marketplace install to `v0.2.4`:
+Upgrade an existing GitHub marketplace install to `v0.2.5`:
 
 ```sh
 codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.4
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.5
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Upgrade a local checkout install to `v0.2.4` by checking out the release tag,
+Upgrade a local checkout install to `v0.2.5` by checking out the release tag,
 then asking Codex to refresh the installed plugin cache:
 
 ```sh
 git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.4
+git -C /path/to/codex-lcm checkout v0.2.5
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -161,7 +161,7 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Current release: `v0.2.4`.
+Current release: `v0.2.5`.
 
 Codex LCM is a local-first Codex memory plugin with native plugin installation,
 hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
@@ -171,16 +171,18 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions.
 
-### v0.2.4 notes
+### v0.2.5 notes
 
-This patch release makes session capture and recall more reliable, including
-work performed by spawned agents.
+This patch release recovers context within the turn that triggered compaction
+and reduces unnecessary storage work.
 
-- Imports current Codex session records without discarding indexed evidence
-  when a raw event log contains malformed lines.
-- Prevents duplicate events during concurrent writes and returns stronger exact
-  recall matches instead of stopping at a weaker candidate tier.
-- Captures completed spawned-agent transcripts through the `SubagentStop` hook.
+- Defers post-compaction recovery output to supported hook events, injects the
+  recovery directive after the next tool result, and blocks completion until
+  context packing clears the pending marker.
+- Reconciles edited or truncated raw logs with the index and rejects malformed
+  optional string arrays at the MCP boundary.
+- Preserves unchanged summary rows during rebuilds and queries top summary nodes
+  directly, reducing repeated rebuild time in the measured benchmark.
 
 Use the [Installation](#installation) section for install and upgrade commands.
 
