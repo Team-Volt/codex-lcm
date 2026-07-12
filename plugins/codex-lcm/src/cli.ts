@@ -10,7 +10,7 @@ import { createStorage } from "./storage.ts";
 export async function main(argv: string[]): Promise<void> {
   const [command, ...rest] = argv;
   if (command === "--version" || command === "-v") {
-    process.stdout.write("0.2.4\n");
+    process.stdout.write("0.2.5\n");
     return;
   }
   if (command === "--help" || command === "-h" || command === undefined) {
