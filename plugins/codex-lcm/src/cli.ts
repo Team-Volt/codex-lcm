@@ -13,8 +13,9 @@ export async function main(argv: string[]): Promise<void> {
     process.stdout.write("0.2.4\n");
     return;
   }
+  const config = loadConfig();
   if (command === "--help" || command === "-h" || command === undefined) {
-    printHelp();
+    printHelp(config.memoryEnabled);
     return;
   }
   if (command === "mcp") {
@@ -30,7 +31,7 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "doctor") {
-    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    const storage = createStorage({ config, readOnly: true });
     try {
       printObjectOrText(buildDoctorReport({
         status: readStatus({ codexHome: optionValue(rest, "--codex-home"), root: pluginRoot() }),
@@ -70,7 +71,7 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "health") {
-    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    const storage = createStorage({ config, readOnly: true });
     try {
       printObjectOrText(storage.health());
     } finally {
@@ -79,7 +80,7 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "stats") {
-    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    const storage = createStorage({ config, readOnly: true });
     try {
       printObjectOrText(storage.stats());
     } finally {
@@ -88,7 +89,7 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (command === "context-plan") {
-    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    const storage = createStorage({ config, readOnly: true });
     try {
       printObjectOrText(storage.getContextPlan({
         sessionId: optionValue(rest, "--session-id"),
@@ -103,10 +104,23 @@ export async function main(argv: string[]): Promise<void> {
     }
     return;
   }
+  if (command === "memory" && config.memoryEnabled) {
+    const [memoryCommand, value] = rest;
+    const storage = createStorage({ config, readOnly: true });
+    try {
+      if (memoryCommand === "list") printObjectOrText(storage.searchMemories({ cwd: process.cwd() }));
+      else if (memoryCommand === "search" && value) printObjectOrText(storage.searchMemories({ query: value, cwd: process.cwd() }));
+      else if (memoryCommand === "show" && value) printObjectOrText(storage.getMemory(value, { cwd: process.cwd() }));
+      else throw new Error("Usage: codex-lcm memory <list|search QUERY|show MEMORY_ID>");
+    } finally {
+      storage.close();
+    }
+    return;
+  }
   throw new Error(`Unknown command: ${command}`);
 }
 
-function printHelp(): void {
+function printHelp(memoryEnabled: boolean): void {
   process.stdout.write(`codex-lcm
 
 Commands:
@@ -119,6 +133,10 @@ Commands:
   codex-lcm context-plan [--session-id ID] [--cwd PATH] [--repo-root PATH] [--model-context-window N] [--auto-compact-token-limit N] [--recent-event-limit N] [--json]
   codex-lcm benchmark long-context [--events N] [--budget-tokens N] [--home PATH] [--json]
   codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--progress] [--batch-size N] [--json]
+${memoryEnabled ? `  codex-lcm memory list
+  codex-lcm memory search <query>
+  codex-lcm memory show <memory-id>
+` : ""}
 `);
 }
 
