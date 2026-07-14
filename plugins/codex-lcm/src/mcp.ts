@@ -32,6 +32,42 @@ const TOOLS = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
+    name: "lcm_list_sessions",
+    title: "LCM List Sessions",
+    description: "List sessions across projects with time, root/child, and pagination filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since: { type: "string" },
+        until: { type: "string" },
+        cwd: { type: "string" },
+        repoRoot: { type: "string" },
+        parentSessionId: { type: "string" },
+        rootsOnly: { type: "boolean", default: false },
+        limit: { type: "number", default: 50 },
+        cursor: { type: "string" },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "lcm_usage",
+    title: "LCM Usage",
+    description: "Aggregate captured Codex token usage across filtered sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        since: { type: "string" },
+        until: { type: "string" },
+        cwd: { type: "string" },
+        repoRoot: { type: "string" },
+        parentSessionId: { type: "string" },
+        rootsOnly: { type: "boolean", default: false },
+      },
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "lcm_grep",
     title: "LCM Grep",
     description: "Preferred standard workflow step 1 (grep): find relevant sessions by searching summary nodes, session summaries, and high-signal raw events. Codex may surface this tool as mcp__codex_lcm__lcm_grep.",
@@ -391,6 +427,30 @@ function callTool(params: Record<string, unknown>) {
           `Codex LCM has ${stats.event_count} events, ${stats.summary_node_count ?? 0} summary nodes, and ${stats.graph_node_count ?? 0} graph nodes.`,
           { stats },
         );
+      }
+      case "lcm_list_sessions": {
+        const page = storage.listSessions({
+          since: optionalString(args.since),
+          until: optionalString(args.until),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          parentSessionId: optionalString(args.parentSessionId),
+          rootsOnly: optionalBoolean(args.rootsOnly),
+          limit: optionalNumber(args.limit),
+          cursor: optionalString(args.cursor),
+        });
+        return toolResult(`Loaded ${page.sessions.length} sessions.`, { page });
+      }
+      case "lcm_usage": {
+        const usage = storage.usage({
+          since: optionalString(args.since),
+          until: optionalString(args.until),
+          cwd: optionalString(args.cwd),
+          repoRoot: optionalString(args.repoRoot),
+          parentSessionId: optionalString(args.parentSessionId),
+          rootsOnly: optionalBoolean(args.rootsOnly),
+        });
+        return toolResult(`Captured ${usage.totals.total_tokens} tokens across ${usage.totals.sessions} sessions.`, { usage });
       }
       case "lcm_grep": {
         const matches = storage.searchSessions({

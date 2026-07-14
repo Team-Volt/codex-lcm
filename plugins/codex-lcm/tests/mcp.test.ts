@@ -44,6 +44,8 @@ test("MCP server initializes and lists LCM tools", () => {
     [
       "lcm_health",
       "lcm_stats",
+      "lcm_list_sessions",
+      "lcm_usage",
       "lcm_grep",
       "lcm_describe",
       "lcm_expand",

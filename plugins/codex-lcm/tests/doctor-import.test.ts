@@ -4,6 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { importCodexSessions } from "../src/codex-import.ts";
+import { normalizeHookEvent } from "../src/events.ts";
 import { createStorage } from "../src/storage.ts";
 import { assertCliOk, runCli, runMcp, tempHome } from "./helpers.ts";
 
@@ -105,6 +106,192 @@ test("import-codex-sessions progress writes to stderr without corrupting JSON st
   assert.equal(report.events_imported, 4);
   assert.match(result.stderr, /codex-lcm import:/u);
   assert.match(result.stderr, /imported=4/u);
+});
+
+test("import-codex-sessions exposes child lineage, runtime metadata, usage, and time-filtered listing", () => {
+  const sourceDir = tempHome("codex-lcm-lineage-source-");
+  const source = path.join(sourceDir, "rollout-2026-07-14T10-00-00-child-session.jsonl");
+  const rows = [
+    {
+      timestamp: "2026-07-14T14:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: "child-session",
+        cwd: "/tmp/lineage",
+        agent_role: "worker",
+        agent_nickname: "Child Worker",
+        parent_thread_id: "parent-session",
+        source: { subagent: { thread_spawn: { parent_thread_id: "parent-session", depth: 1 } } },
+      },
+    },
+    {
+      timestamp: "2026-07-14T14:00:01.000Z",
+      type: "turn_context",
+      payload: { turn_id: "turn-1", cwd: "/tmp/lineage", model: "gpt-5.6-sol", effort: "high" },
+    },
+    {
+      timestamp: "2026-07-14T14:00:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 100,
+            cached_input_tokens: 40,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 120,
+          },
+          model_context_window: 258400,
+        },
+      },
+    },
+  ];
+  fs.writeFileSync(source, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+  const home = tempHome("codex-lcm-lineage-home-");
+
+  const imported = runCli(["import-codex-sessions", "--from", source, "--json"], {
+    env: { CODEX_LCM_HOME: home },
+  });
+  assertCliOk(imported);
+  assert.equal(JSON.parse(imported.stdout).events_imported, 3);
+
+  const listed = runCli([
+    "sessions",
+    "--since", "2026-07-14T13:59:00.000Z",
+    "--until", "2026-07-14T14:01:00.000Z",
+    "--parent-session-id", "parent-session",
+    "--json",
+  ], { env: { CODEX_LCM_HOME: home } });
+  assertCliOk(listed);
+  const page = JSON.parse(listed.stdout);
+  assert.equal(page.sessions.length, 1);
+  assert.deepEqual(page.sessions[0], {
+    session_id: "child-session",
+    first_seen: "2026-07-14T14:00:00.000Z",
+    last_seen: "2026-07-14T14:00:02.000Z",
+    cwd: "/tmp/lineage",
+    event_count: 3,
+    parent_session_id: "parent-session",
+    agent_role: "worker",
+    agent_nickname: "Child Worker",
+    model: "gpt-5.6-sol",
+    reasoning_effort: "high",
+    total_input_tokens: 100,
+    cached_input_tokens: 40,
+    output_tokens: 20,
+    reasoning_output_tokens: 5,
+    total_tokens: 120,
+  });
+
+  const usage = runCli(["usage", "--since", "2026-07-14T13:59:00.000Z", "--json"], {
+    env: { CODEX_LCM_HOME: home },
+  });
+  assertCliOk(usage);
+  assert.deepEqual(JSON.parse(usage.stdout).totals, {
+    sessions: 1,
+    input_tokens: 100,
+    cached_input_tokens: 40,
+    output_tokens: 20,
+    reasoning_output_tokens: 5,
+    total_tokens: 120,
+  });
+
+  const responses = runMcp([
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "lcm_list_sessions", arguments: { since: "2026-07-14T13:59:00.000Z", parentSessionId: "parent-session" } },
+    },
+    {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "lcm_usage", arguments: { since: "2026-07-14T13:59:00.000Z" } },
+    },
+  ], { CODEX_LCM_HOME: home });
+  assert.equal(responses[1].result.structuredContent.page.sessions[0].parent_session_id, "parent-session");
+  assert.equal(responses[2].result.structuredContent.usage.totals.total_tokens, 120);
+});
+
+test("metadata backfill does not duplicate events imported by an older version", () => {
+  const sourceDir = tempHome("codex-lcm-upgrade-source-");
+  const source = path.join(sourceDir, "rollout-upgrade-session.jsonl");
+  const sessionMeta = {
+    id: "upgrade-session",
+    cwd: "/tmp/upgrade",
+    agent_role: "worker",
+    parent_thread_id: "parent-session",
+  };
+  const rows = [
+    { timestamp: "2026-07-14T15:00:00.000Z", type: "session_meta", payload: sessionMeta },
+    {
+      timestamp: "2026-07-14T15:00:01.000Z",
+      type: "turn_context",
+      payload: { turn_id: "turn-1", cwd: "/tmp/upgrade", model: "gpt-5.6-sol", effort: "high" },
+    },
+    {
+      timestamp: "2026-07-14T15:00:02.000Z",
+      type: "event_msg",
+      payload: { type: "user_message", message: "upgrade compatibility prompt" },
+    },
+    {
+      timestamp: "2026-07-14T15:00:03.000Z",
+      type: "event_msg",
+      payload: { type: "token_count", info: { total_token_usage: { input_tokens: 10, total_tokens: 10 } } },
+    },
+  ];
+  fs.writeFileSync(source, `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+  const home = tempHome("codex-lcm-upgrade-home-");
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "SessionStart",
+    rawInput: JSON.stringify({
+      session_id: "upgrade-session",
+      cwd: "/tmp/upgrade",
+      imported_from: source,
+      codex_record_type: "session_meta",
+      source_timestamp: rows[0].timestamp,
+      metadata: sessionMeta,
+    }),
+    env: {},
+    now: () => new Date(rows[0].timestamp),
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      prompt: "upgrade compatibility prompt",
+      imported_from: source,
+      codex_record_type: "event_msg",
+      source_timestamp: rows[2].timestamp,
+      turn_id: "turn-1",
+      session_id: "upgrade-session",
+      cwd: "/tmp/upgrade",
+    }),
+    env: {},
+    now: () => new Date(rows[2].timestamp),
+  }));
+  storage.close();
+
+  const result = runCli(["import-codex-sessions", "--from", source, "--json"], {
+    env: { CODEX_LCM_HOME: home },
+  });
+  assertCliOk(result);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.events_imported, 2);
+  assert.equal(report.events_skipped_duplicate, 2);
+
+  const listed = runCli(["sessions", "--json"], { env: { CODEX_LCM_HOME: home } });
+  assertCliOk(listed);
+  const [session] = JSON.parse(listed.stdout).sessions;
+  assert.equal(session.event_count, 4);
+  assert.equal(session.parent_session_id, "parent-session");
+  assert.equal(session.agent_role, "worker");
+  assert.equal(session.model, "gpt-5.6-sol");
+  assert.equal(session.reasoning_effort, "high");
+  assert.equal(session.total_tokens, 10);
 });
 
 test("import-codex-sessions recalls standalone event messages and re-imports them idempotently", () => {

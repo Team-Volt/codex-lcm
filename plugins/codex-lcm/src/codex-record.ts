@@ -13,6 +13,8 @@ export type ImportState = MessageFingerprintState & {
   cwd?: string;
   repoRoot?: string;
   gitBranch?: string;
+  model?: string;
+  reasoningEffort?: string;
 };
 
 export function codexRecordToEvent(
@@ -58,7 +60,20 @@ export function codexRecordToEvent(
     state.cwd = stringValue(payload.cwd) || state.cwd;
     state.repoRoot = stringValue(payload.repo_root) || stringValue(payload.repoRoot) || state.repoRoot;
     state.gitBranch = stringValue(payload.git_branch) || stringValue(payload.gitBranch) || state.gitBranch;
-    return undefined;
+    state.model = stringValue(payload.model) || state.model;
+    state.reasoningEffort = stringValue(payload.effort) || stringValue(payload.reasoning_effort) || state.reasoningEffort;
+    if (!state.model && !state.reasoningEffort) return undefined;
+    return normalizeImportEvent({
+      hookEvent: "TurnContext",
+      timestamp,
+      sessionId: state.sessionId || sessionIdFromFile(file),
+      cwd: state.cwd || "",
+      payload: basePayload(file, type, timestamp, state, {
+        ...(state.model ? { model: state.model } : {}),
+        ...(state.reasoningEffort ? { reasoning_effort: state.reasoningEffort } : {}),
+      }),
+      state,
+    });
   }
 
   if (type === "compacted") {
@@ -80,6 +95,29 @@ export function codexRecordToEvent(
 
   if (type === "event_msg") {
     const eventType = stringValue(payload.type);
+    if (eventType === "token_count" && isRecord(payload.info)) {
+      const usage = isRecord(payload.info.total_token_usage) ? payload.info.total_token_usage : undefined;
+      if (!usage) return undefined;
+      return normalizeImportEvent({
+        hookEvent: "TokenCount",
+        timestamp,
+        sessionId: state.sessionId || sessionIdFromFile(file),
+        cwd: state.cwd || "",
+        payload: basePayload(file, type, timestamp, state, {
+          usage: {
+            input_token_count: usage.input_tokens,
+            cached_input_token_count: usage.cached_input_tokens,
+            output_token_count: usage.output_tokens,
+            reasoning_output_token_count: usage.reasoning_output_tokens,
+            total_token_count: usage.total_tokens,
+          },
+          ...(typeof payload.info.model_context_window === "number"
+            ? { model_context_window: payload.info.model_context_window }
+            : {}),
+        }),
+        state,
+      });
+    }
     const role = eventType === "user_message"
       ? "user"
       : eventType === "agent_message"
