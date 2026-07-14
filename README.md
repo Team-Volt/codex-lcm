@@ -208,6 +208,8 @@ node bin/codex-lcm doctor --json
 node bin/codex-lcm health --json
 node bin/codex-lcm stats --json
 node bin/codex-lcm status --json
+node bin/codex-lcm sessions --since 2026-07-13T00:00:00Z --json
+node bin/codex-lcm usage --since 2026-07-13T00:00:00Z --json
 node bin/codex-lcm import-codex-sessions --dry-run --json
 ```
 
@@ -216,6 +218,8 @@ summary indexing, and concrete recommendations. `import-codex-sessions` scans
 existing Codex JSONL transcripts, defaulting to `~/.codex/sessions`, and ingests
 them into LCM without modifying the source files. Use `--dry-run` first to see
 how many records are importable; repeated imports skip duplicate event IDs.
+Re-run the import after upgrading to backfill session lineage, runtime metadata,
+and cumulative token usage from existing transcripts.
 
 `stats --json` includes `hook_event_counts`, so `PreCompact` capture can be
 checked without opening raw logs or SQLite.

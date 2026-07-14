@@ -87,6 +87,40 @@ export async function main(argv: string[]): Promise<void> {
     }
     return;
   }
+  if (command === "sessions") {
+    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    try {
+      printObjectOrText(storage.listSessions({
+        since: optionValue(rest, "--since"),
+        until: optionValue(rest, "--until"),
+        cwd: optionValue(rest, "--cwd"),
+        repoRoot: optionValue(rest, "--repo-root"),
+        parentSessionId: optionValue(rest, "--parent-session-id"),
+        rootsOnly: rest.includes("--roots-only"),
+        limit: numberOptionValue(rest, "--limit"),
+        cursor: optionValue(rest, "--cursor"),
+      }));
+    } finally {
+      storage.close();
+    }
+    return;
+  }
+  if (command === "usage") {
+    const storage = createStorage({ config: loadConfig(), readOnly: true });
+    try {
+      printObjectOrText(storage.usage({
+        since: optionValue(rest, "--since"),
+        until: optionValue(rest, "--until"),
+        cwd: optionValue(rest, "--cwd"),
+        repoRoot: optionValue(rest, "--repo-root"),
+        parentSessionId: optionValue(rest, "--parent-session-id"),
+        rootsOnly: rest.includes("--roots-only"),
+      }));
+    } finally {
+      storage.close();
+    }
+    return;
+  }
   if (command === "context-plan") {
     const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
@@ -116,6 +150,8 @@ Commands:
   codex-lcm doctor [--json]              Diagnose install, storage, and capture state
   codex-lcm health [--json]
   codex-lcm stats [--json]
+  codex-lcm sessions [--since ISO] [--until ISO] [--cwd PATH] [--repo-root PATH] [--parent-session-id ID] [--roots-only] [--limit N] [--cursor N] [--json]
+  codex-lcm usage [--since ISO] [--until ISO] [--cwd PATH] [--repo-root PATH] [--parent-session-id ID] [--roots-only] [--json]
   codex-lcm context-plan [--session-id ID] [--cwd PATH] [--repo-root PATH] [--model-context-window N] [--auto-compact-token-limit N] [--recent-event-limit N] [--json]
   codex-lcm benchmark long-context [--events N] [--budget-tokens N] [--home PATH] [--json]
   codex-lcm import-codex-sessions [--from PATH] [--dry-run] [--progress] [--batch-size N] [--json]

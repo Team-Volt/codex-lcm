@@ -36,15 +36,43 @@ test("hook command ingests a synthetic projectless prompt event", () => {
   assert.equal(JSON.parse(health.stdout).event_count, 1);
 });
 
-test("hook command rejects oversized stdin before writing storage", () => {
+test("hook command stores a sanitized overflow reference for oversized valid input", () => {
+  const home = tempHome();
+  const secret = "sk-test-overflow-secret-1234567890";
+  const result = runCli(["hook", "UserPromptSubmit"], {
+    input: JSON.stringify({
+      session_id: "oversized-hook-session",
+      cwd: "/tmp/oversized-hook",
+      api_key: secret,
+      prompt: "x".repeat(512 * 1024),
+    }),
+    env: { CODEX_LCM_HOME: home },
+  });
+
+  assertCliOk(result);
+  const [event] = readJsonl(path.join(home, "events.jsonl")) as Array<{
+    session_id: string;
+    payload: { overflow_ref?: { path?: string; sha256?: string; byte_count?: number } };
+  }>;
+  assert.equal(event.session_id, "oversized-hook-session");
+  assert.match(event.payload.overflow_ref?.sha256 ?? "", /^[a-f0-9]{64}$/u);
+  assert.equal((event.payload.overflow_ref?.byte_count ?? 0) > 512 * 1024, true);
+  const overflowPath = event.payload.overflow_ref?.path ?? "";
+  assert.equal(fs.existsSync(overflowPath), true);
+  const overflow = fs.readFileSync(overflowPath, "utf8");
+  assert.doesNotMatch(overflow, new RegExp(secret, "u"));
+  assert.match(overflow, /\[REDACTED:secret\]/u);
+});
+
+test("hook command still rejects input above the overflow safety ceiling", () => {
   const home = tempHome();
   const result = runCli(["hook", "UserPromptSubmit"], {
-    input: "x".repeat(512 * 1024 + 1),
+    input: "x".repeat(8 * 1024 * 1024 + 1),
     env: { CODEX_LCM_HOME: home },
   });
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /exceeds the 524288 byte limit/u);
+  assert.match(result.stderr, /exceeds the 8388608 byte limit/u);
   assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
 });
 

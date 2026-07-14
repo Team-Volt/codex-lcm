@@ -21,6 +21,8 @@ node bin/codex-lcm hook UserPromptSubmit
 node bin/codex-lcm status
 node bin/codex-lcm health
 node bin/codex-lcm stats
+node bin/codex-lcm sessions --since 2026-07-13T00:00:00Z
+node bin/codex-lcm usage --since 2026-07-13T00:00:00Z
 node bin/codex-lcm context-plan
 node bin/codex-lcm benchmark long-context
 ```
@@ -45,7 +47,11 @@ node bin/codex-lcm benchmark long-context --json
 state, and recommendations. `import-codex-sessions` imports existing Codex
 session JSONL files from `~/.codex/sessions` unless `--from PATH` is provided.
 It leaves source transcripts untouched and skips duplicate event IDs on repeated
-runs. `context-plan` estimates recent-session token pressure and recommends
+runs. Re-run it after upgrading to backfill parent-session links, model and
+reasoning metadata, and cumulative token usage from existing transcripts.
+`sessions` accepts time, cwd, repository, parent-session, root-only, and cursor
+filters; `usage` aggregates the same filtered session set. `context-plan`
+estimates recent-session token pressure and recommends
 when to pack LCM context; it does not control Codex compaction. The benchmark
 command generates a temporary synthetic long session and verifies old evidence
 can still be recovered through `lcm_pack_context`.
@@ -66,6 +72,8 @@ Diagnostics and lower-level tools:
 - `lcm_stats`
 - `lcm_context_plan`
 - `lcm_current_session`
+- `lcm_list_sessions`
+- `lcm_usage`
 - `lcm_search_sessions`
 - `lcm_get_session`
 - `lcm_get_session_summary`
@@ -108,7 +116,7 @@ Hooks capture the JSON payload Codex sends on stdin for:
 - `SubagentStop`
 - `Stop`
 
-Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes. Large path-backed outputs are indexed as file references with path, byte count, SHA-256, MIME guess, and a compact exploration summary; the indexed metadata does not reload the full content.
+Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes. Inputs over 512 KiB keep the normal bounded event plus a redacted, content-addressed overflow file; inputs over 8 MiB are rejected. Large path-backed outputs are indexed as file references with path, byte count, SHA-256, MIME guess, and a compact exploration summary; the indexed metadata does not reload the full content.
 
 Project and git data are metadata only. Search and retrieval are session-first and work for projectless sessions.
 

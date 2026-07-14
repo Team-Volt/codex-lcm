@@ -66,6 +66,33 @@ export type SearchSessionArgs = {
   excludeSessionIds?: string[];
 };
 
+export type ListSessionsArgs = {
+  since?: string;
+  until?: string;
+  cwd?: string;
+  repoRoot?: string;
+  parentSessionId?: string;
+  rootsOnly?: boolean;
+  limit?: number;
+  cursor?: string;
+};
+
+export type SessionPage = {
+  sessions: SessionSummary[];
+  next_cursor?: string;
+};
+
+export type UsageReport = {
+  totals: {
+    sessions: number;
+    input_tokens: number;
+    cached_input_tokens: number;
+    output_tokens: number;
+    reasoning_output_tokens: number;
+    total_tokens: number;
+  };
+};
+
 type SummaryNodeSearchArgs = SearchSessionArgs & {
   sessionIds?: string[];
 };
@@ -78,6 +105,16 @@ export type SessionSummary = {
   repo_root?: string;
   git_branch?: string;
   event_count: number;
+  parent_session_id?: string;
+  agent_role?: string;
+  agent_nickname?: string;
+  model?: string;
+  reasoning_effort?: string;
+  total_input_tokens?: number;
+  cached_input_tokens?: number;
+  output_tokens?: number;
+  reasoning_output_tokens?: number;
+  total_tokens?: number;
   match_count?: number;
   best_match?: SessionSearchMatch;
   discovery?: SessionDiscovery;
@@ -724,6 +761,100 @@ export class LcmStorage {
     };
   }
 
+  listSessions(args: ListSessionsArgs = {}): SessionPage {
+    const limit = clampLimit(args.limit, 50, 500);
+    const offset = parseCursor(args.cursor);
+    const since = parseTimestamp(args.since, "since");
+    const until = parseTimestamp(args.until, "until");
+    if (!this.db) {
+      const matches = summarizeSessions(readRawEvents(this.config.rawLogPath))
+        .filter((session) => !since || session.last_seen >= since)
+        .filter((session) => !until || session.first_seen <= until)
+        .filter((session) => !args.cwd || session.cwd === args.cwd)
+        .filter((session) => !args.repoRoot || session.repo_root === args.repoRoot)
+        .filter((session) => !args.rootsOnly || !session.parent_session_id)
+        .filter((session) => !args.parentSessionId || session.parent_session_id === args.parentSessionId);
+      const sessions = matches.slice(offset, offset + limit);
+      return {
+        sessions,
+        ...(offset + sessions.length < matches.length ? { next_cursor: String(offset + sessions.length) } : {}),
+      };
+    }
+    const rows = this.db.prepare(`
+      SELECT * FROM sessions
+      WHERE (?1 IS NULL OR last_seen >= ?1)
+        AND (?2 IS NULL OR first_seen <= ?2)
+        AND (?3 IS NULL OR cwd = ?3)
+        AND (?4 IS NULL OR repo_root = ?4)
+        AND (?5 = 0 OR parent_session_id IS NULL)
+        AND (?6 IS NULL OR parent_session_id = ?6)
+      ORDER BY last_seen DESC, session_id ASC
+      LIMIT ?7 OFFSET ?8
+    `).all(
+      since ?? null,
+      until ?? null,
+      args.cwd ?? null,
+      args.repoRoot ?? null,
+      args.rootsOnly ? 1 : 0,
+      args.parentSessionId ?? null,
+      limit + 1,
+      offset,
+    );
+    const sessions = rows.slice(0, limit).map(rowToSessionSummary);
+    return {
+      sessions,
+      ...(rows.length > limit ? { next_cursor: String(offset + limit) } : {}),
+    };
+  }
+
+  usage(args: Omit<ListSessionsArgs, "limit" | "cursor"> = {}): UsageReport {
+    const since = parseTimestamp(args.since, "since");
+    const until = parseTimestamp(args.until, "until");
+    if (!this.db) {
+      const sessions = summarizeSessions(readRawEvents(this.config.rawLogPath))
+        .filter((session) => !since || session.last_seen >= since)
+        .filter((session) => !until || session.first_seen <= until)
+        .filter((session) => !args.cwd || session.cwd === args.cwd)
+        .filter((session) => !args.repoRoot || session.repo_root === args.repoRoot)
+        .filter((session) => !args.rootsOnly || !session.parent_session_id)
+        .filter((session) => !args.parentSessionId || session.parent_session_id === args.parentSessionId);
+      return usageFromSessions(sessions);
+    }
+    const row = this.db.prepare(`
+      SELECT
+        COUNT(*) AS sessions,
+        COALESCE(SUM(total_input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+        COALESCE(SUM(output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(reasoning_output_tokens), 0) AS reasoning_output_tokens,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens
+      FROM sessions
+      WHERE (?1 IS NULL OR last_seen >= ?1)
+        AND (?2 IS NULL OR first_seen <= ?2)
+        AND (?3 IS NULL OR cwd = ?3)
+        AND (?4 IS NULL OR repo_root = ?4)
+        AND (?5 = 0 OR parent_session_id IS NULL)
+        AND (?6 IS NULL OR parent_session_id = ?6)
+    `).get(
+      since ?? null,
+      until ?? null,
+      args.cwd ?? null,
+      args.repoRoot ?? null,
+      args.rootsOnly ? 1 : 0,
+      args.parentSessionId ?? null,
+    ) as Record<string, unknown>;
+    return {
+      totals: {
+        sessions: Number(row.sessions),
+        input_tokens: Number(row.input_tokens),
+        cached_input_tokens: Number(row.cached_input_tokens),
+        output_tokens: Number(row.output_tokens),
+        reasoning_output_tokens: Number(row.reasoning_output_tokens),
+        total_tokens: Number(row.total_tokens),
+      },
+    };
+  }
+
   searchSessions(args: SearchSessionArgs): SessionSummary[] {
     const limit = clampLimit(args.limit, 10);
     const excludedSessionIds = this.excludedSearchSessionIds(args);
@@ -741,7 +872,7 @@ export class LcmStorage {
     if (query.length === 0) {
       const searchLimit = excludedSessionIds.size > 0 ? Math.max(limit * 4, 20) : limit;
       return this.db.prepare(`
-        SELECT session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count
+        SELECT *
         FROM sessions
         WHERE (?1 IS NULL OR cwd = ?1)
           AND (?2 IS NULL OR repo_root = ?2)
@@ -755,7 +886,7 @@ export class LcmStorage {
 
     let rows: unknown[] = [];
     const eventStatement = this.db.prepare(`
-        SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
+        SELECT s.*,
                e.raw_json AS match_text, e.timestamp AS match_timestamp, 1 AS match_weight,
                'event' AS match_kind, e.event_id AS match_event_id
         FROM event_fts f
@@ -769,7 +900,7 @@ export class LcmStorage {
         LIMIT ?4
       `);
     const summaryStatement = this.db.prepare(`
-        SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
+        SELECT s.*,
                ss.summary_text AS match_text, ss.updated_at AS match_timestamp, 3 AS match_weight,
                'session_summary' AS match_kind, ss.topics_json AS match_topics_json,
                ss.source_event_ids_json AS match_source_event_ids_json
@@ -783,7 +914,7 @@ export class LcmStorage {
         LIMIT ?4
       `);
     const summaryNodeStatement = this.db.prepare(`
-        SELECT s.session_id, s.first_seen, s.last_seen, s.cwd, s.repo_root, s.git_branch, s.event_count,
+        SELECT s.*,
                n.summary_text AS match_text, n.latest_at AS match_timestamp, 4 AS match_weight,
                'summary_node' AS match_kind, n.node_id AS match_node_id, n.depth AS match_depth,
                n.topics_json AS match_topics_json,
@@ -826,7 +957,7 @@ export class LcmStorage {
         .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot))[0];
     }
     const row = this.db.prepare(`
-      SELECT session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count
+      SELECT *
       FROM sessions
       WHERE (?1 IS NULL OR cwd = ?1)
         AND (?2 IS NULL OR repo_root = ?2)
@@ -1735,7 +1866,17 @@ export class LcmStorage {
         cwd TEXT NOT NULL,
         repo_root TEXT,
         git_branch TEXT,
-        event_count INTEGER NOT NULL DEFAULT 0
+        event_count INTEGER NOT NULL DEFAULT 0,
+        parent_session_id TEXT,
+        agent_role TEXT,
+        agent_nickname TEXT,
+        model TEXT,
+        reasoning_effort TEXT,
+        total_input_tokens INTEGER,
+        cached_input_tokens INTEGER,
+        output_tokens INTEGER,
+        reasoning_output_tokens INTEGER,
+        total_tokens INTEGER
       );
       CREATE TABLE IF NOT EXISTS events (
         event_id TEXT PRIMARY KEY,
@@ -1862,12 +2003,27 @@ export class LcmStorage {
     this.ensureColumn("events", "turn_id", "TEXT");
     this.ensureColumn("events", "tool_use_id", "TEXT");
     this.ensureColumn("session_summaries", "summary_version", "INTEGER");
+    const backfillSessionMetadata = [
+      this.ensureColumn("sessions", "parent_session_id", "TEXT"),
+      this.ensureColumn("sessions", "agent_role", "TEXT"),
+      this.ensureColumn("sessions", "agent_nickname", "TEXT"),
+      this.ensureColumn("sessions", "model", "TEXT"),
+      this.ensureColumn("sessions", "reasoning_effort", "TEXT"),
+      this.ensureColumn("sessions", "total_input_tokens", "INTEGER"),
+      this.ensureColumn("sessions", "cached_input_tokens", "INTEGER"),
+      this.ensureColumn("sessions", "output_tokens", "INTEGER"),
+      this.ensureColumn("sessions", "reasoning_output_tokens", "INTEGER"),
+      this.ensureColumn("sessions", "total_tokens", "INTEGER"),
+    ].some(Boolean);
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_events_session_turn ON events(session_id, turn_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_tool_use ON events(session_id, tool_use_id, hook_event, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_session_hook_time ON events(session_id, hook_event, timestamp);
       CREATE INDEX IF NOT EXISTS idx_events_session_time ON events(session_id, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, last_seen);
+      CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
     `);
+    if (backfillSessionMetadata) this.backfillExistingSessionMetadata();
   }
 
   private indexEventInTransaction(event: NormalizedEvent, options: { rebuildSummary: boolean }): IndexEventResult {
@@ -1875,6 +2031,7 @@ export class LcmStorage {
     const raw = JSON.stringify(event);
     const text = eventSearchText(event);
     const metadata = extractEventMetadata(event);
+    const sessionMetadata = extractSessionMetadata(event);
     const insert = this.db.prepare(`
       INSERT OR IGNORE INTO events
         (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, text, raw_json)
@@ -1896,13 +2053,27 @@ export class LcmStorage {
       return { inserted: false, summaryTouched: false };
     }
     this.db.prepare(`
-      INSERT INTO sessions (session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count)
-      VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1)
+      INSERT INTO sessions
+        (session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count,
+         parent_session_id, agent_role, agent_nickname, model, reasoning_effort,
+         total_input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens)
+      VALUES (?1, ?2, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
       ON CONFLICT(session_id) DO UPDATE SET
+        first_seen = CASE WHEN excluded.first_seen < sessions.first_seen THEN excluded.first_seen ELSE sessions.first_seen END,
         last_seen = CASE WHEN excluded.last_seen > sessions.last_seen THEN excluded.last_seen ELSE sessions.last_seen END,
         cwd = excluded.cwd,
         repo_root = COALESCE(excluded.repo_root, sessions.repo_root),
         git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
+        parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
+        agent_role = COALESCE(excluded.agent_role, sessions.agent_role),
+        agent_nickname = COALESCE(excluded.agent_nickname, sessions.agent_nickname),
+        model = COALESCE(excluded.model, sessions.model),
+        reasoning_effort = COALESCE(excluded.reasoning_effort, sessions.reasoning_effort),
+        total_input_tokens = ${maxNullable("sessions.total_input_tokens", "excluded.total_input_tokens")},
+        cached_input_tokens = ${maxNullable("sessions.cached_input_tokens", "excluded.cached_input_tokens")},
+        output_tokens = ${maxNullable("sessions.output_tokens", "excluded.output_tokens")},
+        reasoning_output_tokens = ${maxNullable("sessions.reasoning_output_tokens", "excluded.reasoning_output_tokens")},
+        total_tokens = ${maxNullable("sessions.total_tokens", "excluded.total_tokens")},
         event_count = sessions.event_count + 1
     `).run(
       event.session_id,
@@ -1910,6 +2081,16 @@ export class LcmStorage {
       event.cwd,
       event.repo_root ?? null,
       event.git_branch ?? null,
+      sessionMetadata.parent_session_id ?? null,
+      sessionMetadata.agent_role ?? null,
+      sessionMetadata.agent_nickname ?? null,
+      sessionMetadata.model ?? null,
+      sessionMetadata.reasoning_effort ?? null,
+      sessionMetadata.total_input_tokens ?? null,
+      sessionMetadata.cached_input_tokens ?? null,
+      sessionMetadata.output_tokens ?? null,
+      sessionMetadata.reasoning_output_tokens ?? null,
+      sessionMetadata.total_tokens ?? null,
     );
     this.db.prepare(`
       INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
@@ -2175,8 +2356,8 @@ export class LcmStorage {
     return row !== undefined;
   }
 
-  private ensureColumn(table: string, column: string, type: string): void {
-    if (!this.db) return;
+  private ensureColumn(table: string, column: string, type: string): boolean {
+    if (!this.db) return false;
     const tableName = sqlIdentifier(table);
     const columnName = sqlIdentifier(column);
     const columnType = sqlColumnType(type);
@@ -2184,6 +2365,21 @@ export class LcmStorage {
       .map((row) => String((row as { name: string }).name));
     if (!columns.includes(columnName)) {
       this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`);
+      return true;
+    }
+    return false;
+  }
+
+  private backfillExistingSessionMetadata(): void {
+    if (!this.db) return;
+    const rows = this.db.prepare("SELECT raw_json FROM events WHERE hook_event = 'SessionStart'").all() as Array<{ raw_json: string }>;
+    const update = this.db.prepare(`
+      UPDATE sessions SET parent_session_id = ?2, agent_role = ?3, agent_nickname = ?4 WHERE session_id = ?1
+    `);
+    for (const row of rows) {
+      const event = JSON.parse(row.raw_json) as NormalizedEvent;
+      const metadata = extractSessionMetadata(event);
+      update.run(event.session_id, metadata.parent_session_id ?? null, metadata.agent_role ?? null, metadata.agent_nickname ?? null);
     }
   }
 
@@ -2309,7 +2505,7 @@ export class LcmStorage {
       return summarizeSessions(readRawEvents(this.config.rawLogPath).filter((event) => event.session_id === sessionId))[0];
     }
     const row = this.db.prepare(`
-      SELECT session_id, first_seen, last_seen, cwd, repo_root, git_branch, event_count
+      SELECT *
       FROM sessions
       WHERE session_id = ?1
     `).get(sessionId);
@@ -2575,6 +2771,22 @@ function rowToSessionSummary(row: unknown): SessionSummary {
     ...(record.repo_root ? { repo_root: String(record.repo_root) } : {}),
     ...(record.git_branch ? { git_branch: String(record.git_branch) } : {}),
     event_count: Number(record.event_count),
+    ...(record.parent_session_id ? { parent_session_id: String(record.parent_session_id) } : {}),
+    ...(record.agent_role ? { agent_role: String(record.agent_role) } : {}),
+    ...(record.agent_nickname ? { agent_nickname: String(record.agent_nickname) } : {}),
+    ...(record.model ? { model: String(record.model) } : {}),
+    ...(record.reasoning_effort ? { reasoning_effort: String(record.reasoning_effort) } : {}),
+    ...(record.total_input_tokens !== null && record.total_input_tokens !== undefined
+      ? { total_input_tokens: Number(record.total_input_tokens) }
+      : {}),
+    ...(record.cached_input_tokens !== null && record.cached_input_tokens !== undefined
+      ? { cached_input_tokens: Number(record.cached_input_tokens) }
+      : {}),
+    ...(record.output_tokens !== null && record.output_tokens !== undefined ? { output_tokens: Number(record.output_tokens) } : {}),
+    ...(record.reasoning_output_tokens !== null && record.reasoning_output_tokens !== undefined
+      ? { reasoning_output_tokens: Number(record.reasoning_output_tokens) }
+      : {}),
+    ...(record.total_tokens !== null && record.total_tokens !== undefined ? { total_tokens: Number(record.total_tokens) } : {}),
     ...(record.match_count !== undefined ? { match_count: Number(record.match_count) } : {}),
   };
 }
@@ -3096,6 +3308,13 @@ function parseCursor(cursor: string | undefined): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+function parseTimestamp(value: string | undefined, name: string): string | undefined {
+  if (!value) return undefined;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) throw new Error(`${name} must be a valid ISO-8601 timestamp.`);
+  return timestamp.toISOString();
+}
+
 function sqlIdentifier(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value)) {
     throw new Error(`Invalid SQL identifier: ${value}`);
@@ -3192,6 +3411,7 @@ function sortedSessionIds(sessionIds: Iterable<string>): string[] {
 function summarizeSessions(events: NormalizedEvent[]): SessionSummary[] {
   const sessions = new Map<string, SessionSummary>();
   for (const event of events) {
+    const metadata = extractSessionMetadata(event);
     const existing = sessions.get(event.session_id);
     if (!existing) {
       sessions.set(event.session_id, {
@@ -3203,6 +3423,7 @@ function summarizeSessions(events: NormalizedEvent[]): SessionSummary[] {
         ...(event.git_branch ? { git_branch: event.git_branch } : {}),
         event_count: 1,
         match_count: 1,
+        ...metadata,
       });
       continue;
     }
@@ -3213,6 +3434,16 @@ function summarizeSessions(events: NormalizedEvent[]): SessionSummary[] {
     existing.git_branch = event.git_branch ?? existing.git_branch;
     existing.event_count += 1;
     existing.match_count = (existing.match_count ?? 0) + 1;
+    existing.parent_session_id = metadata.parent_session_id ?? existing.parent_session_id;
+    existing.agent_role = metadata.agent_role ?? existing.agent_role;
+    existing.agent_nickname = metadata.agent_nickname ?? existing.agent_nickname;
+    existing.model = metadata.model ?? existing.model;
+    existing.reasoning_effort = metadata.reasoning_effort ?? existing.reasoning_effort;
+    existing.total_input_tokens = maxOptional(existing.total_input_tokens, metadata.total_input_tokens);
+    existing.cached_input_tokens = maxOptional(existing.cached_input_tokens, metadata.cached_input_tokens);
+    existing.output_tokens = maxOptional(existing.output_tokens, metadata.output_tokens);
+    existing.reasoning_output_tokens = maxOptional(existing.reasoning_output_tokens, metadata.reasoning_output_tokens);
+    existing.total_tokens = maxOptional(existing.total_tokens, metadata.total_tokens);
   }
   return [...sessions.values()].sort((a, b) => b.last_seen.localeCompare(a.last_seen));
 }
@@ -3224,8 +3455,81 @@ function extractEventMetadata(event: NormalizedEvent): { turn_id?: string; tool_
   };
 }
 
+function extractSessionMetadata(event: NormalizedEvent): Partial<SessionSummary> {
+  const usage = recordField(event.payload.usage);
+  const importedMetadata = recordField(event.payload.metadata);
+  return {
+    ...(stringField(event.payload.parent_session_id) || parentSessionId(importedMetadata)
+      ? { parent_session_id: stringField(event.payload.parent_session_id) || parentSessionId(importedMetadata) }
+      : {}),
+    ...(stringField(event.payload.agent_role) || stringField(importedMetadata?.agent_role)
+      ? { agent_role: stringField(event.payload.agent_role) || stringField(importedMetadata?.agent_role) }
+      : {}),
+    ...(stringField(event.payload.agent_nickname) || stringField(importedMetadata?.agent_nickname)
+      ? { agent_nickname: stringField(event.payload.agent_nickname) || stringField(importedMetadata?.agent_nickname) }
+      : {}),
+    ...(stringField(event.payload.model) ? { model: stringField(event.payload.model) } : {}),
+    ...(stringField(event.payload.reasoning_effort) ? { reasoning_effort: stringField(event.payload.reasoning_effort) } : {}),
+    ...(numberField(usage?.input_token_count) !== undefined ? { total_input_tokens: numberField(usage?.input_token_count) } : {}),
+    ...(numberField(usage?.cached_input_token_count) !== undefined
+      ? { cached_input_tokens: numberField(usage?.cached_input_token_count) }
+      : {}),
+    ...(numberField(usage?.output_token_count) !== undefined ? { output_tokens: numberField(usage?.output_token_count) } : {}),
+    ...(numberField(usage?.reasoning_output_token_count) !== undefined
+      ? { reasoning_output_tokens: numberField(usage?.reasoning_output_token_count) }
+      : {}),
+    ...(numberField(usage?.total_token_count) !== undefined ? { total_tokens: numberField(usage?.total_token_count) } : {}),
+  };
+}
+
+function parentSessionId(metadata: Record<string, unknown> | undefined): string | undefined {
+  const direct = stringField(metadata?.parent_thread_id);
+  if (direct) return direct;
+  const source = recordField(metadata?.source);
+  const subagent = recordField(source?.subagent);
+  return stringField(recordField(subagent?.thread_spawn)?.parent_thread_id);
+}
+
+function recordField(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function maxOptional(current: number | undefined, incoming: number | undefined): number | undefined {
+  if (incoming === undefined) return current;
+  if (current === undefined) return incoming;
+  return Math.max(current, incoming);
+}
+
 function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function maxNullable(current: string, incoming: string): string {
+  return `CASE WHEN ${incoming} IS NULL THEN ${current} WHEN ${current} IS NULL OR ${incoming} > ${current} THEN ${incoming} ELSE ${current} END`;
+}
+
+function usageFromSessions(sessions: SessionSummary[]): UsageReport {
+  return {
+    totals: sessions.reduce((totals, session) => ({
+      sessions: totals.sessions + 1,
+      input_tokens: totals.input_tokens + (session.total_input_tokens ?? 0),
+      cached_input_tokens: totals.cached_input_tokens + (session.cached_input_tokens ?? 0),
+      output_tokens: totals.output_tokens + (session.output_tokens ?? 0),
+      reasoning_output_tokens: totals.reasoning_output_tokens + (session.reasoning_output_tokens ?? 0),
+      total_tokens: totals.total_tokens + (session.total_tokens ?? 0),
+    }), {
+      sessions: 0,
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens: 0,
+    }),
+  };
 }
 
 function isCodexLcmToolEvent(event: NormalizedEvent): boolean {

@@ -11,18 +11,42 @@ import { createStorage } from "./storage.ts";
 export async function runHook(args: string[]): Promise<void> {
   const hookEvent = args[0];
   if (!hookEvent) throw new Error("Usage: codex-lcm hook <event>");
-  const rawInput = await readStdinWithLimit();
+  const config = loadConfig();
+  const rawInput = await readStdinWithLimit(config.limits.maxOverflowInputBytes);
   const payloadCwd = extractStringField(rawInput, "cwd") ?? process.env.PWD ?? process.cwd();
   const transcriptPath = hookEvent === "SubagentStop"
     ? extractStringField(rawInput, "agent_transcript_path")
     : undefined;
-  const config = loadConfig();
+  const repo = resolveGitMetadata(payloadCwd);
   const event = normalizeHookEvent({
     hookEvent,
     rawInput,
     env: process.env,
-    repo: resolveGitMetadata(payloadCwd),
+    repo,
   });
+  if (Buffer.byteLength(rawInput, "utf8") > config.limits.maxInputBytes) {
+    const fullEvent = normalizeHookEvent({
+      hookEvent,
+      rawInput,
+      env: process.env,
+      repo,
+      limits: {
+        maxStringBytes: config.limits.maxOverflowInputBytes,
+        maxPayloadBytes: config.limits.maxOverflowInputBytes,
+      },
+    });
+    const content = JSON.stringify(fullEvent.payload);
+    const hash = sha256(content);
+    fs.mkdirSync(config.overflowDir, { recursive: true, mode: 0o700 });
+    const overflowPath = path.join(config.overflowDir, `${hash}.json`);
+    if (!fs.existsSync(overflowPath)) fs.writeFileSync(overflowPath, content, { mode: 0o600 });
+    event.payload.overflow_ref = {
+      sha256: hash,
+      byte_count: Buffer.byteLength(rawInput, "utf8"),
+      sanitized_byte_count: Buffer.byteLength(content, "utf8"),
+      path: overflowPath,
+    };
+  }
   const storage = createStorage({ config });
   let stored = false;
   try {
@@ -132,7 +156,7 @@ function buildPostCompactLcmDirective(): string {
   ].join("\n");
 }
 
-async function readStdinWithLimit(limit = DEFAULT_LIMITS.maxInputBytes): Promise<string> {
+async function readStdinWithLimit(limit = DEFAULT_LIMITS.maxOverflowInputBytes): Promise<string> {
   const chunks: string[] = [];
   let bytes = 0;
   for await (const chunk of process.stdin) {

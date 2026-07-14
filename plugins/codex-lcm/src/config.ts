@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 export type LcmLimits = {
   maxInputBytes: number;
+  maxOverflowInputBytes: number;
   maxStringBytes: number;
   maxPayloadBytes: number;
   maxParseErrorPreviewBytes: number;
@@ -13,11 +14,13 @@ export type LcmConfig = {
   home: string;
   rawLogPath: string;
   indexPath: string;
+  overflowDir: string;
   limits: LcmLimits;
 };
 
 export const DEFAULT_LIMITS: LcmLimits = {
   maxInputBytes: 512 * 1024,
+  maxOverflowInputBytes: 8 * 1024 * 1024,
   maxStringBytes: 64 * 1024,
   maxPayloadBytes: 256 * 1024,
   maxParseErrorPreviewBytes: 4 * 1024,
@@ -33,6 +36,7 @@ export function loadConfig(options: { home?: string; env?: Record<string, string
     home,
     rawLogPath: path.join(home, "events.jsonl"),
     indexPath: path.join(home, "index.sqlite"),
+    overflowDir: path.join(home, "overflow"),
     limits: DEFAULT_LIMITS,
   };
 }

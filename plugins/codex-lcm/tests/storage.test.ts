@@ -930,6 +930,65 @@ test("indexes large path-backed tool outputs as file references", () => {
   storage.close();
 });
 
+test("lists root and child sessions with stable cursor pagination", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  for (const [sessionId, timestamp, parentSessionId] of [
+    ["root-new", "2026-07-14T12:00:02.000Z", undefined],
+    ["child", "2026-07-14T12:00:01.000Z", "root-old"],
+    ["root-old", "2026-07-14T12:00:00.000Z", undefined],
+  ] as const) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "SessionStart",
+      rawInput: JSON.stringify({
+        session_id: sessionId,
+        cwd: "/tmp/session-list",
+        ...(parentSessionId ? { parent_session_id: parentSessionId } : {}),
+      }),
+      env: {},
+      now: () => new Date(timestamp),
+    }));
+  }
+
+  const first = storage.listSessions({ since: "2026-07-14T12:00:00Z", limit: 1 });
+  const second = storage.listSessions({ since: "2026-07-14T12:00:00Z", limit: 1, cursor: first.next_cursor });
+  const roots = storage.listSessions({ since: "2026-07-14T12:00:00Z", rootsOnly: true });
+
+  assert.deepEqual(first.sessions.map((session) => session.session_id), ["root-new"]);
+  assert.equal(first.next_cursor, "1");
+  assert.deepEqual(second.sessions.map((session) => session.session_id), ["child"]);
+  assert.deepEqual(roots.sessions.map((session) => session.session_id), ["root-new", "root-old"]);
+  storage.close();
+});
+
+test("raw fallback usage includes more than one page of sessions", () => {
+  const home = tempHome();
+  fs.mkdirSync(path.join(home, "index.sqlite"));
+  const storage = createStorage({ home });
+  for (let index = 0; index < 501; index += 1) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "TokenCount",
+      rawInput: JSON.stringify({
+        session_id: `raw-usage-${index}`,
+        cwd: "/tmp/raw-usage",
+        usage: { input_token_count: 1, total_token_count: 1 },
+      }),
+      env: {},
+      now,
+    }));
+  }
+
+  assert.deepEqual(storage.usage().totals, {
+    sessions: 501,
+    input_tokens: 501,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: 501,
+  });
+  storage.close();
+});
+
 test("writable storage backfills file references for existing indexed events", () => {
   const home = tempHome();
   const content = JSON.stringify({
