@@ -1,6 +1,6 @@
 {
   "name": "codex-lcm",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Codex-native session-first lossless context memory plugin.",
   "license": "MIT",
   "author": "Team Volt",
