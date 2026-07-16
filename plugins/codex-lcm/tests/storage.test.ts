@@ -680,6 +680,41 @@ test("bulk ingest reuses the raw event ID cache warmed by single ingest", () => 
   }
 });
 
+test("reopening synchronized storage does not rescan the raw log", () => {
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const seed = createStorage({ home });
+  seed.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "reopen-fast-path", cwd: "/tmp/reopen-fast-path", prompt: "seed" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:00.000Z"),
+  }));
+  seed.close();
+
+  const fsModule = fs as typeof fs & { readFileSync: typeof fs.readFileSync };
+  const originalReadFileSync = fsModule.readFileSync;
+  let rawLogReads = 0;
+  fsModule.readFileSync = ((...args: Parameters<typeof originalReadFileSync>) => {
+    if (args[0] === rawLogPath) rawLogReads += 1;
+    return originalReadFileSync(...args);
+  }) as typeof originalReadFileSync;
+
+  try {
+    const reopened = createStorage({ home });
+    reopened.ingest(normalizeHookEvent({
+      hookEvent: "PostToolUse",
+      rawInput: JSON.stringify({ session_id: "reopen-fast-path", cwd: "/tmp/reopen-fast-path", tool_name: "Bash" }),
+      env: {},
+      now: () => new Date("2026-06-09T12:00:01.000Z"),
+    }));
+    reopened.close();
+    assert.equal(rawLogReads, 0);
+  } finally {
+    fsModule.readFileSync = originalReadFileSync;
+  }
+});
+
 test("bulk ingest can defer summary rebuilds until touched sessions are finalized", () => {
   const home = tempHome();
   const storage = createStorage({ home });

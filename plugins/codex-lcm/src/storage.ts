@@ -301,6 +301,7 @@ const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
 const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
+const RAW_LOG_INDEX_STATE_KEY = "raw_log_index_state_v1";
 
 type IndexEventResult = {
   inserted: boolean;
@@ -313,6 +314,12 @@ type RawEventIdCache = {
   size: number;
   mtimeMs: number;
   eventIds: Set<string>;
+};
+
+type RawLogState = {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
 };
 
 export class LcmStorage {
@@ -396,9 +403,16 @@ export class LcmStorage {
 
     let rawEventIds: Set<string>;
     let indexedEventIds: Set<string>;
+    let rawLogWasIndexed = false;
     try {
-      rawEventIds = this.readRawEventIds();
-      indexedEventIds = this.db ? this.knownEventIds(events.map((event) => event.event_id)) : rawEventIds;
+      rawLogWasIndexed = this.db ? this.rawLogIsIndexed() : false;
+      if (this.db) {
+        indexedEventIds = this.knownEventIds(events.map((event) => event.event_id));
+        rawEventIds = rawLogWasIndexed ? new Set(indexedEventIds) : this.readRawEventIds();
+      } else {
+        rawEventIds = this.readRawEventIds();
+        indexedEventIds = rawEventIds;
+      }
     } catch (error) {
       if (this.db) {
         try {
@@ -463,6 +477,7 @@ export class LcmStorage {
       const rebuiltSessions = summaryRebuild === "sessions"
         ? this.rebuildTouchedSummarySessions(touchedSessions)
         : sortedSessionIds(touchedSessions);
+      if (rawLogWasIndexed) this.recordRawLogState();
       this.db.exec("COMMIT");
       return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
     } catch (error) {
@@ -587,7 +602,8 @@ export class LcmStorage {
   }
 
   private replayRawLogToIndex(): void {
-    if (!this.db || !fs.existsSync(this.config.rawLogPath)) return;
+    if (!this.db) return;
+    if (this.rawLogIsIndexed()) return;
     const rawLog = readRawLog(this.config.rawLogPath);
     const rawEvents = rawLog.events;
     const indexedEvents = this.indexedEventsById();
@@ -598,6 +614,7 @@ export class LcmStorage {
     }
     if (rawEvents.length === 0) {
       if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([]);
+      else if (rawLog.malformedLineCount === 0) this.recordRawLogState();
       return;
     }
     const rawIds = new Set(rawEvents.map((event) => event.event_id));
@@ -611,7 +628,10 @@ export class LcmStorage {
       return;
     }
     const missingEvents = rawEvents.filter((event) => !indexedIds.has(event.event_id));
-    if (missingEvents.length === 0) return;
+    if (missingEvents.length === 0) {
+      if (rawLog.malformedLineCount === 0) this.recordRawLogState();
+      return;
+    }
 
     const touchedSessions = new Set<string>();
     this.db.exec("BEGIN IMMEDIATE");
@@ -621,6 +641,7 @@ export class LcmStorage {
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
+      if (rawLog.malformedLineCount === 0) this.recordRawLogState();
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -643,6 +664,7 @@ export class LcmStorage {
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
+      this.recordRawLogState();
       this.db.exec("COMMIT");
     } catch (error) {
       let rollbackError: unknown;
@@ -694,6 +716,28 @@ export class LcmStorage {
     if (!this.db) return new Map();
     const rows = this.db.prepare("SELECT event_id, raw_json FROM events").all() as Array<{ event_id: string; raw_json: string }>;
     return new Map(rows.map((row) => [row.event_id, row.raw_json]));
+  }
+
+  private rawLogIsIndexed(): boolean {
+    if (!this.db) return false;
+    const row = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(RAW_LOG_INDEX_STATE_KEY) as { value?: string } | undefined;
+    return row?.value === JSON.stringify(this.rawLogState());
+  }
+
+  private recordRawLogState(): void {
+    if (!this.db) return;
+    this.db.prepare(`
+      INSERT INTO index_metadata (key, value)
+      VALUES (?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(RAW_LOG_INDEX_STATE_KEY, JSON.stringify(this.rawLogState()));
+  }
+
+  private rawLogState(): RawLogState {
+    const stat = this.rawLogStat();
+    return stat
+      ? { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs }
+      : { size: 0, mtimeMs: 0, ctimeMs: 0 };
   }
 
   private rebuildTouchedSummarySessions(sessionIds: Iterable<string>): string[] {
