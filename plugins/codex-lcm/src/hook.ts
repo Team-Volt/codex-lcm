@@ -98,7 +98,7 @@ function postCompactRecoveryOutput(args: {
     return formatAdditionalContextOutput(args.hookEvent, buildPostCompactLcmDirective());
   }
   if (args.hookEvent === "Stop" && hasPostCompactPending(args.home, args.sessionId)) {
-    return `${JSON.stringify({ decision: "block", reason: buildPostCompactLcmDirective() })}\n`;
+    return `${JSON.stringify({ decision: "block", reason: "Post-compaction LCM recovery required: call `lcm_pack_context`, then continue." })}\n`;
   }
   if (
     args.hookEvent !== "UserPromptSubmit" &&

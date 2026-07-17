@@ -311,7 +311,7 @@ test("PostCompact pending marker blocks same-turn completion until LCM recovery"
   assertCliOk(stop);
   const output = JSON.parse(stop.stdout) as { readonly decision: string; readonly reason: string };
   assert.equal(output.decision, "block");
-  assert.match(output.reason, /lcm_pack_context/u);
+  assert.equal(output.reason, "Post-compaction LCM recovery required: call `lcm_pack_context`, then continue.");
 });
 
 test("post-compaction LCM nudge is emitted once per compacted session", () => {
