@@ -38,8 +38,8 @@ export type SessionMemorySummary = {
   source_event_ids: string[];
 };
 
-export const SUMMARY_ALGORITHM_VERSION = 3;
-export const SUMMARY_NODE_VERSION = 2;
+export const SUMMARY_ALGORITHM_VERSION = 4;
+export const SUMMARY_NODE_VERSION = 3;
 export const SUMMARY_NODE_CHUNK_SIZE = 8;
 export const SUMMARY_NODE_FANOUT = 4;
 export const SUMMARY_NODE_MAX_DEPTH = 8;
@@ -353,13 +353,14 @@ export function buildCondensedSummaryNode(nodes: SummaryNode[], depth: number): 
 
 export function buildSessionMemorySummary(events: NormalizedEvent[]): SessionMemorySummary {
   const sorted = [...events].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const summaryEvents = sorted.filter(isSummarySourceEvent);
   const sessionId = sorted[0]?.session_id ?? "";
   const latest = sorted.at(-1);
-  const prompts = sorted
+  const prompts = summaryEvents
     .filter((event) => event.hook_event === "UserPromptSubmit" || event.hook_event === "Note")
     .map(eventSignalText)
     .filter((text) => text.length > 0);
-  const outcomes = sorted
+  const outcomes = summaryEvents
     .filter((event) => event.hook_event === "Stop" || event.hook_event === "PreCompact" || event.hook_event === "PostCompact")
     .map(eventSignalText)
     .filter((text) => text.length > 0);
@@ -369,10 +370,9 @@ export function buildSessionMemorySummary(events: NormalizedEvent[]): SessionMem
     .slice(0, 8);
   const signalTexts = [...prompts, ...outcomes];
   const topics = extractTopics(signalTexts);
-  const title = titleFromText(prompts.at(-1) || prompts[0] || outcomes.at(-1) || latest?.hook_event || "Codex session");
+  const title = titleFromText(prompts[0] || outcomes[0] || latest?.hook_event || "Codex session");
   const overview = overviewFromSignals(prompts, outcomes);
-  const sourceEventIds = sorted
-    .filter((event) => isSummarySourceEvent(event))
+  const sourceEventIds = summaryEvents
     .map((event) => event.event_id);
   return {
     session_id: sessionId,
@@ -410,8 +410,17 @@ export function eventSignalText(event: NormalizedEvent): string {
 
 export function isSummarySourceEvent(event: NormalizedEvent): boolean {
   if (isGeneratedSuggestionEvent(event)) return false;
+  const signal = compactWhitespace(eventSignalText(event));
+  if (event.hook_event === "UserPromptSubmit") {
+    if (/^<heartbeat>/iu.test(signal)) return false;
+    if (/^<recommended_plugins>/iu.test(signal)) return false;
+  }
+  if (event.hook_event === "Stop") {
+    if (event.payload.stop_hook_active === true) return false;
+    if (/^<heartbeat>/iu.test(signal) && /<decision>\s*DONT_NOTIFY\s*<\/decision>/iu.test(signal)) return false;
+  }
   if (event.hook_event === "PostCompact") {
-    return compactWhitespace(eventSignalText(event)).length > 0;
+    return signal.length > 0;
   }
   return event.hook_event === "UserPromptSubmit" ||
     event.hook_event === "Note" ||

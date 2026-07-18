@@ -31,6 +31,8 @@ because context had to be recovered.
 - Use `lcm_stats` for aggregate storage, hook-event, summary-depth, graph-count, and freshness questions. It is the normal path for "how many summaries/nodes?" and "did PreCompact/PostCompact fire?" checks.
 - Use `lcm_context_plan` when deciding whether to pack LCM context before continuing a long or compacted session. It reports context pressure only; Codex owns compaction.
 - Keep retrieval bounded. Prefer packed context, graph slices, limits, and cursors over full-session dumps.
+- Keep Codex LCM MCP calls sequential. Do not fan out one call per session or run multiple LCM calls concurrently; each call opens an index reader and concurrent fan-out can multiply process and SQLite memory.
+- For date-range or multi-session reviews, call `lcm_list_sessions` once with `includeSummaries: true`, then follow its cursor sequentially if needed. Only describe or expand the small set of sessions whose compact summaries need source evidence.
 - The preferred standard workflow is `lcm_grep` -> `lcm_describe` -> `lcm_expand`: find candidates, inspect session or summary-node lineage, then expand a chosen summary node into bounded source evidence.
 - In Codex, `mcp__codex_lcm__lcm_grep` -> `mcp__codex_lcm__lcm_describe` -> `mcp__codex_lcm__lcm_expand` are those same standard tools. Agents must use the host-qualified form Codex shows when the bare names are absent rather than fall back to lower-level session APIs.
 - Use `lcm_expand_query` as the focused query-first alternative when you do not yet know which summary node to expand. It searches matching summary nodes and recursively expands source lineage into bounded evidence. It does not synthesize an answer. Use `overview: true` for broad lineage views, and remember `sourceLimit` is per matched node/source expansion.
@@ -63,7 +65,7 @@ because context had to be recovered.
 - Use `lcm_current_session` first when the current Codex session may matter.
 - Use `lcm_stats` when checking whether LCM is capturing hook events and building summaries, summary nodes, graph nodes, and graph edges as expected.
 - Use `lcm_grep` for normal discovery across summaries and high-signal events; inspect `discovery.confidence`, `discovery.reasons`, `best_match.kind`, `best_match.snippet`, and `best_match.topics` to decide which sessions deserve deeper retrieval.
-- Use `lcm_describe` to inspect session summary nodes, node depth, source IDs, and lineage before expanding.
+- Use `lcm_describe` to inspect compact session summary nodes and source counts before expanding. Set `includeLineage: true` only when exact source ID arrays are required.
 - Use `lcm_describe` with `fileId` to inspect large output references without loading full content.
 - Use `lcm_expand` only after choosing a summary node. It expands bounded source summary nodes and source events, not an entire transcript.
 - Use `lcm_expand_query` for focused recursive evidence expansion when the query itself should pick the matching summary nodes.

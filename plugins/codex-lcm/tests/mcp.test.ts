@@ -78,6 +78,9 @@ test("MCP server initializes and lists LCM tools", () => {
   assert.equal(expandQueryTool.inputSchema.properties.overview.type, "boolean");
   const contextPlanTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_context_plan");
   assert.equal(contextPlanTool.inputSchema.properties.canControlCompaction.const, false);
+  const listTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_list_sessions");
+  assert.equal(listTool.inputSchema.properties.includeSummaries.type, "boolean");
+  assert.equal(describeTool.inputSchema.properties.includeLineage.type, "boolean");
 });
 
 test("MCP server falls back to its supported protocol version", () => {
@@ -548,6 +551,15 @@ test("MCP standard LCM verbs grep, describe, and expand summary-node evidence", 
         arguments: { sessionId: "mcp-standard-verbs-session", limit: 20 },
       },
     },
+    {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "lcm_describe",
+        arguments: { sessionId: "mcp-standard-verbs-session", limit: 20, includeLineage: true },
+      },
+    },
   ], { CODEX_LCM_HOME: home });
 
   const matches = discoveryResponses[1].result.structuredContent.matches;
@@ -559,6 +571,10 @@ test("MCP standard LCM verbs grep, describe, and expand summary-node evidence", 
   assert.equal(description.session.session_id, "mcp-standard-verbs-session");
   assert.equal(description.summary.session_id, "mcp-standard-verbs-session");
   assert.equal(description.summary_nodes.length > 0, true);
+  assert.equal("source_event_ids" in description.summary, false);
+  assert.equal(description.summary.source_event_count > 0, true);
+  assert.equal("source_ids" in description.summary_nodes[0], false);
+  assert.equal(Array.isArray(discoveryResponses[3].result.structuredContent.description.summary.source_event_ids), true);
 
   const nodeId = description.summary_nodes.find((node: { depth: number }) => node.depth === 0)?.node_id ??
     description.summary_nodes[0].node_id;
@@ -580,7 +596,8 @@ test("MCP standard LCM verbs grep, describe, and expand summary-node evidence", 
   assert.equal(expansion.target, "summary_node");
   assert.equal(expansion.node.node_id, nodeId);
   assert.equal(expansion.source_events.length > 0, true);
-  assert.match(expansion.markdown, /canonical alias evidence/u);
+  assert.equal("markdown" in expansion, false);
+  assert.match(expansionResponses[1].result.content[0].text, /canonical alias evidence/u);
 });
 
 test("MCP describe inspects large file references without loading content", () => {
@@ -679,7 +696,8 @@ test("MCP expand_query returns recursive evidence for a focused query", () => {
 
   const expansion = responses[1].result.structuredContent.expansion;
   assert.equal(expansion.query, "mcp-expand-query-needle source lineage");
-  assert.match(expansion.markdown, /mcp-expand-query-needle source lineage decision/u);
+  assert.equal("markdown" in expansion, false);
+  assert.match(responses[1].result.content[0].text, /mcp-expand-query-needle source lineage decision/u);
   assert.equal(expansion.estimated_tokens <= 500, true);
   assert.equal(expansion.sources.some((source: { kind: string; node_id?: string }) => source.kind === "summary" && source.node_id), true);
   assert.equal(expansion.sources.some((source: { kind: string; event_id?: string }) => source.kind === "event" && source.event_id), true);
@@ -730,7 +748,7 @@ test("MCP pack context biases toward the active thread across cwd mismatches", (
     },
   ], { CODEX_LCM_HOME: home });
   assert.doesNotMatch(
-    withoutThread[1].result.structuredContent.markdown,
+    withoutThread[1].result.content[0].text,
     /Commented on spec PR 12977 that the spec matches intent/u,
   );
 
@@ -752,7 +770,8 @@ test("MCP pack context biases toward the active thread across cwd mismatches", (
   ], { CODEX_LCM_HOME: home, CODEX_THREAD_ID: targetThreadId });
 
   const packed = responses[1].result.structuredContent;
-  assert.match(packed.markdown, /Commented on spec PR 12977 that the spec matches intent/u);
+  assert.equal("markdown" in packed, false);
+  assert.match(responses[1].result.content[0].text, /Commented on spec PR 12977 that the spec matches intent/u);
   assert.equal(
     packed.sources.some((source: { session_id: string }) => source.session_id === targetSessionId),
     true,

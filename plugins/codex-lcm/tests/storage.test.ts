@@ -996,6 +996,186 @@ test("lists root and child sessions with stable cursor pagination", () => {
   storage.close();
 });
 
+test("lists compact session summaries in one bounded query", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  for (const [index, prompt] of ["Investigate LCM memory pressure", "Add the cleanup command"].entries()) {
+    storage.ingest(normalizeHookEvent({
+      hookEvent: "UserPromptSubmit",
+      rawInput: JSON.stringify({
+        session_id: "session-list-summary",
+        cwd: "/tmp/session-list-summary",
+        prompt,
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 6, 14, 12, 0, index)),
+    }));
+  }
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "Stop",
+    rawInput: JSON.stringify({
+      session_id: "session-list-summary",
+      cwd: "/tmp/session-list-summary",
+      last_assistant_message: "Cleanup implementation completed",
+    }),
+    env: {},
+    now: () => new Date("2026-07-14T12:00:02.000Z"),
+  }));
+
+  const plain = storage.listSessions({ cwd: "/tmp/session-list-summary" });
+  const enriched = storage.listSessions({ cwd: "/tmp/session-list-summary", includeSummaries: true });
+
+  assert.equal(plain.sessions[0].summary, undefined);
+  assert.match(enriched.sessions[0].summary?.title ?? "", /Investigate LCM memory pressure/u);
+  assert.equal(enriched.sessions[0].summary?.source_event_count, 3);
+  assert.deepEqual(enriched.sessions[0].summary?.outcomes, ["Cleanup implementation completed"]);
+  storage.close();
+});
+
+test("root usage includes descendant session tokens", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "TokenCount",
+    rawInput: JSON.stringify({
+      session_id: "usage-root",
+      cwd: "/tmp/usage-root",
+      usage: { input_token_count: 10, total_token_count: 10 },
+    }),
+    env: {},
+    now,
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "TokenCount",
+    rawInput: JSON.stringify({
+      session_id: "usage-child",
+      parent_session_id: "usage-root",
+      cwd: "/tmp/usage-child",
+      usage: { input_token_count: 20, total_token_count: 20 },
+    }),
+    env: {},
+    now,
+  }));
+
+  const usage = storage.usage({ cwd: "/tmp/usage-root", rootsOnly: true });
+
+  assert.equal(usage.totals.sessions, 2);
+  assert.equal(usage.totals.input_tokens, 30);
+  assert.equal(usage.totals.total_tokens, 30);
+  storage.close();
+});
+
+test("infers child lineage from codex delegation prompts", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "delegated-child",
+      cwd: "/tmp/delegated-child",
+      prompt: "<codex_delegation><source_thread_id>delegation-root</source_thread_id><task>inspect tests</task></codex_delegation>",
+    }),
+    env: {},
+    now,
+  }));
+
+  const child = storage.listSessions({ parentSessionId: "delegation-root" }).sessions[0];
+
+  assert.equal(child.session_id, "delegated-child");
+  assert.equal(child.parent_session_id, "delegation-root");
+  storage.close();
+});
+
+test("cleanup compacts legacy search text while preserving the raw log", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "cleanup-session", cwd: "/tmp/cleanup", prompt: "keep searchable cleanup evidence" }),
+    env: {},
+    now,
+  }));
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "PreToolUse",
+    rawInput: JSON.stringify({ session_id: "cleanup-session", cwd: "/tmp/cleanup", tool_name: "Read", tool_input: { path: "/tmp/file" } }),
+    env: {},
+    now,
+  }));
+  storage.close();
+
+  const rawLogPath = path.join(home, "events.jsonl");
+  const rawBefore = fs.readFileSync(rawLogPath, "utf8");
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  try {
+    db.exec("UPDATE events SET text = raw_json");
+    db.exec(`
+      INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
+      SELECT event_id, session_id, cwd, COALESCE(repo_root, ''), hook_event, raw_json
+      FROM events
+      WHERE hook_event = 'PreToolUse'
+    `);
+  } finally {
+    db.close();
+  }
+
+  const previewStorage = createStorage({ home, readOnly: true });
+  const preview = previewStorage.cleanupIndex();
+  previewStorage.close();
+  assert.equal(preview.applied, false);
+  assert.equal(preview.event_fts_rows_before, 2);
+  assert.equal(preview.projected_event_fts_rows, 1);
+  assert.equal(preview.event_text_bytes_before > 0, true);
+
+  const cleanupStorage = createStorage({ home });
+  const applied = cleanupStorage.cleanupIndex({ apply: true });
+  cleanupStorage.close();
+
+  assert.equal(applied.applied, true);
+  assert.equal(applied.event_fts_rows_after, 1);
+  assert.equal(applied.event_text_bytes_after, 0);
+  assert.equal(applied.raw_log_preserved, true);
+  assert.equal(fs.readFileSync(rawLogPath, "utf8"), rawBefore);
+  const verified = new DatabaseSync(path.join(home, "index.sqlite"), { readOnly: true });
+  try {
+    assert.equal(verified.prepare("PRAGMA quick_check").get()?.quick_check, "ok");
+  } finally {
+    verified.close();
+  }
+});
+
+test("cleanup acquires the write lock before snapshotting searchable events", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "cleanup-lock", cwd: "/tmp/cleanup-lock", prompt: "preserve concurrent evidence" }),
+    env: {},
+    now,
+  }));
+
+  const db = (storage as unknown as { db: DatabaseSync }).db;
+  const calls: string[] = [];
+  const originalExec = db.exec.bind(db);
+  const originalPrepare = db.prepare.bind(db);
+  db.exec = (sql: string) => {
+    calls.push(sql.trim());
+    return originalExec(sql);
+  };
+  db.prepare = (sql: string) => {
+    calls.push(sql.trim());
+    return originalPrepare(sql);
+  };
+
+  storage.cleanupIndex({ apply: true });
+  storage.close();
+
+  const beginIndex = calls.findIndex((sql) => sql === "BEGIN IMMEDIATE");
+  const snapshotIndex = calls.findIndex((sql) => sql.includes("SELECT raw_json") && sql.includes("FROM events"));
+  assert.equal(beginIndex >= 0, true);
+  assert.equal(snapshotIndex >= 0, true);
+  assert.equal(beginIndex < snapshotIndex, true);
+});
+
 test("raw fallback usage includes more than one page of sessions", () => {
   const home = tempHome();
   fs.mkdirSync(path.join(home, "index.sqlite"));
