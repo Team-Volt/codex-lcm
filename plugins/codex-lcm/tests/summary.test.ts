@@ -1,7 +1,46 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { queryTermHitCount, rankSummaryNodesForContext, type SummaryNode } from "../src/summary.ts";
+import { normalizeHookEvent } from "../src/events.ts";
+import {
+  buildSessionMemorySummary,
+  isSummarySourceEvent,
+  queryTermHitCount,
+  rankSummaryNodesForContext,
+  type SummaryNode,
+} from "../src/summary.ts";
+
+test("session summaries keep the first meaningful prompt as the stable title", () => {
+  const events = [
+    event("UserPromptSubmit", { prompt: "<recommended_plugins>generated bootstrap context</recommended_plugins>" }, 0),
+    event("UserPromptSubmit", { prompt: "Fix the database cleanup behavior" }, 1),
+    event("UserPromptSubmit", { prompt: "Now add one more unrelated request" }, 2),
+  ];
+
+  const summary = buildSessionMemorySummary(events);
+
+  assert.match(summary.title, /Fix the database cleanup behavior/u);
+  assert.doesNotMatch(summary.title, /unrelated request/u);
+});
+
+test("summary sources exclude silent heartbeats and stop-hook recovery output", () => {
+  const heartbeatPrompt = event("UserPromptSubmit", { prompt: "<heartbeat>check state</heartbeat>" }, 0);
+  const silentHeartbeat = event("Stop", {
+    last_assistant_message: "<heartbeat><decision>DONT_NOTIFY</decision></heartbeat>",
+  }, 1);
+  const recoveryStop = event("Stop", {
+    stop_hook_active: true,
+    last_assistant_message: "recovery replay output",
+  }, 2);
+  const visibleHeartbeat = event("Stop", {
+    last_assistant_message: "<heartbeat><decision>NOTIFY</decision><message>needs attention</message></heartbeat>",
+  }, 3);
+
+  assert.equal(isSummarySourceEvent(heartbeatPrompt), false);
+  assert.equal(isSummarySourceEvent(silentHeartbeat), false);
+  assert.equal(isSummarySourceEvent(recoveryStop), false);
+  assert.equal(isSummarySourceEvent(visibleHeartbeat), true);
+});
 
 test("summary ranking prefers source-rich focused context over a newer thin query echo", () => {
   const focusedDecision = summaryNode({
@@ -142,4 +181,13 @@ function summaryNode(overrides: Partial<SummaryNode>): SummaryNode {
     topics: ["retrieval", "ranking", "source", "lineage"],
     ...overrides,
   };
+}
+
+function event(hookEvent: string, payload: Record<string, unknown>, second: number) {
+  return normalizeHookEvent({
+    hookEvent,
+    rawInput: JSON.stringify({ session_id: "summary-quality-session", cwd: "/tmp/summary-quality", ...payload }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 6, 14, 12, 0, second)),
+  });
 }

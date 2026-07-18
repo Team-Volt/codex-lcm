@@ -548,6 +548,40 @@ test("expand query reports no matching evidence in markdown", () => {
   storage.close();
 });
 
+test("expand query falls back to summaries without escaping requested sessions", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "scoped-summary-target",
+    cwd: "/tmp/scoped-summary",
+    prompt: "target source evidence",
+  }, "2026-06-09T14:30:00.000Z");
+  ingest(storage, "UserPromptSubmit", {
+    session_id: "scoped-summary-other",
+    cwd: "/tmp/scoped-summary",
+    prompt: "other source evidence",
+  }, "2026-06-09T14:31:00.000Z");
+
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  try {
+    db.prepare("UPDATE session_summaries SET title = ?1, summary_text = summary_text || ?1 WHERE session_id = ?2")
+      .run("summary-only-scoped-needle", "scoped-summary-target");
+  } finally {
+    db.close();
+  }
+
+  const expansion = storage.expandQuery({
+    query: "summary-only-scoped-needle",
+    sessionIds: ["scoped-summary-target"],
+    budgetTokens: 300,
+  });
+
+  assert.equal(expansion.events.length > 0, true);
+  assert.equal(expansion.sources.every((source) => source.session_id === "scoped-summary-target"), true);
+  assert.doesNotMatch(expansion.markdown, /other source evidence/u);
+  storage.close();
+});
+
 test("expand query reserves markdown space for a focused event under tiny budgets", () => {
   const storage = createStorage({ home: tempHome() });
   const cwd = "/tmp/tiny-expand-query";
