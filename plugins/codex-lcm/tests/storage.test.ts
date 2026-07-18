@@ -1143,6 +1143,39 @@ test("cleanup compacts legacy search text while preserving the raw log", () => {
   }
 });
 
+test("cleanup acquires the write lock before snapshotting searchable events", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "cleanup-lock", cwd: "/tmp/cleanup-lock", prompt: "preserve concurrent evidence" }),
+    env: {},
+    now,
+  }));
+
+  const db = (storage as unknown as { db: DatabaseSync }).db;
+  const calls: string[] = [];
+  const originalExec = db.exec.bind(db);
+  const originalPrepare = db.prepare.bind(db);
+  db.exec = (sql: string) => {
+    calls.push(sql.trim());
+    return originalExec(sql);
+  };
+  db.prepare = (sql: string) => {
+    calls.push(sql.trim());
+    return originalPrepare(sql);
+  };
+
+  storage.cleanupIndex({ apply: true });
+  storage.close();
+
+  const beginIndex = calls.findIndex((sql) => sql === "BEGIN IMMEDIATE");
+  const snapshotIndex = calls.findIndex((sql) => sql.includes("SELECT raw_json") && sql.includes("FROM events"));
+  assert.equal(beginIndex >= 0, true);
+  assert.equal(snapshotIndex >= 0, true);
+  assert.equal(beginIndex < snapshotIndex, true);
+});
+
 test("raw fallback usage includes more than one page of sessions", () => {
   const home = tempHome();
   fs.mkdirSync(path.join(home, "index.sqlite"));
