@@ -591,50 +591,58 @@ export class LcmStorage {
     const apply = options.apply === true;
     if (apply && this.readOnly) throw new Error("Cleanup --apply requires writable storage.");
 
-    const databaseBytesBefore = fileSize(this.config.indexPath);
-    const eventFtsRowsBefore = Number(this.scalar("SELECT COUNT(*) AS count FROM event_fts"));
-    const eventTextBytesBefore = Number(this.scalar("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS count FROM events"));
-    const searchableEvents = (this.db.prepare(`
-      SELECT raw_json
-      FROM events
-      WHERE hook_event IN ${SUMMARY_SOURCE_HOOKS}
-      ORDER BY timestamp ASC, rowid ASC
-    `).all() as Array<{ raw_json: string }>)
-      .map((row) => JSON.parse(row.raw_json) as NormalizedEvent)
-      .filter(isSearchIndexEvent)
-      .filter((event) => !isCodexLcmToolEvent(event));
-    const summarySessionIds = new Set(searchableEvents
-      .filter(isSummarySourceEvent)
-      .map((event) => event.session_id));
-    const sessionIds = this.outdatedSummarySessionIds()
-      .filter((sessionId) => summarySessionIds.has(sessionId));
+    const inspectIndex = () => {
+      const searchableEvents = (this.db!.prepare(`
+        SELECT raw_json
+        FROM events
+        WHERE hook_event IN ${SUMMARY_SOURCE_HOOKS}
+        ORDER BY timestamp ASC, rowid ASC
+      `).all() as Array<{ raw_json: string }>)
+        .map((row) => JSON.parse(row.raw_json) as NormalizedEvent)
+        .filter(isSearchIndexEvent)
+        .filter((event) => !isCodexLcmToolEvent(event));
+      const summarySessionIds = new Set(searchableEvents
+        .filter(isSummarySourceEvent)
+        .map((event) => event.session_id));
+      return {
+        databaseBytesBefore: fileSize(this.config.indexPath),
+        eventFtsRowsBefore: Number(this.scalar("SELECT COUNT(*) AS count FROM event_fts")),
+        eventTextBytesBefore: Number(this.scalar("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS count FROM events")),
+        searchableEvents,
+        sessionIds: this.outdatedSummarySessionIds()
+          .filter((sessionId) => summarySessionIds.has(sessionId)),
+      };
+    };
 
     if (!apply) {
+      const inspection = inspectIndex();
       return {
         applied: false,
         raw_log_preserved: true,
         index_path: this.config.indexPath,
-        database_bytes_before: databaseBytesBefore,
-        database_bytes_after: databaseBytesBefore,
-        event_fts_rows_before: eventFtsRowsBefore,
-        event_fts_rows_after: eventFtsRowsBefore,
-        projected_event_fts_rows: searchableEvents.length,
-        event_text_bytes_before: eventTextBytesBefore,
-        event_text_bytes_after: eventTextBytesBefore,
-        projected_summaries_to_rebuild: sessionIds.length,
+        database_bytes_before: inspection.databaseBytesBefore,
+        database_bytes_after: inspection.databaseBytesBefore,
+        event_fts_rows_before: inspection.eventFtsRowsBefore,
+        event_fts_rows_after: inspection.eventFtsRowsBefore,
+        projected_event_fts_rows: inspection.searchableEvents.length,
+        event_text_bytes_before: inspection.eventTextBytesBefore,
+        event_text_bytes_after: inspection.eventTextBytesBefore,
+        projected_summaries_to_rebuild: inspection.sessionIds.length,
         summaries_rebuilt: 0,
         vacuumed: false,
       };
     }
 
     this.db.exec("BEGIN IMMEDIATE");
+    let inspection: ReturnType<typeof inspectIndex>;
     try {
+      inspection = inspectIndex();
       this.db.prepare("DELETE FROM event_fts").run();
       const insertSearchEvent = this.db.prepare(`
         INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
       `);
-      for (const event of searchableEvents) {
+      for (const event of inspection.searchableEvents) {
         insertSearchEvent.run(
           event.event_id,
           event.session_id,
@@ -655,7 +663,7 @@ export class LcmStorage {
       throw error;
     }
 
-    for (const sessionBatch of chunkArray(sessionIds, 10)) {
+    for (const sessionBatch of chunkArray(inspection.sessionIds, 10)) {
       this.reopenWritableIndex();
       this.db?.exec("BEGIN IMMEDIATE");
       try {
@@ -677,15 +685,15 @@ export class LcmStorage {
       applied: true,
       raw_log_preserved: true,
       index_path: this.config.indexPath,
-      database_bytes_before: databaseBytesBefore,
+      database_bytes_before: inspection.databaseBytesBefore,
       database_bytes_after: fileSize(this.config.indexPath),
-      event_fts_rows_before: eventFtsRowsBefore,
+      event_fts_rows_before: inspection.eventFtsRowsBefore,
       event_fts_rows_after: Number(this.scalar("SELECT COUNT(*) AS count FROM event_fts")),
-      projected_event_fts_rows: searchableEvents.length,
-      event_text_bytes_before: eventTextBytesBefore,
+      projected_event_fts_rows: inspection.searchableEvents.length,
+      event_text_bytes_before: inspection.eventTextBytesBefore,
       event_text_bytes_after: Number(this.scalar("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS count FROM events")),
-      projected_summaries_to_rebuild: sessionIds.length,
-      summaries_rebuilt: sessionIds.length,
+      projected_summaries_to_rebuild: inspection.sessionIds.length,
+      summaries_rebuilt: inspection.sessionIds.length,
       vacuumed: true,
     };
   }
