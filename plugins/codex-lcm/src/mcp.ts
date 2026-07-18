@@ -1,5 +1,5 @@
 import { DEFAULT_LIMITS } from "./config.ts";
-import { createStorage } from "./storage.ts";
+import { createStorage, type LcmDescription, type SummaryNode } from "./storage.ts";
 
 type JsonRpcRequest = {
   readonly jsonrpc: "2.0";
@@ -34,7 +34,7 @@ const TOOLS = [
   {
     name: "lcm_list_sessions",
     title: "LCM List Sessions",
-    description: "List sessions across projects with time, root/child, and pagination filters.",
+    description: "List sessions across projects with time, root/child, pagination, and optional compact summary filters.",
     inputSchema: {
       type: "object",
       properties: {
@@ -44,6 +44,7 @@ const TOOLS = [
         repoRoot: { type: "string" },
         parentSessionId: { type: "string" },
         rootsOnly: { type: "boolean", default: false },
+        includeSummaries: { type: "boolean", default: false, description: "Include compact titles, overviews, prompts, outcomes, and topics in this one response." },
         limit: { type: "number", default: 50 },
         cursor: { type: "string" },
       },
@@ -53,7 +54,7 @@ const TOOLS = [
   {
     name: "lcm_usage",
     title: "LCM Usage",
-    description: "Aggregate captured Codex token usage across filtered sessions.",
+    description: "Aggregate captured Codex token usage across filtered sessions. With rootsOnly, selected roots include all descendant sessions.",
     inputSchema: {
       type: "object",
       properties: {
@@ -95,6 +96,7 @@ const TOOLS = [
         nodeId: { type: "string" },
         fileId: { type: "string" },
         limit: { type: "number", default: 50 },
+        includeLineage: { type: "boolean", default: false, description: "Include full source ID arrays instead of compact source counts." },
       },
     },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -383,6 +385,7 @@ function handleMessage(message: JsonRpcRequest): void {
         "Use lcm_context_plan to estimate whether recent context is near or past a caller-provided soft limit; it does not control Codex compaction.",
         "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
         "Use lcm_pack_context for model-ready summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
+        "For multi-session reviews, call lcm_list_sessions once with includeSummaries instead of making one summary call per session.",
         "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
       ].join(" "),
     });
@@ -436,6 +439,7 @@ function callTool(params: Record<string, unknown>) {
           repoRoot: optionalString(args.repoRoot),
           parentSessionId: optionalString(args.parentSessionId),
           rootsOnly: optionalBoolean(args.rootsOnly),
+          includeSummaries: optionalBoolean(args.includeSummaries),
           limit: optionalNumber(args.limit),
           cursor: optionalString(args.cursor),
         });
@@ -475,7 +479,9 @@ function callTool(params: Record<string, unknown>) {
           : description.target === "summary_node"
             ? description.node.node_id
             : description.file_ref.file_ref_id;
-        return toolResult(`Described ${description.target} ${target}.`, { description });
+        return toolResult(`Described ${description.target} ${target}.`, {
+          description: optionalBoolean(args.includeLineage) ? description : compactDescription(description),
+        });
       }
       case "lcm_expand": {
         const expansion = storage.expandMemory({
@@ -483,7 +489,7 @@ function callTool(params: Record<string, unknown>) {
           query: optionalString(args.query),
           limit: optionalNumber(args.limit),
         });
-        return toolResult(expansion.markdown, { expansion });
+        return toolResult(expansion.markdown, { expansion: withoutMarkdown(expansion) });
       }
       case "lcm_expand_query": {
         const expansion = storage.expandQuery({
@@ -496,7 +502,7 @@ function callTool(params: Record<string, unknown>) {
           sourceLimit: optionalNumber(args.sourceLimit),
           overview: optionalBoolean(args.overview),
         });
-        return toolResult(expansion.markdown, { expansion });
+        return toolResult(expansion.markdown, { expansion: withoutMarkdown(expansion) });
       }
       case "lcm_context_plan": {
         const plan = storage.getContextPlan({
@@ -562,7 +568,7 @@ function callTool(params: Record<string, unknown>) {
           budgetTokens: optionalNumber(args.budgetTokens),
           cwd: optionalString(args.cwd),
         });
-        return toolResult(packed.markdown, packed);
+        return toolResult(packed.markdown, withoutMarkdown(packed));
       }
       case "lcm_record_note": {
         const event = storage.recordNote({
@@ -604,6 +610,45 @@ function toolResult(text: string, structuredContent: unknown) {
     content: [{ type: "text", text }],
     structuredContent,
   };
+}
+
+function withoutMarkdown<T extends { markdown: string }>(value: T): Omit<T, "markdown"> {
+  const { markdown: _markdown, ...rest } = value;
+  return rest;
+}
+
+function compactDescription(description: LcmDescription): unknown {
+  if (description.target === "file_ref") return description;
+  if (description.target === "summary_node") {
+    return {
+      ...description,
+      node: compactSummaryNode(description.node),
+      source_nodes: description.source_nodes.map(compactSummaryNode),
+    };
+  }
+  const summary = description.summary;
+  return {
+    ...description,
+    summary: summary ? compactSessionSummary(summary) : undefined,
+    summary_nodes: description.summary_nodes.map(compactSummaryNode),
+  };
+}
+
+function compactSummaryNode(node: SummaryNode): Omit<SummaryNode, "source_ids" | "source_event_ids"> & {
+  source_count: number;
+  source_event_count: number;
+} {
+  const { source_ids: sourceIds, source_event_ids: sourceEventIds, ...rest } = node;
+  return {
+    ...rest,
+    source_count: sourceIds.length,
+    source_event_count: sourceEventIds.length,
+  };
+}
+
+function compactSessionSummary<T extends { source_event_ids: string[] }>(summary: T): Omit<T, "source_event_ids"> & { source_event_count: number } {
+  const { source_event_ids: sourceEventIds, ...rest } = summary;
+  return { ...rest, source_event_count: sourceEventIds.length };
 }
 
 function stringArg(value: unknown, name: string): string {

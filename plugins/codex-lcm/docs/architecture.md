@@ -72,6 +72,12 @@ SQLite tables:
 
 Codex LCM creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
 
+`event_fts` indexes only discovery signals such as prompts, notes, outcomes,
+and compaction summaries. Tool inputs and outputs remain available in
+`events.raw_json` and the raw log, but duplicating them into full-text search
+adds substantial storage and does not improve session discovery. The legacy
+`events.text` column remains schema-compatible but new rows leave it empty.
+
 `file_refs` records large path-backed outputs detected in sanitized event
 payloads. Each row stores the path, source event, byte count, SHA-256, MIME
 guess, and a compact exploration summary. It is metadata for inspection and

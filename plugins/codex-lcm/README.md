@@ -21,8 +21,9 @@ node bin/codex-lcm hook UserPromptSubmit
 node bin/codex-lcm status
 node bin/codex-lcm health
 node bin/codex-lcm stats
-node bin/codex-lcm sessions --since 2026-07-13T00:00:00Z
+node bin/codex-lcm sessions --since 2026-07-13T00:00:00Z --include-summaries
 node bin/codex-lcm usage --since 2026-07-13T00:00:00Z
+node bin/codex-lcm cleanup
 node bin/codex-lcm context-plan
 node bin/codex-lcm benchmark long-context
 ```
@@ -41,6 +42,7 @@ node bin/codex-lcm import-codex-sessions --dry-run --json
 node bin/codex-lcm import-codex-sessions --json
 node bin/codex-lcm context-plan --session-id SESSION --json
 node bin/codex-lcm benchmark long-context --json
+node bin/codex-lcm cleanup --apply --json
 ```
 
 `doctor` reports install wiring, storage health, capture state, summary index
@@ -49,8 +51,11 @@ session JSONL files from `~/.codex/sessions` unless `--from PATH` is provided.
 It leaves source transcripts untouched and skips duplicate event IDs on repeated
 runs. Re-run it after upgrading to backfill parent-session links, model and
 reasoning metadata, and cumulative token usage from existing transcripts.
-`sessions` accepts time, cwd, repository, parent-session, root-only, and cursor
-filters; `usage` aggregates the same filtered session set. `context-plan`
+`sessions` accepts time, cwd, repository, parent-session, root-only, compact-summary,
+and cursor filters. `usage --roots-only` includes descendant session tokens, so
+root-task totals account for delegated work. `cleanup` previews a high-signal
+FTS rebuild and SQLite compaction; `--apply` performs it while preserving the
+raw JSONL source of truth. `context-plan`
 estimates recent-session token pressure and recommends
 when to pack LCM context; it does not control Codex compaction. The benchmark
 command generates a temporary synthetic long session and verifies old evidence
@@ -61,7 +66,7 @@ can still be recovered through `lcm_pack_context`.
 Standard recall workflow:
 
 - `lcm_grep`: find relevant sessions by searching summary nodes, session summaries, and high-signal events.
-- `lcm_describe`: inspect a session, summary node, or indexed file reference, including depth, source IDs, lineage metadata, and large-output summaries.
+- `lcm_describe`: inspect a session, summary node, or indexed file reference with compact source counts. Set `includeLineage: true` when exact source ID arrays are needed.
 - `lcm_expand`: expand one summary node into bounded source summary nodes and high-signal source events.
 - `lcm_expand_query`: answer a focused retrieval need by searching matching summary nodes and recursively expanding their source lineage into bounded evidence. The default budget is 2000 tokens. Use `overview: true` for broad, source-rich lineage views. `sourceLimit` is per matched node/source expansion, and tight budgets reserve room for a focused source-event excerpt when one exists.
 - `lcm_pack_context`: pack relevant summary-node context into a model-ready Markdown block.

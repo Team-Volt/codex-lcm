@@ -87,6 +87,16 @@ export async function main(argv: string[]): Promise<void> {
     }
     return;
   }
+  if (command === "cleanup") {
+    const apply = rest.includes("--apply");
+    const storage = createStorage({ config: loadConfig(), readOnly: !apply });
+    try {
+      printObjectOrText(storage.cleanupIndex({ apply }));
+    } finally {
+      storage.close();
+    }
+    return;
+  }
   if (command === "sessions") {
     const storage = createStorage({ config: loadConfig(), readOnly: true });
     try {
@@ -97,6 +107,7 @@ export async function main(argv: string[]): Promise<void> {
         repoRoot: optionValue(rest, "--repo-root"),
         parentSessionId: optionValue(rest, "--parent-session-id"),
         rootsOnly: rest.includes("--roots-only"),
+        includeSummaries: rest.includes("--include-summaries"),
         limit: numberOptionValue(rest, "--limit"),
         cursor: optionValue(rest, "--cursor"),
       }));
@@ -150,7 +161,8 @@ Commands:
   codex-lcm doctor [--json]              Diagnose install, storage, and capture state
   codex-lcm health [--json]
   codex-lcm stats [--json]
-  codex-lcm sessions [--since ISO] [--until ISO] [--cwd PATH] [--repo-root PATH] [--parent-session-id ID] [--roots-only] [--limit N] [--cursor N] [--json]
+  codex-lcm cleanup [--apply] [--json]   Preview or apply safe derived-index compaction; raw events are preserved
+  codex-lcm sessions [--since ISO] [--until ISO] [--cwd PATH] [--repo-root PATH] [--parent-session-id ID] [--roots-only] [--include-summaries] [--limit N] [--cursor N] [--json]
   codex-lcm usage [--since ISO] [--until ISO] [--cwd PATH] [--repo-root PATH] [--parent-session-id ID] [--roots-only] [--json]
   codex-lcm context-plan [--session-id ID] [--cwd PATH] [--repo-root PATH] [--model-context-window N] [--auto-compact-token-limit N] [--recent-event-limit N] [--json]
   codex-lcm benchmark long-context [--events N] [--budget-tokens N] [--home PATH] [--json]

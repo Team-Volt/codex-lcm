@@ -94,6 +94,39 @@ For compaction hook verification, check `hook_event_counts.PreCompact` and
 rebuilt after an upgrade, the next normal hook ingestion or `lcm_record_note`
 write will run maintenance.
 
+## The SQLite Index Is Much Larger Than The Raw Log
+
+Preview the built-in cleanup before changing anything:
+
+```sh
+node bin/codex-lcm cleanup --json
+```
+
+The preview reports the current index size, retained search rows, duplicated
+event-text bytes, and the projected high-signal search-row count. It does not
+write to SQLite.
+
+`events.jsonl` remains the source of truth, so cleanup never deletes transcript
+events. If you also want a point-in-time copy of the derived index, make an
+online SQLite backup first:
+
+```sh
+sqlite3 ~/.codex-lcm/index.sqlite ".backup '/path/to/index-backup.sqlite'"
+```
+
+Then apply the cleanup:
+
+```sh
+node bin/codex-lcm cleanup --apply --json
+```
+
+The apply step rebuilds full-text search from user prompts, notes, outcomes,
+compaction summaries, and explicit suggestion-audit events. It clears the old
+duplicate event-text column, refreshes deterministic summaries, and runs
+`VACUUM` so SQLite can return unused pages to disk. Close other Codex sessions
+first if SQLite reports that the database is busy. Set `CODEX_LCM_HOME` when
+cleaning a non-default LCM home.
+
 ## Node Warnings
 
 The implementation uses Node 22's `node:sqlite`. Test and smoke scripts run with `--no-warnings` so experimental runtime warnings do not interfere with MCP stdout parsing.

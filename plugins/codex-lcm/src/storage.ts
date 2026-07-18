@@ -73,6 +73,7 @@ export type ListSessionsArgs = {
   repoRoot?: string;
   parentSessionId?: string;
   rootsOnly?: boolean;
+  includeSummaries?: boolean;
   limit?: number;
   cursor?: string;
 };
@@ -91,6 +92,22 @@ export type UsageReport = {
     reasoning_output_tokens: number;
     total_tokens: number;
   };
+};
+
+export type IndexCleanupReport = {
+  applied: boolean;
+  raw_log_preserved: true;
+  index_path: string;
+  database_bytes_before: number;
+  database_bytes_after: number;
+  event_fts_rows_before: number;
+  event_fts_rows_after: number;
+  projected_event_fts_rows: number;
+  event_text_bytes_before: number;
+  event_text_bytes_after: number;
+  projected_summaries_to_rebuild: number;
+  summaries_rebuilt: number;
+  vacuumed: boolean;
 };
 
 type SummaryNodeSearchArgs = SearchSessionArgs & {
@@ -118,6 +135,17 @@ export type SessionSummary = {
   match_count?: number;
   best_match?: SessionSearchMatch;
   discovery?: SessionDiscovery;
+  summary?: SessionListSummary;
+};
+
+export type SessionListSummary = {
+  updated_at: string;
+  title: string;
+  overview: string;
+  topics: string[];
+  key_prompts: string[];
+  outcomes: string[];
+  source_event_count: number;
 };
 
 export type SessionSearchMatch = {
@@ -301,6 +329,7 @@ const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
 const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
+const DELEGATION_PARENT_BACKFILL_KEY = "delegation_parent_backfilled_v1";
 const RAW_LOG_INDEX_STATE_KEY = "raw_log_index_state_v1";
 
 type IndexEventResult = {
@@ -343,6 +372,7 @@ export class LcmStorage {
       if (!this.readOnly) {
         this.initialize();
         this.replayRawLogToIndex();
+        this.backfillDelegationParents();
         this.backfillGraph();
         this.backfillFileRefs();
         this.backfillSessionMemorySummaries();
@@ -554,6 +584,142 @@ export class LcmStorage {
       this.indexError = rollbackError === undefined ? message : `${message}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
       return [];
     }
+  }
+
+  cleanupIndex(options: { apply?: boolean } = {}): IndexCleanupReport {
+    if (!this.db) throw new Error("SQLite index is unavailable; the raw event log was not changed.");
+    const apply = options.apply === true;
+    if (apply && this.readOnly) throw new Error("Cleanup --apply requires writable storage.");
+
+    const databaseBytesBefore = fileSize(this.config.indexPath);
+    const eventFtsRowsBefore = Number(this.scalar("SELECT COUNT(*) AS count FROM event_fts"));
+    const eventTextBytesBefore = Number(this.scalar("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS count FROM events"));
+    const searchableEvents = (this.db.prepare(`
+      SELECT raw_json
+      FROM events
+      WHERE hook_event IN ${SUMMARY_SOURCE_HOOKS}
+      ORDER BY timestamp ASC, rowid ASC
+    `).all() as Array<{ raw_json: string }>)
+      .map((row) => JSON.parse(row.raw_json) as NormalizedEvent)
+      .filter(isSearchIndexEvent)
+      .filter((event) => !isCodexLcmToolEvent(event));
+    const summarySessionIds = new Set(searchableEvents
+      .filter(isSummarySourceEvent)
+      .map((event) => event.session_id));
+    const sessionIds = this.outdatedSummarySessionIds()
+      .filter((sessionId) => summarySessionIds.has(sessionId));
+
+    if (!apply) {
+      return {
+        applied: false,
+        raw_log_preserved: true,
+        index_path: this.config.indexPath,
+        database_bytes_before: databaseBytesBefore,
+        database_bytes_after: databaseBytesBefore,
+        event_fts_rows_before: eventFtsRowsBefore,
+        event_fts_rows_after: eventFtsRowsBefore,
+        projected_event_fts_rows: searchableEvents.length,
+        event_text_bytes_before: eventTextBytesBefore,
+        event_text_bytes_after: eventTextBytesBefore,
+        projected_summaries_to_rebuild: sessionIds.length,
+        summaries_rebuilt: 0,
+        vacuumed: false,
+      };
+    }
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM event_fts").run();
+      const insertSearchEvent = this.db.prepare(`
+        INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      `);
+      for (const event of searchableEvents) {
+        insertSearchEvent.run(
+          event.event_id,
+          event.session_id,
+          event.cwd,
+          event.repo_root ?? "",
+          event.hook_event,
+          eventSearchText(event),
+        );
+      }
+      this.db.prepare("UPDATE events SET text = '' WHERE text <> ''").run();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original cleanup failure.
+      }
+      throw error;
+    }
+
+    for (const sessionBatch of chunkArray(sessionIds, 10)) {
+      this.reopenWritableIndex();
+      this.db?.exec("BEGIN IMMEDIATE");
+      try {
+        for (const sessionId of sessionBatch) this.rebuildSessionMemorySummary(sessionId);
+        this.db?.exec("COMMIT");
+      } catch (error) {
+        try {
+          this.db?.exec("ROLLBACK");
+        } catch {
+          // Preserve the original summary rebuild failure.
+        }
+        throw error;
+      }
+    }
+
+    this.db.exec("PRAGMA optimize");
+    this.db.exec("VACUUM");
+    return {
+      applied: true,
+      raw_log_preserved: true,
+      index_path: this.config.indexPath,
+      database_bytes_before: databaseBytesBefore,
+      database_bytes_after: fileSize(this.config.indexPath),
+      event_fts_rows_before: eventFtsRowsBefore,
+      event_fts_rows_after: Number(this.scalar("SELECT COUNT(*) AS count FROM event_fts")),
+      projected_event_fts_rows: searchableEvents.length,
+      event_text_bytes_before: eventTextBytesBefore,
+      event_text_bytes_after: Number(this.scalar("SELECT COALESCE(SUM(length(CAST(text AS BLOB))), 0) AS count FROM events")),
+      projected_summaries_to_rebuild: sessionIds.length,
+      summaries_rebuilt: sessionIds.length,
+      vacuumed: true,
+    };
+  }
+
+  private reopenWritableIndex(): void {
+    this.db?.close();
+    this.db = new DatabaseSync(this.config.indexPath, { timeout: 5_000 });
+  }
+
+  private outdatedSummarySessionIds(): string[] {
+    if (!this.db) return [];
+    return (this.db.prepare(`
+      SELECT s.session_id
+      FROM sessions s
+      LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
+      LEFT JOIN (
+        SELECT session_id, MAX(summary_version) AS summary_node_version
+        FROM summary_nodes
+        GROUP BY session_id
+      ) sn ON sn.session_id = s.session_id
+      WHERE EXISTS (
+        SELECT 1 FROM events e
+        WHERE e.session_id = s.session_id
+          AND e.hook_event IN ${SUMMARY_SOURCE_HOOKS}
+      )
+        AND (
+          ss.session_id IS NULL
+          OR ss.summary_version IS NULL
+          OR ss.summary_version < ${SUMMARY_ALGORITHM_VERSION}
+          OR sn.summary_node_version IS NULL
+          OR sn.summary_node_version < ${SUMMARY_NODE_VERSION}
+        )
+      ORDER BY s.session_id ASC
+    `).all() as Array<{ session_id: string }>).map((row) => row.session_id);
   }
 
   health(): Health {
@@ -811,28 +977,46 @@ export class LcmStorage {
     const since = parseTimestamp(args.since, "since");
     const until = parseTimestamp(args.until, "until");
     if (!this.db) {
-      const matches = summarizeSessions(readRawEvents(this.config.rawLogPath))
+      const rawEvents = readRawEvents(this.config.rawLogPath);
+      const matches = summarizeSessions(rawEvents)
         .filter((session) => !since || session.last_seen >= since)
         .filter((session) => !until || session.first_seen <= until)
         .filter((session) => !args.cwd || session.cwd === args.cwd)
         .filter((session) => !args.repoRoot || session.repo_root === args.repoRoot)
         .filter((session) => !args.rootsOnly || !session.parent_session_id)
         .filter((session) => !args.parentSessionId || session.parent_session_id === args.parentSessionId);
-      const sessions = matches.slice(offset, offset + limit);
+      const eventsBySession = args.includeSummaries ? groupEventsBySession(rawEvents) : undefined;
+      const sessions = matches.slice(offset, offset + limit).map((session) => {
+        const events = eventsBySession?.get(session.session_id) ?? [];
+        return events.length > 0
+          ? { ...session, summary: sessionListSummary(buildSessionMemorySummary(events)) }
+          : session;
+      });
       return {
         sessions,
         ...(offset + sessions.length < matches.length ? { next_cursor: String(offset + sessions.length) } : {}),
       };
     }
+    const summaryColumns = args.includeSummaries ? `,
+        ss.updated_at AS summary_updated_at,
+        ss.title AS summary_title,
+        ss.overview AS summary_overview,
+        ss.topics_json AS summary_topics_json,
+        ss.key_prompts_json AS summary_key_prompts_json,
+        ss.outcomes_json AS summary_outcomes_json,
+        ss.source_event_ids_json AS summary_source_event_ids_json` : "";
+    const summaryJoin = args.includeSummaries ? "LEFT JOIN session_summaries ss ON ss.session_id = s.session_id" : "";
     const rows = this.db.prepare(`
-      SELECT * FROM sessions
-      WHERE (?1 IS NULL OR last_seen >= ?1)
-        AND (?2 IS NULL OR first_seen <= ?2)
-        AND (?3 IS NULL OR cwd = ?3)
-        AND (?4 IS NULL OR repo_root = ?4)
-        AND (?5 = 0 OR parent_session_id IS NULL)
-        AND (?6 IS NULL OR parent_session_id = ?6)
-      ORDER BY last_seen DESC, session_id ASC
+      SELECT s.*${summaryColumns}
+      FROM sessions s
+      ${summaryJoin}
+      WHERE (?1 IS NULL OR s.last_seen >= ?1)
+        AND (?2 IS NULL OR s.first_seen <= ?2)
+        AND (?3 IS NULL OR s.cwd = ?3)
+        AND (?4 IS NULL OR s.repo_root = ?4)
+        AND (?5 = 0 OR s.parent_session_id IS NULL)
+        AND (?6 IS NULL OR s.parent_session_id = ?6)
+      ORDER BY s.last_seen DESC, s.session_id ASC
       LIMIT ?7 OFFSET ?8
     `).all(
       since ?? null,
@@ -855,14 +1039,49 @@ export class LcmStorage {
     const since = parseTimestamp(args.since, "since");
     const until = parseTimestamp(args.until, "until");
     if (!this.db) {
-      const sessions = summarizeSessions(readRawEvents(this.config.rawLogPath))
+      const allSessions = summarizeSessions(readRawEvents(this.config.rawLogPath));
+      let sessions = allSessions
         .filter((session) => !since || session.last_seen >= since)
         .filter((session) => !until || session.first_seen <= until)
         .filter((session) => !args.cwd || session.cwd === args.cwd)
         .filter((session) => !args.repoRoot || session.repo_root === args.repoRoot)
-        .filter((session) => !args.rootsOnly || !session.parent_session_id)
         .filter((session) => !args.parentSessionId || session.parent_session_id === args.parentSessionId);
+      if (args.rootsOnly) sessions = sessionsWithDescendants(allSessions, sessions.filter((session) => !session.parent_session_id));
       return usageFromSessions(sessions);
+    }
+    if (args.rootsOnly) {
+      const row = this.db.prepare(`
+        WITH RECURSIVE selected_sessions(session_id) AS (
+          SELECT session_id
+          FROM sessions
+          WHERE parent_session_id IS NULL
+            AND (?1 IS NULL OR last_seen >= ?1)
+            AND (?2 IS NULL OR first_seen <= ?2)
+            AND (?3 IS NULL OR cwd = ?3)
+            AND (?4 IS NULL OR repo_root = ?4)
+            AND (?5 IS NULL OR parent_session_id = ?5)
+          UNION
+          SELECT child.session_id
+          FROM sessions child
+          JOIN selected_sessions parent ON child.parent_session_id = parent.session_id
+        )
+        SELECT
+          COUNT(*) AS sessions,
+          COALESCE(SUM(s.total_input_tokens), 0) AS input_tokens,
+          COALESCE(SUM(s.cached_input_tokens), 0) AS cached_input_tokens,
+          COALESCE(SUM(s.output_tokens), 0) AS output_tokens,
+          COALESCE(SUM(s.reasoning_output_tokens), 0) AS reasoning_output_tokens,
+          COALESCE(SUM(s.total_tokens), 0) AS total_tokens
+        FROM sessions s
+        JOIN selected_sessions selected ON selected.session_id = s.session_id
+      `).get(
+        since ?? null,
+        until ?? null,
+        args.cwd ?? null,
+        args.repoRoot ?? null,
+        args.parentSessionId ?? null,
+      ) as Record<string, unknown>;
+      return usageReportFromRow(row);
     }
     const row = this.db.prepare(`
       SELECT
@@ -877,26 +1096,15 @@ export class LcmStorage {
         AND (?2 IS NULL OR first_seen <= ?2)
         AND (?3 IS NULL OR cwd = ?3)
         AND (?4 IS NULL OR repo_root = ?4)
-        AND (?5 = 0 OR parent_session_id IS NULL)
-        AND (?6 IS NULL OR parent_session_id = ?6)
+        AND (?5 IS NULL OR parent_session_id = ?5)
     `).get(
       since ?? null,
       until ?? null,
       args.cwd ?? null,
       args.repoRoot ?? null,
-      args.rootsOnly ? 1 : 0,
       args.parentSessionId ?? null,
     ) as Record<string, unknown>;
-    return {
-      totals: {
-        sessions: Number(row.sessions),
-        input_tokens: Number(row.input_tokens),
-        cached_input_tokens: Number(row.cached_input_tokens),
-        output_tokens: Number(row.output_tokens),
-        reasoning_output_tokens: Number(row.reasoning_output_tokens),
-        total_tokens: Number(row.total_tokens),
-      },
-    };
+    return usageReportFromRow(row);
   }
 
   searchSessions(args: SearchSessionArgs): SessionSummary[] {
@@ -1398,6 +1606,17 @@ export class LcmStorage {
 
     const nodesById = new Map<string, SummaryNode>();
     const eventsById = new Map<string, NormalizedEvent>();
+    if (candidates.length === 0 && args.sessionIds?.length) {
+      for (const sessionId of args.sessionIds) {
+        const summary = this.getSessionMemorySummary(sessionId);
+        if (!summary || (args.cwd && summary.cwd !== args.cwd) || (args.repoRoot && summary.repo_root !== args.repoRoot)) continue;
+        if (!matchesQueryText(summarySearchText(summary), query)) continue;
+        candidates.push(...this.getTopSummaryNodesForSession(sessionId, 1));
+        for (const event of this.getSessionSummarySourceEvents(summary, query, sourceLimit)) {
+          eventsById.set(event.event_id, event);
+        }
+      }
+    }
     const visit = (node: SummaryNode) => {
       if (nodesById.has(node.node_id) || nodesById.size >= maxNodes) return;
       nodesById.set(node.node_id, node);
@@ -1656,6 +1875,31 @@ export class LcmStorage {
       .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
       .filter(isSummarySourceEvent)
       .filter((event) => !isCodexLcmToolEvent(event))
+      .sort((a, b) =>
+        queryTermHitCount(eventSignalText(b), query) - queryTermHitCount(eventSignalText(a), query) ||
+        a.timestamp.localeCompare(b.timestamp) ||
+        a.event_id.localeCompare(b.event_id))
+      .slice(0, clampLimit(limit, SUMMARY_NODE_SOURCE_EVENT_LIMIT, 20));
+  }
+
+  private getSessionSummarySourceEvents(
+    summary: SessionMemorySummary,
+    query: string,
+    limit: number,
+  ): NormalizedEvent[] {
+    if (!this.db || summary.source_event_ids.length === 0) return [];
+    const placeholders = summary.source_event_ids.map((_, index) => `?${index + 1}`).join(", ");
+    const events = (this.db.prepare(`
+      SELECT raw_json
+      FROM events
+      WHERE event_id IN (${placeholders})
+      ORDER BY timestamp ASC, rowid ASC
+    `).all(...summary.source_event_ids) as Array<{ raw_json: string }>)
+      .map((row) => JSON.parse(row.raw_json) as NormalizedEvent)
+      .filter(isSummarySourceEvent)
+      .filter((event) => !isCodexLcmToolEvent(event));
+    const matching = events.filter((event) => matchesQueryText(eventSignalText(event), query));
+    return (matching.length > 0 ? matching : events)
       .sort((a, b) =>
         queryTermHitCount(eventSignalText(b), query) - queryTermHitCount(eventSignalText(a), query) ||
         a.timestamp.localeCompare(b.timestamp) ||
@@ -1932,7 +2176,7 @@ export class LcmStorage {
         git_branch TEXT,
         turn_id TEXT,
         tool_use_id TEXT,
-        text TEXT NOT NULL,
+        text TEXT NOT NULL DEFAULT '',
         raw_json TEXT NOT NULL
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
@@ -2073,7 +2317,6 @@ export class LcmStorage {
   private indexEventInTransaction(event: NormalizedEvent, options: { rebuildSummary: boolean }): IndexEventResult {
     if (!this.db) return { inserted: false, summaryTouched: false };
     const raw = JSON.stringify(event);
-    const text = eventSearchText(event);
     const metadata = extractEventMetadata(event);
     const sessionMetadata = extractSessionMetadata(event);
     const insert = this.db.prepare(`
@@ -2090,7 +2333,7 @@ export class LcmStorage {
       event.git_branch ?? null,
       metadata.turn_id ?? null,
       metadata.tool_use_id ?? null,
-      text,
+      "",
       raw,
     );
     if ((insert as { changes?: number }).changes === 0) {
@@ -2136,17 +2379,19 @@ export class LcmStorage {
       sessionMetadata.reasoning_output_tokens ?? null,
       sessionMetadata.total_tokens ?? null,
     );
-    this.db.prepare(`
-      INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-    `).run(
-      event.event_id,
-      event.session_id,
-      event.cwd,
-      event.repo_root ?? "",
-      event.hook_event,
-      text,
-    );
+    if (isSearchIndexEvent(event) && !isCodexLcmToolEvent(event)) {
+      this.db.prepare(`
+        INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      `).run(
+        event.event_id,
+        event.session_id,
+        event.cwd,
+        event.repo_root ?? "",
+        event.hook_event,
+        eventSearchText(event),
+      );
+    }
     const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
     const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
     this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
@@ -2427,6 +2672,46 @@ export class LcmStorage {
     }
   }
 
+  private backfillDelegationParents(): void {
+    if (!this.db) return;
+    const marker = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(DELEGATION_PARENT_BACKFILL_KEY) as { value?: string } | undefined;
+    if (marker?.value === "1") return;
+    const rows = this.db.prepare(`
+      SELECT e.raw_json
+      FROM events e
+      JOIN sessions s ON s.session_id = e.session_id
+      WHERE e.hook_event = 'UserPromptSubmit'
+        AND s.parent_session_id IS NULL
+      ORDER BY e.timestamp ASC, e.rowid ASC
+    `).all() as Array<{ raw_json: string }>;
+    const update = this.db.prepare(`
+      UPDATE sessions
+      SET parent_session_id = ?2
+      WHERE session_id = ?1 AND parent_session_id IS NULL
+    `);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const event = JSON.parse(row.raw_json) as NormalizedEvent;
+        const parentId = extractSessionMetadata(event).parent_session_id;
+        if (parentId && parentId !== event.session_id) update.run(event.session_id, parentId);
+      }
+      this.db.prepare(`
+        INSERT INTO index_metadata (key, value)
+        VALUES (?1, '1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(DELEGATION_PARENT_BACKFILL_KEY);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original backfill failure.
+      }
+      this.indexError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   private backfillGraph(): void {
     if (!this.db) return;
     const rows = this.db.prepare(`
@@ -2524,7 +2809,7 @@ export class LcmStorage {
          OR sn.summary_node_version IS NULL
          OR sn.summary_node_version < ${SUMMARY_NODE_VERSION}
       ORDER BY s.last_seen DESC
-      LIMIT 1000
+      LIMIT 5
     `).all();
     if (rows.length === 0) return;
 
@@ -2597,7 +2882,12 @@ export class LcmStorage {
   private rebuildSessionMemorySummary(sessionId: string): void {
     if (!this.db) return;
     const events = this.getSummaryEventsForSession(sessionId);
-    if (events.length === 0) return;
+    if (events.length === 0) {
+      this.db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
+      this.db.prepare("DELETE FROM session_summaries WHERE session_id = ?1").run(sessionId);
+      this.rebuildSummaryNodes(sessionId);
+      return;
+    }
     const summary = buildSessionMemorySummary(events);
     const summaryText = summarySearchText(summary);
     this.db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
@@ -2793,11 +3083,12 @@ export class LcmStorage {
       ORDER BY timestamp DESC, rowid DESC
       LIMIT ?2
     `).all(sessionId, SUMMARY_RECENT_EVENT_LIMIT);
-    return uniqueEvents([...earlySignals, ...latestSignals, ...recentEvents]
+    const events = uniqueEvents([...earlySignals, ...latestSignals, ...recentEvents]
       .map((row) => JSON.parse((row as { raw_json: string }).raw_json) as NormalizedEvent)
       .filter((event) => !isCodexLcmToolEvent(event))
-      .filter((event) => !isGeneratedSuggestionEvent(event)))
+      .filter((event) => !isSummaryHook(event.hook_event) || isSummarySourceEvent(event)))
       .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.event_id.localeCompare(b.event_id));
+    return events.some(isSummarySourceEvent) ? events : [];
   }
 }
 
@@ -2832,6 +3123,17 @@ function rowToSessionSummary(row: unknown): SessionSummary {
       : {}),
     ...(record.total_tokens !== null && record.total_tokens !== undefined ? { total_tokens: Number(record.total_tokens) } : {}),
     ...(record.match_count !== undefined ? { match_count: Number(record.match_count) } : {}),
+    ...(record.summary_title ? {
+      summary: {
+        updated_at: String(record.summary_updated_at),
+        title: String(record.summary_title),
+        overview: String(record.summary_overview),
+        topics: parseStringArray(record.summary_topics_json),
+        key_prompts: parseStringArray(record.summary_key_prompts_json),
+        outcomes: parseStringArray(record.summary_outcomes_json),
+        source_event_count: parseStringArray(record.summary_source_event_ids_json).length,
+      },
+    } : {}),
   };
 }
 
@@ -3388,6 +3690,10 @@ function eventSearchText(event: NormalizedEvent): string {
   ].filter(Boolean).join("\n");
 }
 
+function fileSize(filePath: string): number {
+  return fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+}
+
 function checkpointToMarkdown(node: GraphNode): string {
   return [
     `## ${node.timestamp} Checkpoint`,
@@ -3452,6 +3758,47 @@ function sortedSessionIds(sessionIds: Iterable<string>): string[] {
   return Array.from(new Set(sessionIds)).sort((left, right) => left.localeCompare(right));
 }
 
+function groupEventsBySession(events: NormalizedEvent[]): Map<string, NormalizedEvent[]> {
+  const groups = new Map<string, NormalizedEvent[]>();
+  for (const event of events) {
+    const group = groups.get(event.session_id) ?? [];
+    group.push(event);
+    groups.set(event.session_id, group);
+  }
+  return groups;
+}
+
+function sessionListSummary(summary: SessionMemorySummary): SessionListSummary {
+  return {
+    updated_at: summary.updated_at,
+    title: summary.title,
+    overview: summary.overview,
+    topics: summary.topics,
+    key_prompts: summary.key_prompts,
+    outcomes: summary.outcomes,
+    source_event_count: summary.source_event_ids.length,
+  };
+}
+
+function sessionsWithDescendants(allSessions: SessionSummary[], roots: SessionSummary[]): SessionSummary[] {
+  const byParent = new Map<string, SessionSummary[]>();
+  for (const session of allSessions) {
+    if (!session.parent_session_id) continue;
+    const children = byParent.get(session.parent_session_id) ?? [];
+    children.push(session);
+    byParent.set(session.parent_session_id, children);
+  }
+  const selected = new Map<string, SessionSummary>();
+  const queue = [...roots];
+  while (queue.length > 0) {
+    const session = queue.shift();
+    if (!session || selected.has(session.session_id)) continue;
+    selected.set(session.session_id, session);
+    queue.push(...(byParent.get(session.session_id) ?? []));
+  }
+  return [...selected.values()];
+}
+
 function summarizeSessions(events: NormalizedEvent[]): SessionSummary[] {
   const sessions = new Map<string, SessionSummary>();
   for (const event of events) {
@@ -3502,10 +3849,11 @@ function extractEventMetadata(event: NormalizedEvent): { turn_id?: string; tool_
 function extractSessionMetadata(event: NormalizedEvent): Partial<SessionSummary> {
   const usage = recordField(event.payload.usage);
   const importedMetadata = recordField(event.payload.metadata);
+  const inferredParentId = stringField(event.payload.parent_session_id) ||
+    parentSessionId(importedMetadata) ||
+    delegatedParentSessionId(event);
   return {
-    ...(stringField(event.payload.parent_session_id) || parentSessionId(importedMetadata)
-      ? { parent_session_id: stringField(event.payload.parent_session_id) || parentSessionId(importedMetadata) }
-      : {}),
+    ...(inferredParentId ? { parent_session_id: inferredParentId } : {}),
     ...(stringField(event.payload.agent_role) || stringField(importedMetadata?.agent_role)
       ? { agent_role: stringField(event.payload.agent_role) || stringField(importedMetadata?.agent_role) }
       : {}),
@@ -3524,6 +3872,14 @@ function extractSessionMetadata(event: NormalizedEvent): Partial<SessionSummary>
       : {}),
     ...(numberField(usage?.total_token_count) !== undefined ? { total_tokens: numberField(usage?.total_token_count) } : {}),
   };
+}
+
+function delegatedParentSessionId(event: NormalizedEvent): string | undefined {
+  if (event.hook_event !== "UserPromptSubmit") return undefined;
+  const prompt = eventSignalText(event).trimStart();
+  if (!prompt.startsWith("<codex_delegation>")) return undefined;
+  const match = /<source_thread_id>\s*([^<\s]+)\s*<\/source_thread_id>/iu.exec(prompt);
+  return stringField(match?.[1]);
 }
 
 function parentSessionId(metadata: Record<string, unknown> | undefined): string | undefined {
@@ -3576,9 +3932,34 @@ function usageFromSessions(sessions: SessionSummary[]): UsageReport {
   };
 }
 
+function usageReportFromRow(row: Record<string, unknown>): UsageReport {
+  return {
+    totals: {
+      sessions: Number(row.sessions),
+      input_tokens: Number(row.input_tokens),
+      cached_input_tokens: Number(row.cached_input_tokens),
+      output_tokens: Number(row.output_tokens),
+      reasoning_output_tokens: Number(row.reasoning_output_tokens),
+      total_tokens: Number(row.total_tokens),
+    },
+  };
+}
+
 function isCodexLcmToolEvent(event: NormalizedEvent): boolean {
   const toolName = event.tool_name || stringField(event.payload.tool_name) || stringField(event.payload.toolName);
   return toolName?.startsWith("mcp__codex_lcm__") ?? false;
+}
+
+function isSearchIndexEvent(event: NormalizedEvent): boolean {
+  return isSummarySourceEvent(event) || isGeneratedSuggestionEvent(event);
+}
+
+function isSummaryHook(hookEvent: string): boolean {
+  return hookEvent === "UserPromptSubmit" ||
+    hookEvent === "Note" ||
+    hookEvent === "Stop" ||
+    hookEvent === "PreCompact" ||
+    hookEvent === "PostCompact";
 }
 
 function sessionNodeId(sessionId: string): string {

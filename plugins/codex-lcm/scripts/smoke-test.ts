@@ -118,14 +118,14 @@ try {
 
   assert.equal(responses[1].result.structuredContent.health.summary_node_count > 0, true);
   assert.equal(responses[2].result.structuredContent.matches[0].session_id, "smoke-session");
-  assert.match(responses[3].result.structuredContent.markdown, /smoke searchable context/u);
-  assert.doesNotMatch(responses[3].result.structuredContent.markdown, /mcp__codex_lcm__/u);
+  assert.match(responses[3].result.content[0].text, /smoke searchable context/u);
+  assert.doesNotMatch(responses[3].result.content[0].text, /mcp__codex_lcm__/u);
   assert.equal(responses[4].result.structuredContent.summary.session_id, "smoke-session");
   assert.match(responses[4].result.structuredContent.summary.overview, /Smoke verified extractive summaries/u);
   assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
   assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "summary"), true);
   assert.equal(responses[5].result.structuredContent.edges.some((edge: { kind: string }) => edge.kind === "summary_source"), true);
-  assert.match(responses[6].result.structuredContent.markdown, /smoke-old-dag-marker/u);
+  assert.match(responses[6].result.content[0].text, /smoke-old-dag-marker/u);
   assert.equal(responses[7].result.structuredContent.matches[0].session_id, "smoke-session");
   assert.equal(responses[8].result.structuredContent.description.target, "session");
   const nodeId = responses[8].result.structuredContent.description.summary_nodes[0].node_id;
@@ -142,7 +142,7 @@ try {
     },
   ]);
   assert.equal(expansionResponses[1].result.structuredContent.expansion.node.node_id, nodeId);
-  assert.match(expansionResponses[1].result.structuredContent.expansion.markdown, /smoke searchable context/u);
+  assert.match(expansionResponses[1].result.content[0].text, /smoke searchable context/u);
   assert.doesNotMatch(fs.readFileSync(path.join(home, "events.jsonl"), "utf8"), /sk-proj-secret-value/u);
 
   process.stdout.write(`Smoke test passed with CODEX_LCM_HOME=${home}\n`);
