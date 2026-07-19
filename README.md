@@ -102,7 +102,7 @@ operation.
 Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.6
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.7
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -119,20 +119,20 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Upgrade an existing GitHub marketplace install to `v0.2.6`:
+Upgrade an existing GitHub marketplace install to `v0.2.7`:
 
 ```sh
 codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.6
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.7
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Upgrade a local checkout install to `v0.2.6` by checking out the release tag,
+Upgrade a local checkout install to `v0.2.7` by checking out the release tag,
 then asking Codex to refresh the installed plugin cache:
 
 ```sh
 git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.6
+git -C /path/to/codex-lcm checkout v0.2.7
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -161,7 +161,7 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Current release: `v0.2.6`.
+Current release: `v0.2.7`.
 
 Codex LCM is a local-first Codex memory plugin with native plugin installation,
 hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
@@ -171,18 +171,19 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions.
 
-### v0.2.6 notes
+### v0.2.7 notes
 
-This release adds cross-project session observability and avoids unnecessary
-raw-log scans during normal hook ingestion.
+This release cuts derived SQLite storage and keeps multi-session retrieval
+responses bounded without changing the raw JSONL source of truth.
 
-- Adds session listing and token usage to the CLI and MCP server, including
-  parent/child lineage, model metadata, reasoning metadata, and cumulative token
-  usage backfilled from existing Codex transcripts.
-- Keeps a bounded event and redacted overflow file for oversized hook inputs up
-  to the 8 MiB safety ceiling.
-- Records synchronized raw-log state in SQLite so unchanged logs skip full
-  rescans while edited or truncated logs still use the reconciliation path.
+- Adds `codex-lcm cleanup`, which previews index compaction by default and
+  requires `--apply` before writing.
+- Keeps high-signal prompts, notes, outcomes, and compaction summaries in FTS
+  instead of duplicating large tool payloads across derived tables.
+- Returns compact summaries from session listings, removes repeated MCP response
+  text, and makes full lineage arrays opt-in.
+- Shortens post-compaction stop feedback while still requiring
+  `lcm_pack_context` before completion continues.
 
 Use the [Installation](#installation) section for install and upgrade commands.
 
