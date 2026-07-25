@@ -57,7 +57,10 @@ export function isBenignTokenMetric(key: string, value: unknown): boolean {
 }
 
 export function shouldRedactSecretKey(key: string, value: unknown): boolean {
-  return isSecretAssignmentKey(key) && !isBenignTokenMetric(key, value);
+  const parts = keyParts(key);
+  return isSecretAssignmentKey(key) &&
+    !isBenignTokenMetric(key, value) &&
+    !(typeof value === "boolean" && parts.length === 1 && parts[0] === "private");
 }
 
 function redactSecretAssignmentLine(value: string, path: string, redactions: RedactionRecord[]): string {

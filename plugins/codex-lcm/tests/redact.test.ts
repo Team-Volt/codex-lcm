@@ -24,6 +24,13 @@ test("redacts secret-like object keys recursively", () => {
   assert.equal(result.truncations.length, 0);
 });
 
+test("preserves a benign private package flag", () => {
+  const result = sanitizeForStorage({ private: true });
+
+  assert.deepEqual(result.value, { private: true });
+  assert.equal(result.redactions.length, 0);
+});
+
 test("preserves benign token budget and count metadata", () => {
   const result = sanitizeForStorage({
     token_budget: 1200,
