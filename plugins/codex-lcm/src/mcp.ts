@@ -590,7 +590,7 @@ function callTool(params: Record<string, unknown>) {
           budgetTokens: optionalNumber(args.budgetTokens),
           cwd: optionalString(args.cwd),
         });
-        return toolResult(packed.markdown, packed);
+        return toolResult("Packed context is in structuredContent.markdown.", packed);
       }
       case "lcm_record_note": {
         const event = storage.recordNote({
