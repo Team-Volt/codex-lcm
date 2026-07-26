@@ -106,7 +106,7 @@ operation.
 Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.7
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.8
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -123,20 +123,20 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Upgrade an existing GitHub marketplace install to `v0.2.7`:
+Upgrade an existing GitHub marketplace install to `v0.2.8`:
 
 ```sh
 codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.7
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.8
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Upgrade a local checkout install to `v0.2.7` by checking out the release tag,
+Upgrade a local checkout install to `v0.2.8` by checking out the release tag,
 then asking Codex to refresh the installed plugin cache:
 
 ```sh
 git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.7
+git -C /path/to/codex-lcm checkout v0.2.8
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -165,7 +165,7 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Current release: `v0.2.7`.
+Current release: `v0.2.8`.
 
 Codex LCM is a local-first Codex memory plugin with native plugin installation,
 hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
@@ -175,19 +175,19 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions.
 
-### v0.2.7 notes
+### v0.2.8 notes
 
-This release cuts derived SQLite storage and keeps multi-session retrieval
-responses bounded without changing the raw JSONL source of truth.
+This release makes truncated payloads recoverable through search and description
+tools, adds a repeatable retrieval-quality benchmark, and fixes two data-shape
+issues in stored and packed results.
 
-- Adds `codex-lcm cleanup`, which previews index compaction by default and
-  requires `--apply` before writing.
-- Keeps high-signal prompts, notes, outcomes, and compaction summaries in FTS
-  instead of duplicating large tool payloads across derived tables.
-- Returns compact summaries from session listings, removes repeated MCP response
-  text, and makes full lineage arrays opt-in.
-- Shortens post-compaction stop feedback while still requiring
-  `lcm_pack_context` before completion continues.
+- Preserves sanitized overflow payloads, lets `lcm_grep` search them, and pages
+  verified content through `lcm_describe`.
+- Adds `codex-lcm benchmark retrieval-quality` with Recall@1, Recall@5, mean
+  reciprocal rank, category scores, and per-query ranks.
+- Keeps boolean `private` package metadata instead of redacting it as a secret.
+- Returns packed recovery Markdown in MCP structured content so Codex Desktop
+  can restore context from structured tool results.
 
 Use the [Installation](#installation) section for install and upgrade commands.
 
