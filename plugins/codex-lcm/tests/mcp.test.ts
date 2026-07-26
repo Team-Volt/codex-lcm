@@ -864,8 +864,8 @@ test("MCP pack context biases toward the active thread across cwd mismatches", (
   ], { CODEX_LCM_HOME: home, CODEX_THREAD_ID: targetThreadId });
 
   const packed = responses[1].result.structuredContent;
-  assert.equal("markdown" in packed, false);
-  assert.match(responses[1].result.content[0].text, /Commented on spec PR 12977 that the spec matches intent/u);
+  assert.match(packed.markdown, /Commented on spec PR 12977 that the spec matches intent/u);
+  assert.equal(responses[1].result.content[0].text, packed.markdown);
   assert.equal(
     packed.sources.some((source: { session_id: string }) => source.session_id === targetSessionId),
     true,
