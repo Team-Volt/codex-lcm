@@ -223,8 +223,10 @@ bounded budget. Pass `--home PATH` to keep the benchmark storage for inspection.
 `node bin/codex-lcm benchmark retrieval-quality --json` runs a fixed,
 dependency-free corpus through production session search. It reports Recall@1,
 Recall@5, mean reciprocal rank, and per-case ranks across exact, cross-session,
-temporal, and paraphrase queries. The paraphrase cases expose lexical retrieval
-gaps instead of hiding them behind exact needles.
+temporal, and paraphrase queries. Corpus version 2 has 39 sessions and 38
+queries, including 32 paraphrase cases split evenly between development and
+holdout sets. The paraphrase cases expose lexical retrieval gaps instead of
+hiding them behind exact needles.
 
 ## Privacy And Safety
 
