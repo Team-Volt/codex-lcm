@@ -913,17 +913,17 @@ test("raw-log lock setup failures do not enter the append callback", () => {
     env: {},
     now,
   });
-  const originalOpenSync = fs.openSync;
-  fs.openSync = ((targetPath: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
-    if (String(targetPath).endsWith("events.jsonl.lock")) throw new Error("forced lock setup failure");
-    return originalOpenSync(targetPath, flags, mode);
-  }) as typeof fs.openSync;
+  const originalLinkSync = fs.linkSync;
+  fs.linkSync = (existingPath, newPath) => {
+    if (String(newPath).endsWith("events.jsonl.lock")) throw new Error("forced lock setup failure");
+    return originalLinkSync(existingPath, newPath);
+  };
 
   try {
     assert.throws(() => storage.ingest(event), /forced lock setup failure/u);
     assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
   } finally {
-    fs.openSync = originalOpenSync;
+    fs.linkSync = originalLinkSync;
     storage.close();
   }
 });
@@ -979,7 +979,7 @@ test("same-process orphaned raw-log lock is cleared", () => {
   const home = tempHome();
   const rawLogPath = path.join(home, "events.jsonl");
   const lockPath = `${rawLogPath}.lock`;
-  fs.writeFileSync(lockPath, `${process.pid}:${threadId}:orphan-token`, { mode: 0o600 });
+  fs.writeFileSync(lockPath, `${process.pid}:${threadId}:00000000-0000-4000-8000-000000000000`, { mode: 0o600 });
 
   // When
   let entered = false;
@@ -1055,7 +1055,7 @@ test("concurrent stale clearers do not unlink a newly acquired raw-log lock", as
   const staleOwner = spawnSync(process.execPath, [
     "--input-type=module",
     "--eval",
-    `const fs = await import("node:fs"); fs.writeFileSync(process.env.RAW_LOCK_PATH, process.pid + ":0:stale", { mode: 0o600 });`,
+    `const fs = await import("node:fs"); fs.writeFileSync(process.env.RAW_LOCK_PATH, process.pid + ":0:00000000-0000-4000-8000-000000000000", { mode: 0o600 });`,
   ], { env: { ...process.env, RAW_LOCK_PATH: lockPath } });
   assert.equal(staleOwner.status, 0, staleOwner.stderr?.toString());
   const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);

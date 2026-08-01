@@ -21,7 +21,7 @@ export type RawLogState = {
 const RAW_LOG_LOCK_TIMEOUT_MS = 10_000;
 const RAW_LOG_LOCK_POLL_MS = 10;
 const RAW_LOG_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-const activeRawLogLockTokens = new Set<string>();
+const RAW_LOG_LOCK_TOKEN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export class RawLogLockTimeoutError extends Error {
   readonly lockPath: string;
@@ -37,79 +37,64 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
   const lockPath = `${rawLogPath}.lock`;
   const coordinatorPath = `${rawLogPath}.lock.sqlite`;
-  const token = `${process.pid}:${threadId}:${randomUUID()}`;
+  const tokenId = randomUUID();
+  const token = `${process.pid}:${threadId}:${tokenId}`;
+  const candidatePath = `${lockPath}.${tokenId}.candidate`;
   const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
-  let descriptor: number;
+  let coordinator: DatabaseSync | undefined;
+  let transactionOpen = false;
+  let published = false;
 
-  const coordinator = new DatabaseSync(coordinatorPath, { timeout: RAW_LOG_LOCK_POLL_MS });
+  fs.writeFileSync(candidatePath, token, { flag: "wx", mode: 0o600 });
   try {
+    coordinator = new DatabaseSync(coordinatorPath, { timeout: RAW_LOG_LOCK_POLL_MS });
     fs.chmodSync(coordinatorPath, 0o600);
-    while (true) {
-      const acquired = tryAcquireRawLogLock(coordinator, lockPath);
-      if (acquired !== undefined) {
-        descriptor = acquired;
-        break;
+    while (!published) {
+      if (!transactionOpen) {
+        try {
+          coordinator.exec("BEGIN IMMEDIATE");
+          transactionOpen = true;
+        } catch (error) {
+          if (!isSqliteBusy(error)) throw error;
+          waitForRawLogLock(deadline, lockPath);
+          continue;
+        }
       }
-      if (Date.now() >= deadline) throw new RawLogLockTimeoutError(lockPath);
-      Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
+      try {
+        fs.linkSync(candidatePath, lockPath);
+        published = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (clearStaleRawLogLock(lockPath)) continue;
+        coordinator.exec("ROLLBACK");
+        transactionOpen = false;
+        waitForRawLogLock(deadline, lockPath);
+      }
     }
-  } finally {
-    coordinator.close();
-  }
+    fs.unlinkSync(candidatePath);
 
-  try {
-    fs.writeFileSync(descriptor, token);
-    activeRawLogLockTokens.add(token);
-  } catch (error) {
-    try {
-      fs.closeSync(descriptor);
-    } catch {}
-    try {
-      fs.unlinkSync(lockPath);
-    } catch {}
-    throw error;
-  }
-
-  // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
-  try {
+    // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
     return callback();
   } finally {
     try {
-      fs.closeSync(descriptor);
-      if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
+      if (published && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     } finally {
-      activeRawLogLockTokens.delete(token);
+      if (transactionOpen) coordinator?.exec("ROLLBACK");
+      coordinator?.close();
+      try {
+        fs.unlinkSync(candidatePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     }
   }
 }
 
-function tryAcquireRawLogLock(coordinator: DatabaseSync, lockPath: string): number | undefined {
-  let transactionOpen = false;
-  try {
-    try {
-      coordinator.exec("BEGIN IMMEDIATE");
-      transactionOpen = true;
-    } catch (error) {
-      if (isSqliteBusy(error)) return undefined;
-      throw error;
-    }
-    try {
-      return fs.openSync(lockPath, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (!clearStaleRawLogLock(lockPath)) return undefined;
-      try {
-        return fs.openSync(lockPath, "wx", 0o600);
-      } catch (retryError) {
-        if ((retryError as NodeJS.ErrnoException).code === "EEXIST") return undefined;
-        throw retryError;
-      }
-    }
-  } finally {
-    if (transactionOpen) coordinator.exec("ROLLBACK");
-  }
+function waitForRawLogLock(deadline: number, lockPath: string): void {
+  if (Date.now() >= deadline) throw new RawLogLockTimeoutError(lockPath);
+  Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
 }
 
 function isSqliteBusy(error: unknown): boolean {
@@ -139,20 +124,27 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
 function clearStaleRawLogLock(lockPath: string): boolean {
   try {
     const token = fs.readFileSync(lockPath, "utf8");
-    const [ownerText, ownerThreadText] = token.split(":", 2);
+    const tokenParts = token.split(":");
+    const [ownerText, ownerThreadText, tokenId] = tokenParts;
     const owner = Number(ownerText);
+    const ownerThread = Number(ownerThreadText);
+    const currentToken = tokenParts.length === 3
+      && Number.isSafeInteger(owner)
+      && owner > 0
+      && Number.isSafeInteger(ownerThread)
+      && ownerThread >= 0
+      && typeof tokenId === "string"
+      && RAW_LOG_LOCK_TOKEN_ID_PATTERN.test(tokenId);
+    if (currentToken) {
+      if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
+      return true;
+    }
     if (Number.isSafeInteger(owner) && owner > 0) {
-      if (owner === process.pid) {
-        const ownerThread = Number(ownerThreadText);
-        if (!Number.isSafeInteger(ownerThread) || ownerThread < 0 || ownerThread !== threadId) return false;
-        if (activeRawLogLockTokens.has(token)) return false;
-      } else {
-        try {
-          process.kill(owner, 0);
-          return false;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
-        }
+      try {
+        process.kill(owner, 0);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
       }
     } else {
       return false;

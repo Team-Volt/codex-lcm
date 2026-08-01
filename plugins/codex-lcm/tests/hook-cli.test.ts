@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import { assertCliOk, clearDerivedSummaries, readJsonl, runCli, tempHome } from "./helpers.ts";
 
@@ -114,6 +115,92 @@ test("hook command reports raw fsync failure and persists on retry", () => {
   // Then: exactly one raw and indexed event persists.
   assertCliOk(retried);
   assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
+  const health = runCli(["health", "--json"], { env: { CODEX_LCM_HOME: home } });
+  assertCliOk(health);
+  assert.equal(JSON.parse(health.stdout).event_count, 1);
+});
+
+test("hook recovers when a writer dies before atomic raw-lock publication", async () => {
+  // Given: a worker dies at the old post-create/pre-token boundary or the new pre-link boundary.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
+  const writer = new Worker(String.raw`
+    const fs = require("node:fs");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    const originalWriteFileSync = fs.writeFileSync;
+    const originalLinkSync = fs.linkSync;
+    const stop = () => {
+      parentPort.postMessage("publication-boundary");
+      Atomics.wait(wait, 0, 0);
+    };
+    fs.writeFileSync = (...args) => {
+      if (typeof args[0] === "number") stop();
+      return originalWriteFileSync(...args);
+    };
+    fs.linkSync = (...args) => {
+      stop();
+      return originalLinkSync(...args);
+    };
+    (async () => {
+      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
+      withRawLogLock(workerData.rawLogPath, () => {});
+    })();
+  `, { eval: true, workerData: { rawLogModuleUrl, rawLogPath } });
+  await new Promise<void>((resolve, reject) => {
+    writer.once("message", () => resolve());
+    writer.once("error", reject);
+  });
+  await writer.terminate();
+  const input = JSON.stringify({ session_id: "atomic-publication-retry", cwd: "/tmp/atomic-publication", prompt: "persist after publication crash" });
+
+  // When: the real hook retries after the writer is gone.
+  const startedAt = Date.now();
+  const retried = runCli(["hook", "UserPromptSubmit"], { input, env: { CODEX_LCM_HOME: home }, timeout: 15_000 });
+  const elapsedMs = Date.now() - startedAt;
+
+  // Then: no empty fixed lock blocks recovery and one event persists promptly.
+  assertCliOk(retried);
+  assert.equal(elapsedMs < 1_000, true, `publication crash delayed retry by ${elapsedMs}ms`);
+  assert.equal(readJsonl(rawLogPath).length, 1);
+  const health = runCli(["health", "--json"], { env: { CODEX_LCM_HOME: home } });
+  assertCliOk(health);
+  assert.equal(JSON.parse(health.stdout).event_count, 1);
+});
+
+test("hook recovers a published current lock after its worker terminates", async () => {
+  // Given: a worker publishes a current-format lock, enters its callback, then is terminated while the PID stays alive.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
+  const writer = new Worker(String.raw`
+    const { parentPort, workerData } = require("node:worker_threads");
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    (async () => {
+      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
+      withRawLogLock(workerData.rawLogPath, () => {
+        parentPort.postMessage("published");
+        Atomics.wait(wait, 0, 0);
+      });
+    })();
+  `, { eval: true, workerData: { rawLogModuleUrl, rawLogPath } });
+  await new Promise<void>((resolve, reject) => {
+    writer.once("message", () => resolve());
+    writer.once("error", reject);
+  });
+  await writer.terminate();
+  const input = JSON.stringify({ session_id: "worker-owner-retry", cwd: "/tmp/worker-owner", prompt: "persist after worker owner crash" });
+
+  // When: another real hook writes while the parent process remains alive.
+  const startedAt = Date.now();
+  const retried = runCli(["hook", "UserPromptSubmit"], { input, env: { CODEX_LCM_HOME: home }, timeout: 15_000 });
+  const elapsedMs = Date.now() - startedAt;
+
+  // Then: released coordinator ownership proves the current token stale and recovery is prompt.
+  assertCliOk(retried);
+  assert.equal(elapsedMs < 1_000, true, `terminated worker delayed retry by ${elapsedMs}ms`);
+  assert.equal(readJsonl(rawLogPath).length, 1);
   const health = runCli(["health", "--json"], { env: { CODEX_LCM_HOME: home } });
   assertCliOk(health);
   assert.equal(JSON.parse(health.stdout).event_count, 1);
