@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -6,9 +7,9 @@ import test from "node:test";
 import { Worker } from "node:worker_threads";
 
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
-import { readRawLog } from "../src/raw-log.ts";
+import { appendRawEvents, readRawLog, withRawLogLock } from "../src/raw-log.ts";
 import { sha256 } from "../src/redact.ts";
-import { createStorage } from "../src/storage.ts";
+import { createStorage, LcmStorage } from "../src/storage.ts";
 import { clearDerivedSummaries, readJsonl, tempHome } from "./helpers.ts";
 
 const now = () => new Date("2026-06-09T12:00:00.000Z");
@@ -917,6 +918,165 @@ test("raw-log lock setup failures do not leave a stale lock", () => {
     fs.writeFileSync = originalWriteFileSync;
     storage.close();
   }
+});
+
+test("constructor replay leaves an interleaved raw append visible to the next opener", () => {
+  // Given: one raw event and an append injected after replay takes its snapshot.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const seed = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "replay-seed", cwd: "/tmp/replay-race", prompt: "seed" }),
+    env: {},
+    now,
+  });
+  const interleaved = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "replay-interleaved", cwd: "/tmp/replay-race", prompt: "interleaved" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  });
+  withRawLogLock(rawLogPath, () => appendRawEvents(rawLogPath, [seed]));
+  const prototype = LcmStorage.prototype as unknown as {
+    indexEventInTransaction: (event: NormalizedEvent, options: { rebuildSummary: boolean }) => unknown;
+  };
+  const originalIndexEventInTransaction = prototype.indexEventInTransaction;
+  let appended = false;
+  prototype.indexEventInTransaction = function (event, options) {
+    if (!appended) {
+      appended = true;
+      withRawLogLock(rawLogPath, () => appendRawEvents(rawLogPath, [interleaved]));
+    }
+    return originalIndexEventInTransaction.call(this, event, options);
+  };
+
+  // When: the first opener completes replay, then a second opener checks the persisted state.
+  try {
+    const first = createStorage({ home });
+    first.close();
+  } finally {
+    prototype.indexEventInTransaction = originalIndexEventInTransaction;
+  }
+  const reopened = createStorage({ home });
+
+  // Then: the append that raced replay is present in both authority and index.
+  assert.equal(readRawLog(rawLogPath).events.length, 2);
+  assert.equal(reopened.health().event_count, 2);
+  assert.equal(reopened.hasEvent(interleaved.event_id), true);
+  reopened.close();
+});
+
+test("old raw-log lock with a live PID does not delay a hook append", () => {
+  // Given: an abandoned lock whose PID is still live but whose age exceeds the lock timeout.
+  const home = tempHome();
+  const lockPath = path.join(home, "events.jsonl.lock");
+  fs.writeFileSync(lockPath, `${process.pid}:abandoned`, { mode: 0o600 });
+  const old = new Date(Date.now() - 20_000);
+  fs.utimesSync(lockPath, old, old);
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "stale-live-pid", cwd: "/tmp/stale-lock", prompt: "must persist" }),
+    env: {},
+    now,
+  });
+
+  // When: the hook path ingests one event.
+  const startedAt = Date.now();
+  storage.ingest(event);
+  const elapsedMs = Date.now() - startedAt;
+
+  // Then: stale ownership is cleared promptly and the raw event is durable.
+  assert.equal(elapsedMs < 1_000, true, `stale lock delayed append by ${elapsedMs}ms`);
+  assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events.map(({ event_id }) => event_id), [event.event_id]);
+  storage.close();
+});
+
+test("derived index work does not hold the raw-log writer lock", () => {
+  // Given: a parent ingest whose derived index step launches an independent raw writer.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const storage = createStorage({ home });
+  const parent = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "slow-index-parent", cwd: "/tmp/slow-index", prompt: "parent" }),
+    env: {},
+    now,
+  });
+  const child = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "slow-index-child", cwd: "/tmp/slow-index", prompt: "child" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  });
+  const internals = storage as unknown as {
+    indexEventInTransaction: (event: NormalizedEvent, options: { rebuildSummary: boolean }) => unknown;
+  };
+  const originalIndexEventInTransaction = internals.indexEventInTransaction;
+  let childResult: ReturnType<typeof spawnSync> | undefined;
+  internals.indexEventInTransaction = function (event, options) {
+    childResult = spawnSync(process.execPath, [
+      "--no-warnings",
+      "--input-type=module",
+      "--eval",
+      `const { appendRawEvents, withRawLogLock } = await import(process.env.RAW_LOG_MODULE_URL); withRawLogLock(process.env.RAW_LOG_PATH, () => appendRawEvents(process.env.RAW_LOG_PATH, [JSON.parse(process.env.RAW_EVENT)]));`,
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        RAW_EVENT: JSON.stringify(child),
+        RAW_LOG_MODULE_URL: new URL("../src/raw-log.ts", import.meta.url).href,
+        RAW_LOG_PATH: rawLogPath,
+      },
+      timeout: 1_500,
+    });
+    return originalIndexEventInTransaction.call(this, event, options);
+  };
+
+  // When: the parent reaches derived indexing.
+  try {
+    storage.ingest(parent);
+  } finally {
+    internals.indexEventInTransaction = originalIndexEventInTransaction;
+  }
+
+  // Then: the child acquires the raw lock before parent derived work finishes.
+  const childError = typeof childResult?.stderr === "string" && childResult.stderr.length > 0
+    ? childResult.stderr
+    : `child terminated with ${childResult?.signal}`;
+  assert.equal(childResult?.status, 0, childError);
+  assert.equal(readRawLog(rawLogPath).events.length, 2);
+  storage.close();
+});
+
+test("raw event ID cache invalidates after a same-size edit with restored mtime", () => {
+  // Given: a cached ID set and an external same-size raw rewrite that restores mtime.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "cache-rewrite", cwd: "/tmp/cache-rewrite", prompt: "restore me" }),
+    env: {},
+    now,
+  });
+  storage.ingest(event);
+  const pinnedMtime = new Date("2026-06-09T11:59:00.000Z");
+  fs.utimesSync(rawLogPath, pinnedMtime, pinnedMtime);
+  assert.equal(storage.ingestMany([event]).skippedDuplicate, 1);
+  const before = fs.statSync(rawLogPath);
+  const replacementId = "f".repeat(event.event_id.length);
+  fs.writeFileSync(rawLogPath, fs.readFileSync(rawLogPath, "utf8").replace(event.event_id, replacementId));
+  fs.utimesSync(rawLogPath, before.atime, before.mtime);
+
+  // When: the original event is ingested again.
+  const result = storage.ingestMany([event]);
+
+  // Then: the changed ctime forces a rescan and restores the missing raw event.
+  assert.equal(result.imported, 1);
+  assert.equal(result.skippedDuplicate, 0);
+  assert.deepEqual(new Set(readRawLog(rawLogPath).events.map(({ event_id }) => event_id)), new Set([replacementId, event.event_id]));
+  storage.close();
 });
 
 test("bulk ingest persists raw JSONL before surfacing a SQLite lock timeout", () => {

@@ -80,16 +80,17 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
 
 function clearStaleRawLogLock(lockPath: string): boolean {
   try {
+    const stale = Date.now() - fs.statSync(lockPath).mtimeMs >= RAW_LOG_LOCK_TIMEOUT_MS;
     const [ownerText] = fs.readFileSync(lockPath, "utf8").split(":", 1);
     const owner = Number(ownerText);
-    if (Number.isSafeInteger(owner) && owner > 0) {
+    if (!stale && Number.isSafeInteger(owner) && owner > 0) {
       try {
         process.kill(owner, 0);
         return false;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
       }
-    } else if (Date.now() - fs.statSync(lockPath).mtimeMs < RAW_LOG_LOCK_TIMEOUT_MS) {
+    } else if (!stale) {
       return false;
     }
     fs.unlinkSync(lockPath);

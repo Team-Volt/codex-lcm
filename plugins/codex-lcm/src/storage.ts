@@ -382,6 +382,7 @@ type SummaryRebuildStrategy = "event" | "sessions" | "deferred";
 type RawEventIdCache = {
   size: number;
   mtimeMs: number;
+  ctimeMs: number;
   eventIds: Set<string>;
 };
 
@@ -464,19 +465,21 @@ export class LcmStorage {
 
   private ingestSerialized(events: NormalizedEvent[], summaryRebuild: SummaryRebuildStrategy): IngestManyResult {
     if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
-    return withRawLogLock(this.config.rawLogPath, () => {
-      let rawLogWasIndexed = false;
-      let rawEventIds: Set<string>;
-      try {
-        if (this.db && this.indexError) this.replayRawLogToIndex();
-        rawLogWasIndexed = this.db ? this.rawLogIsIndexed() : false;
-        rawEventIds = this.db && rawLogWasIndexed
-          ? this.knownEventIds(events.map((event) => event.event_id))
-          : this.readRawEventIds();
-      } catch (error) {
-        this.indexError = error instanceof Error ? error.message : String(error);
-        rawEventIds = this.readRawEventIds();
+    let indexedRawLogState: string | undefined;
+    let indexedEventIds = new Set<string>();
+    try {
+      if (this.db && this.indexError) this.replayRawLogToIndex();
+      if (this.db) {
+        indexedRawLogState = this.indexedRawLogState();
+        indexedEventIds = this.knownEventIds(events.map((event) => event.event_id));
       }
+    } catch (error) {
+      this.indexError = error instanceof Error ? error.message : String(error);
+      indexedRawLogState = undefined;
+    }
+    const rawWrite = withRawLogLock(this.config.rawLogPath, () => {
+      const rawLogWasIndexed = indexedRawLogState === JSON.stringify(this.rawLogState());
+      const rawEventIds = rawLogWasIndexed ? indexedEventIds : this.readRawEventIds();
 
       const rawSeen = new Set(rawEventIds);
       const eventsToAppend: NormalizedEvent[] = [];
@@ -494,50 +497,59 @@ export class LcmStorage {
         appendRawEvents(this.config.rawLogPath, eventsToAppend);
         this.storeRawEventIds(rawSeen);
       }
-      if (!this.db) return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
-
-      try {
-        this.db.exec("BEGIN IMMEDIATE");
-      } catch (error) {
-        const failure = new DerivedIndexError(error);
-        this.indexError = failure.message;
-        throw failure;
-      }
-
-      const touchedSessions = new Set<string>();
-      try {
-        const indexSeen = this.knownEventIds(events.map((event) => event.event_id));
-        for (const event of events) {
-          if (indexSeen.has(event.event_id)) continue;
-          indexSeen.add(event.event_id);
-          const result = this.indexEventInTransaction(event, { rebuildSummary: summaryRebuild === "event" });
-          if (result.summaryTouched) touchedSessions.add(event.session_id);
-        }
-        const rebuiltSessions = summaryRebuild === "sessions"
-          ? this.rebuildTouchedSummarySessions(touchedSessions)
-          : sortedSessionIds(touchedSessions);
-        if (rawLogWasIndexed) this.recordRawLogState();
-        this.db.exec("COMMIT");
-        if (rawLogWasIndexed) this.indexError = undefined;
-        return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
-      } catch (error) {
-        let failure = error;
-        try {
-          this.db.exec("ROLLBACK");
-        } catch (rollbackError) {
-          failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
-        }
-        const indexFailure = new DerivedIndexError(failure);
-        this.indexError = indexFailure.message;
-        throw indexFailure;
-      }
+      return {
+        eventsToAppend,
+        rawLogState: rawLogWasIndexed ? this.rawLogState() : undefined,
+        skippedDuplicate,
+      };
     });
+    if (!this.db) return { imported: rawWrite.eventsToAppend.length, skippedDuplicate: rawWrite.skippedDuplicate, touchedSessions: [] };
+
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+    } catch (error) {
+      const failure = new DerivedIndexError(error);
+      this.indexError = failure.message;
+      throw failure;
+    }
+
+    const touchedSessions = new Set<string>();
+    try {
+      const indexSeen = this.knownEventIds(events.map((event) => event.event_id));
+      for (const event of events) {
+        if (indexSeen.has(event.event_id)) continue;
+        indexSeen.add(event.event_id);
+        const result = this.indexEventInTransaction(event, { rebuildSummary: summaryRebuild === "event" });
+        if (result.summaryTouched) touchedSessions.add(event.session_id);
+      }
+      const rebuiltSessions = summaryRebuild === "sessions"
+        ? this.rebuildTouchedSummarySessions(touchedSessions)
+        : sortedSessionIds(touchedSessions);
+      if (rawWrite.rawLogState) this.recordRawLogState(rawWrite.rawLogState);
+      this.db.exec("COMMIT");
+      if (rawWrite.rawLogState) this.indexError = undefined;
+      return {
+        imported: rawWrite.eventsToAppend.length,
+        skippedDuplicate: rawWrite.skippedDuplicate,
+        touchedSessions: rebuiltSessions,
+      };
+    } catch (error) {
+      let failure = error;
+      try {
+        this.db.exec("ROLLBACK");
+      } catch (rollbackError) {
+        failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
+      }
+      const indexFailure = new DerivedIndexError(failure);
+      this.indexError = indexFailure.message;
+      throw indexFailure;
+    }
   }
 
   private readRawEventIds(): Set<string> {
     const stat = this.rawLogStat();
     const cache = this.rawEventIdCache;
-    if (cache && stat && cache.size === stat.size && cache.mtimeMs === stat.mtimeMs) {
+    if (cache && stat && cache.size === stat.size && cache.mtimeMs === stat.mtimeMs && cache.ctimeMs === stat.ctimeMs) {
       return cache.eventIds;
     }
 
@@ -546,12 +558,14 @@ export class LcmStorage {
       this.rawEventIdCache = {
         size: stat.size,
         mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
         eventIds,
       };
     } else {
       this.rawEventIdCache = {
         size: 0,
         mtimeMs: 0,
+        ctimeMs: 0,
         eventIds,
       };
     }
@@ -564,11 +578,13 @@ export class LcmStorage {
       ? {
           size: stat.size,
           mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
           eventIds,
         }
       : {
           size: 0,
           mtimeMs: 0,
+          ctimeMs: 0,
           eventIds,
         };
   }
@@ -811,7 +827,11 @@ export class LcmStorage {
   private replayRawLogToIndex(): void {
     if (!this.db) return;
     if (this.rawLogIsIndexed()) return;
-    const rawLog = readRawLog(this.config.rawLogPath);
+    const snapshot = withRawLogLock(this.config.rawLogPath, () => ({
+      rawLog: readRawLog(this.config.rawLogPath),
+      state: this.rawLogState(),
+    }));
+    const rawLog = snapshot.rawLog;
     const rawEvents = rawLog.events;
     const indexedEvents = this.indexedEventsById();
     const indexedIds = new Set(indexedEvents.keys());
@@ -820,8 +840,8 @@ export class LcmStorage {
       this.indexError = `Raw JSONL contains ${rawLog.malformedLineCount} malformed ${noun}; destructive index reconciliation is disabled until the log is repaired.`;
     }
     if (rawEvents.length === 0) {
-      if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([]);
-      else if (rawLog.malformedLineCount === 0) this.recordRawLogState();
+      if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([], snapshot.state);
+      else if (rawLog.malformedLineCount === 0) this.recordRawLogState(snapshot.state);
       return;
     }
     const rawIds = new Set(rawEvents.map((event) => event.event_id));
@@ -831,12 +851,12 @@ export class LcmStorage {
       return indexedRaw !== undefined && indexedRaw !== JSON.stringify(event);
     });
     if ((hasStaleIndexedRows || hasChangedIndexedRows) && rawLog.malformedLineCount === 0) {
-      this.rebuildIndexFromRawEvents(rawEvents);
+      this.rebuildIndexFromRawEvents(rawEvents, snapshot.state);
       return;
     }
     const missingEvents = rawEvents.filter((event) => !indexedIds.has(event.event_id));
     if (missingEvents.length === 0) {
-      if (rawLog.malformedLineCount === 0) this.recordRawLogState();
+      if (rawLog.malformedLineCount === 0) this.recordRawLogState(snapshot.state);
       return;
     }
 
@@ -848,7 +868,7 @@ export class LcmStorage {
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
-      if (rawLog.malformedLineCount === 0) this.recordRawLogState();
+      if (rawLog.malformedLineCount === 0) this.recordRawLogState(snapshot.state);
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -860,7 +880,7 @@ export class LcmStorage {
     }
   }
 
-  private rebuildIndexFromRawEvents(rawEvents: NormalizedEvent[]): void {
+  private rebuildIndexFromRawEvents(rawEvents: NormalizedEvent[], state: RawLogState): void {
     if (!this.db) return;
     const touchedSessions = new Set<string>();
     this.db.exec("BEGIN IMMEDIATE");
@@ -871,7 +891,7 @@ export class LcmStorage {
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
-      this.recordRawLogState();
+      this.recordRawLogState(state);
       this.db.exec("COMMIT");
     } catch (error) {
       let rollbackError: unknown;
@@ -925,17 +945,22 @@ export class LcmStorage {
 
   private rawLogIsIndexed(): boolean {
     if (!this.db) return false;
-    const row = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(RAW_LOG_INDEX_STATE_KEY) as { value?: string } | undefined;
-    return row?.value === JSON.stringify(this.rawLogState());
+    return this.indexedRawLogState() === JSON.stringify(this.rawLogState());
   }
 
-  private recordRawLogState(): void {
+  private indexedRawLogState(): string | undefined {
+    if (!this.db) return undefined;
+    const row = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(RAW_LOG_INDEX_STATE_KEY) as { value?: string } | undefined;
+    return row?.value;
+  }
+
+  private recordRawLogState(state: RawLogState): void {
     if (!this.db) return;
     this.db.prepare(`
       INSERT INTO index_metadata (key, value)
       VALUES (?1, ?2)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(RAW_LOG_INDEX_STATE_KEY, JSON.stringify(this.rawLogState()));
+    `).run(RAW_LOG_INDEX_STATE_KEY, JSON.stringify(state));
   }
 
   private rawLogState(): RawLogState {
