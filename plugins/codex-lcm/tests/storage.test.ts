@@ -126,6 +126,31 @@ test("read-only single ingest rejects an event that is already raw-durable", () 
   readOnlyStorage.close();
 });
 
+test("read-only bulk ingest rejects with the storage contract message", () => {
+  const home = tempHome();
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "read-only-bulk-ingest-session",
+      cwd: "/tmp/read-only-bulk-ingest",
+      prompt: "bulk writes stay read only",
+    }),
+    env: {},
+    now,
+  });
+  const storage = createStorage({ home });
+  storage.ingest(event);
+  storage.close();
+  const readOnlyStorage = createStorage({ home, readOnly: true });
+
+  assert.throws(
+    () => readOnlyStorage.ingestMany([event]),
+    { message: "Cannot ingest events with read-only storage." },
+  );
+
+  readOnlyStorage.close();
+});
+
 test("context plan reports budget pressure without claiming compaction control", () => {
   const home = tempHome();
   const storage = createStorage({ home });
