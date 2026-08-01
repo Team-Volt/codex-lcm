@@ -1,11 +1,17 @@
+import type { DatabaseSync } from "node:sqlite";
+
+import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
-import { extractEventMetadata } from "./storage-sessions.ts";
+import { readRawEvents } from "./raw-log.ts";
+import { recordValue } from "./storage-rows.ts";
+import { countMap, extractEventMetadata } from "./storage-sessions.ts";
+import { getSummaryNodesForGraph } from "./storage-summaries.ts";
 import type { GraphEdge, GraphNode, SessionGraph } from "./storage-types.ts";
 import { summaryNodeTitle, type SummaryNode } from "./summary.ts";
 
 export const CHECKPOINT_INTERVAL = 50;
 
-export function summaryNodeToGraphNode(node: SummaryNode): GraphNode {
+function summaryNodeToGraphNode(node: SummaryNode): GraphNode {
   return {
     node_id: node.node_id,
     kind: "summary",
@@ -29,7 +35,7 @@ export function summaryNodeToGraphNode(node: SummaryNode): GraphNode {
   };
 }
 
-export function summaryGraphEdges(node: SummaryNode, nodeIds: Set<string>): GraphEdge[] {
+function summaryGraphEdges(node: SummaryNode, nodeIds: Set<string>): GraphEdge[] {
   return node.source_ids.flatMap((sourceId, index) => {
     const targetId = node.source_type === "events" ? eventNodeId(sourceId) : sourceId;
     if (!nodeIds.has(node.node_id) || !nodeIds.has(targetId)) return [];
@@ -48,27 +54,27 @@ export function summaryGraphEdges(node: SummaryNode, nodeIds: Set<string>): Grap
   });
 }
 
-export function graphEdgeKey(edge: Pick<GraphEdge, "from_node_id" | "to_node_id" | "kind">): string {
+function graphEdgeKey(edge: Pick<GraphEdge, "from_node_id" | "to_node_id" | "kind">): string {
   return `${edge.from_node_id}\0${edge.to_node_id}\0${edge.kind}`;
 }
 
-export function sessionNodeId(sessionId: string): string {
+function sessionNodeId(sessionId: string): string {
   return `session:${sessionId}`;
 }
 
-export function turnNodeId(sessionId: string, turnId: string): string {
+function turnNodeId(sessionId: string, turnId: string): string {
   return `turn:${sessionId}:${turnId}`;
 }
 
-export function eventNodeId(eventId: string): string {
+function eventNodeId(eventId: string): string {
   return `event:${eventId}`;
 }
 
-export function checkpointNodeId(sessionId: string, eventCount: number): string {
+function checkpointNodeId(sessionId: string, eventCount: number): string {
   return `checkpoint:${sessionId}:${eventCount}`;
 }
 
-export function checkpointGraphNode(event: NormalizedEvent, eventCount: number, metadata: Record<string, unknown>): GraphNode {
+function checkpointGraphNode(event: NormalizedEvent, eventCount: number, metadata: Record<string, unknown>): GraphNode {
   return {
     node_id: checkpointNodeId(event.session_id, eventCount),
     kind: "checkpoint",
@@ -82,7 +88,7 @@ export function checkpointGraphNode(event: NormalizedEvent, eventCount: number, 
   };
 }
 
-export function buildFallbackGraph(events: NormalizedEvent[], limit: number): SessionGraph {
+function buildFallbackGraph(events: NormalizedEvent[], limit: number): SessionGraph {
   const sessionId = events[0]?.session_id ?? "";
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
@@ -177,7 +183,7 @@ export function buildFallbackGraph(events: NormalizedEvent[], limit: number): Se
   };
 }
 
-export function fallbackEdge(
+function fallbackEdge(
   fromNodeId: string,
   toNodeId: string,
   kind: string,
@@ -194,4 +200,168 @@ export function fallbackEdge(
     created_at: createdAt,
     metadata: { fallback: true },
   };
+}
+
+export function getStoredSessionGraph(
+  db: DatabaseSync | undefined,
+  rawLogPath: string,
+  sessionId: string,
+  limit: number,
+): SessionGraph {
+  if (!db) return buildFallbackGraph(readRawEvents(rawLogPath).filter((event) => event.session_id === sessionId), limit);
+
+  const summaryBudget = limit >= 20
+    ? Math.min(Math.max(Math.ceil(limit * 0.25), 8), Math.floor(limit / 2))
+    : Math.max(0, Math.floor(limit / 4));
+  const graphNodeLimit = Math.max(1, limit - summaryBudget);
+  const events = db.prepare(`
+    SELECT raw_json FROM events
+    WHERE session_id = ?1
+    ORDER BY timestamp ASC, rowid ASC
+    LIMIT ?2
+  `).all(sessionId, graphNodeLimit)
+    .map((row) => decodePersistedEvent(String(recordValue(row).raw_json)));
+  const graph = buildFallbackGraph(events, graphNodeLimit);
+  const nodes = graph.nodes.map((node) => {
+    if (node.kind !== "checkpoint") return node;
+    const eventCount = Number(node.metadata.event_count ?? 0);
+    return { ...node, metadata: buildCheckpointMetadata(db, sessionId, eventCount) };
+  });
+  const remainingNodeBudget = Math.max(0, limit - nodes.length);
+  const rawSummaryNodes = remainingNodeBudget > 0
+    ? getSummaryNodesForGraph(db, sessionId, remainingNodeBudget)
+    : [];
+  const summaryNodes = rawSummaryNodes.map(summaryNodeToGraphNode);
+  nodes.push(...summaryNodes);
+  const nodeIds = new Set(nodes.map((node) => node.node_id));
+  const edges = graph.edges;
+  const edgeKeys = new Set(edges.map((edge) => graphEdgeKey(edge)));
+  for (const edge of rawSummaryNodes.flatMap((node) => summaryGraphEdges(node, nodeIds))) {
+    const key = graphEdgeKey(edge);
+    if (edgeKeys.has(key)) continue;
+    edgeKeys.add(key);
+    edges.push(edge);
+  }
+  return { session_id: sessionId, nodes, edges };
+}
+
+export function getLatestCheckpoint(db: DatabaseSync | undefined, sessionId: string): GraphNode | undefined {
+  if (!db) return undefined;
+  const row = recordValue(db.prepare(`
+    SELECT raw_json, position FROM (
+      SELECT raw_json, hook_event,
+        ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
+      FROM events
+      WHERE session_id = ?1
+    )
+    WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+    ORDER BY position DESC
+    LIMIT 1
+  `).get(sessionId));
+  if (typeof row.raw_json !== "string") return undefined;
+  const event = decodePersistedEvent(row.raw_json);
+  const position = Number(row.position);
+  return checkpointGraphNode(event, position, buildCheckpointMetadata(db, sessionId, position));
+}
+
+function buildCheckpointMetadata(
+  db: DatabaseSync | undefined,
+  sessionId: string,
+  eventCount: number,
+): Record<string, unknown> {
+  if (!db) return { event_count: eventCount };
+  const counts = db.prepare(`
+    WITH ordered AS (
+      SELECT hook_event, ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
+      FROM events
+      WHERE session_id = ?1
+    )
+    SELECT hook_event, COUNT(*) AS count
+    FROM ordered
+    WHERE position <= ?2
+    GROUP BY hook_event
+    ORDER BY hook_event ASC
+  `).all(sessionId, eventCount).map((row) => {
+    const record = recordValue(row);
+    return { hook_event: String(record.hook_event), count: Number(record.count) };
+  });
+  const recent = db.prepare(`
+    WITH ordered AS (
+      SELECT event_id, timestamp, hook_event,
+        ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
+      FROM events
+      WHERE session_id = ?1
+    )
+    SELECT event_id, timestamp, hook_event
+    FROM ordered
+    WHERE position <= ?2
+    ORDER BY position DESC
+    LIMIT 5
+  `).all(sessionId, eventCount).map((row) => {
+    const record = recordValue(row);
+    return {
+      event_id: String(record.event_id),
+      timestamp: String(record.timestamp),
+      hook_event: String(record.hook_event),
+    };
+  });
+  return { event_count: eventCount, hook_event_counts: counts, recent_events: recent };
+}
+
+export function derivedGraphNodeCounts(db: DatabaseSync | undefined): Record<string, number> {
+  return countMap(db, `
+    WITH ordered_events AS (
+      SELECT hook_event,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY timestamp, rowid) AS position
+      FROM events
+    ), counts AS (
+      SELECT 'session' AS key, COUNT(*) AS count FROM sessions
+      UNION ALL
+      SELECT 'turn', COUNT(*) FROM (
+        SELECT 1 FROM events WHERE turn_id IS NOT NULL GROUP BY session_id, turn_id
+      )
+      UNION ALL
+      SELECT 'event', COUNT(*) FROM events
+      UNION ALL
+      SELECT 'checkpoint', COUNT(*) FROM ordered_events
+      WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+      UNION ALL
+      SELECT 'summary', COUNT(*) FROM summary_nodes
+    )
+    SELECT key, count FROM counts WHERE count > 0 ORDER BY key
+  `);
+}
+
+export function derivedGraphEdgeCounts(db: DatabaseSync | undefined): Record<string, number> {
+  return countMap(db, `
+    WITH ordered_events AS (
+      SELECT rowid AS event_rowid, session_id, hook_event, tool_use_id, timestamp,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY timestamp, rowid) AS position
+      FROM events
+    ), counts AS (
+      SELECT 'contains' AS key,
+        (SELECT COUNT(*) FROM events) +
+        (SELECT COUNT(*) FROM (
+          SELECT 1 FROM events WHERE turn_id IS NOT NULL GROUP BY session_id, turn_id
+        )) AS count
+      UNION ALL
+      SELECT 'next', COALESCE(SUM(MAX(event_count - 1, 0)), 0) FROM sessions
+      UNION ALL
+      SELECT 'tool_result', COUNT(*) FROM ordered_events post
+      WHERE post.hook_event = 'PostToolUse' AND post.tool_use_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM events pre
+          WHERE pre.session_id = post.session_id
+            AND pre.hook_event = 'PreToolUse'
+            AND pre.tool_use_id = post.tool_use_id
+            AND (pre.timestamp < post.timestamp OR (pre.timestamp = post.timestamp AND pre.rowid < post.event_rowid))
+        )
+      UNION ALL
+      SELECT 'checkpoint', COUNT(*) FROM ordered_events
+      WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+      UNION ALL
+      SELECT 'summary_source', COALESCE(SUM(json_array_length(source_ids_json)), 0) FROM summary_nodes
+    )
+    SELECT key, count FROM counts WHERE count > 0 ORDER BY key
+  `);
 }

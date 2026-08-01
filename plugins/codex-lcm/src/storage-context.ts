@@ -76,7 +76,7 @@ export function buildContextPlan(args: {
   };
 }
 
-export function contextPlanState(estimatedRecentTokens: number, autoCompactTokenLimit: number, modelContextWindow: number): ContextPlanState {
+function contextPlanState(estimatedRecentTokens: number, autoCompactTokenLimit: number, modelContextWindow: number): ContextPlanState {
   if (estimatedRecentTokens <= 0) return "empty";
   if (estimatedRecentTokens >= modelContextWindow) return "over_context";
   if (estimatedRecentTokens >= autoCompactTokenLimit) return "over_limit";
@@ -84,7 +84,7 @@ export function contextPlanState(estimatedRecentTokens: number, autoCompactToken
   return "under_limit";
 }
 
-export function contextPlanRecommendation(state: ContextPlanState, summaryNodeCount: number): string {
+function contextPlanRecommendation(state: ContextPlanState, summaryNodeCount: number): string {
   if (state === "empty") return "No matching session found.";
   if (state === "under_limit") return "No context packing needed yet.";
   if (summaryNodeCount === 0) return "Context pressure is high, but no summary nodes are available yet.";
@@ -159,15 +159,7 @@ export function checkpointToMarkdown(node: GraphNode): string {
   ].join("\n");
 }
 
-export function countEventsByHook(events: NormalizedEvent[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const event of events) {
-    counts[event.hook_event] = (counts[event.hook_event] ?? 0) + 1;
-  }
-  return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));
-}
-
-export function uniqueEvents(events: NormalizedEvent[]): NormalizedEvent[] {
+function uniqueEvents(events: NormalizedEvent[]): NormalizedEvent[] {
   const seen = new Set<string>();
   const result: NormalizedEvent[] = [];
   for (const event of events) {
@@ -176,14 +168,4 @@ export function uniqueEvents(events: NormalizedEvent[]): NormalizedEvent[] {
     result.push(event);
   }
   return result;
-}
-
-export function groupEventsBySession(events: NormalizedEvent[]): Map<string, NormalizedEvent[]> {
-  const groups = new Map<string, NormalizedEvent[]>();
-  for (const event of events) {
-    const group = groups.get(event.session_id) ?? [];
-    group.push(event);
-    groups.set(event.session_id, group);
-  }
-  return groups;
 }

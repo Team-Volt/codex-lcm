@@ -1,10 +1,19 @@
+import type { DatabaseSync } from "node:sqlite";
+
 import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
+import { overflowReferenceFromEvent, searchOverflowContent, type OverflowSearchMatch } from "./overflow.ts";
+import { readRawEvents } from "./raw-log.ts";
 import { parseStringArray, recordValue, rowToSessionSummary } from "./storage-rows.ts";
-import type { SessionDiscovery, SessionSearchMatch, SessionSummary } from "./storage-types.ts";
-import { eventSignalText, isGeneratedSuggestionEvent, isSummarySourceEvent, queryTermHitCount } from "./summary.ts";
+import { getCurrentStoredSession, summarizeSessions } from "./storage-sessions.ts";
+export { searchSummaryNodes } from "./storage-summaries.ts";
+import type { SearchOverflowArgs, SearchSessionArgs, SessionDiscovery, SessionSearchMatch, SessionSummary } from "./storage-types.ts";
+import { eventSignalText, isGeneratedSuggestionEvent, isSummarySourceEvent, matchesQueryText, queryTermHitCount, toFtsQueries } from "./summary.ts";
 
-export function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
+const MAX_OVERFLOW_SEARCH_BYTES = 64 * 1024 * 1024;
+const MAX_OVERFLOW_SEARCH_REFERENCES = 4_096;
+
+function rankSessionRows(rows: unknown[], query: string): SessionSummary[] {
   const evidenceRows = strongestSessionEvidenceRows(rows, query);
   const sessions = new Map<string, {
     summary: SessionSummary;
@@ -61,7 +70,7 @@ export function rankSessionRows(rows: unknown[], query: string): SessionSummary[
     }));
 }
 
-export function strongestSessionEvidenceRows(rows: unknown[], query: string): unknown[] {
+function strongestSessionEvidenceRows(rows: unknown[], query: string): unknown[] {
   const scores = new Map<string, Map<SessionSearchMatch["kind"], { score: number; matchCount: number }>>();
   for (const row of rows) {
     const record = recordValue(row);
@@ -93,7 +102,7 @@ export function strongestSessionEvidenceRows(rows: unknown[], query: string): un
   });
 }
 
-export function sessionDiscovery(entry: {
+function sessionDiscovery(entry: {
   summary: SessionSummary;
   score: number;
   matchCount: number;
@@ -160,7 +169,7 @@ export function sessionDiscovery(entry: {
   };
 }
 
-export function isSearchDiscoveryRow(row: unknown, query: string): boolean {
+function isSearchDiscoveryRow(row: unknown, query: string): boolean {
   const record = recordValue(row);
   if (searchMatchKind(record.match_kind) !== "event") return true;
   if (typeof record.match_text !== "string") return true;
@@ -171,20 +180,20 @@ export function isSearchDiscoveryRow(row: unknown, query: string): boolean {
   }
 }
 
-export function isSearchDiscoveryEvent(event: NormalizedEvent, query: string): boolean {
+function isSearchDiscoveryEvent(event: NormalizedEvent, query: string): boolean {
   if (isGeneratedSuggestionEvent(event)) return isExplicitSuggestionQuery(query);
   return isSummarySourceEvent(event);
 }
 
-export function isExplicitSuggestionQuery(query: string): boolean {
+function isExplicitSuggestionQuery(query: string): boolean {
   return /\b(hyperpersonalized|suggestion|suggestions)\b/iu.test(query);
 }
 
-export function isBroadDiscoveryQuery(query: string): boolean {
+function isBroadDiscoveryQuery(query: string): boolean {
   return discoveryQueryTermCount(query) >= 4;
 }
 
-export function discoveryQueryTermCount(query: string): number {
+function discoveryQueryTermCount(query: string): number {
   const terms = new Set<string>();
   for (const term of query.toLowerCase().split(/[^\p{L}\p{N}_-]+/u)) {
     const normalized = term.replace(/^-+|-+$/gu, "");
@@ -195,7 +204,7 @@ export function discoveryQueryTermCount(query: string): number {
   return terms.size;
 }
 
-export function rowToSessionSearchMatch(record: Record<string, unknown>, query: string, score: number): SessionSearchMatch | undefined {
+function rowToSessionSearchMatch(record: Record<string, unknown>, query: string, score: number): SessionSearchMatch | undefined {
   const kind = searchMatchKind(record.match_kind);
   if (!kind) return undefined;
   const text = searchMatchText(kind, record.match_text);
@@ -218,12 +227,12 @@ export function rowToSessionSearchMatch(record: Record<string, unknown>, query: 
   };
 }
 
-export function searchMatchKind(value: unknown): SessionSearchMatch["kind"] | undefined {
+function searchMatchKind(value: unknown): SessionSearchMatch["kind"] | undefined {
   if (value === "summary_node" || value === "session_summary" || value === "event") return value;
   return undefined;
 }
 
-export function searchMatchText(kind: SessionSearchMatch["kind"], value: unknown): string {
+function searchMatchText(kind: SessionSearchMatch["kind"], value: unknown): string {
   if (typeof value !== "string") return "";
   if (kind !== "event") return value;
   try {
@@ -234,13 +243,13 @@ export function searchMatchText(kind: SessionSearchMatch["kind"], value: unknown
   }
 }
 
-export function compareSearchMatches(a: SessionSearchMatch, b: SessionSearchMatch): number {
+function compareSearchMatches(a: SessionSearchMatch, b: SessionSearchMatch): number {
   return b.score - a.score ||
     searchMatchKindWeight(b.kind) - searchMatchKindWeight(a.kind) ||
     b.timestamp.localeCompare(a.timestamp);
 }
 
-export function searchMatchKindWeight(kind: SessionSearchMatch["kind"]): number {
+function searchMatchKindWeight(kind: SessionSearchMatch["kind"]): number {
   if (kind === "summary_node") return 3;
   if (kind === "session_summary") return 2;
   return 1;
@@ -261,7 +270,7 @@ export function bestMatchSnippet(text: string, query: string, maxChars = 220): s
   return queryFocusedSnippet(bestLine, query, maxChars);
 }
 
-export function queryFocusedSnippet(text: string, query: string, maxChars: number): string {
+function queryFocusedSnippet(text: string, query: string, maxChars: number): string {
   const compact = compactWhitespace(text);
   if (compact.length <= maxChars) return compact;
   const phrase = compactWhitespace(query).toLowerCase();
@@ -290,4 +299,148 @@ export function clampLimit(limit: number | undefined, fallback: number, max = 20
 export function positiveInteger(value: number | undefined, fallback: number): number {
   const parsed = Number(value ?? fallback);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+export function searchStoredSessions(db: DatabaseSync | undefined, rawLogPath: string, args: SearchSessionArgs): SessionSummary[] {
+  const limit = clampLimit(args.limit, 10);
+  const excludedSessionIds = excludedSearchSessionIds(db, rawLogPath, args);
+  if (!db) {
+    const query = args.query?.trim() ?? "";
+    return summarizeSessions(readRawEvents(rawLogPath)
+      .filter((event) => !args.cwd || event.cwd === args.cwd)
+      .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
+      .filter((event) => !excludedSessionIds.has(event.session_id))
+      .filter((event) => isSearchDiscoveryEvent(event, query))
+      .filter((event) => matchesQueryText(JSON.stringify(event), query)))
+      .slice(0, limit);
+  }
+  const query = args.query?.trim() ?? "";
+  if (query.length === 0) {
+    const searchLimit = excludedSessionIds.size > 0 ? Math.max(limit * 4, 20) : limit;
+    return db.prepare(`
+      SELECT *
+      FROM sessions
+      WHERE (?1 IS NULL OR cwd = ?1)
+        AND (?2 IS NULL OR repo_root = ?2)
+      ORDER BY last_seen DESC
+      LIMIT ?3
+    `).all(args.cwd ?? null, args.repoRoot ?? null, searchLimit)
+      .map(rowToSessionSummary)
+      .filter((session) => !excludedSessionIds.has(session.session_id))
+      .slice(0, limit);
+  }
+
+  let rows: unknown[] = [];
+  const eventStatement = db.prepare(`
+    SELECT s.*,
+           e.raw_json AS match_text, e.timestamp AS match_timestamp, 1 AS match_weight,
+           'event' AS match_kind, e.event_id AS match_event_id
+    FROM event_fts f
+    JOIN events e ON e.event_id = f.event_id
+    JOIN sessions s ON s.session_id = e.session_id
+    WHERE event_fts MATCH ?1
+      AND (?2 IS NULL OR s.cwd = ?2)
+      AND (?3 IS NULL OR s.repo_root = ?3)
+      AND e.hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')
+    ORDER BY bm25(event_fts) ASC, e.timestamp DESC
+    LIMIT ?4
+  `);
+  const summaryStatement = db.prepare(`
+    SELECT s.*,
+           ss.summary_text AS match_text, ss.updated_at AS match_timestamp, 3 AS match_weight,
+           'session_summary' AS match_kind, ss.topics_json AS match_topics_json,
+           ss.source_event_ids_json AS match_source_event_ids_json
+    FROM session_summary_fts f
+    JOIN session_summaries ss ON ss.session_id = f.session_id
+    JOIN sessions s ON s.session_id = ss.session_id
+    WHERE session_summary_fts MATCH ?1
+      AND (?2 IS NULL OR s.cwd = ?2)
+      AND (?3 IS NULL OR s.repo_root = ?3)
+    ORDER BY bm25(session_summary_fts) ASC, ss.updated_at DESC
+    LIMIT ?4
+  `);
+  const summaryNodeStatement = db.prepare(`
+    SELECT s.*,
+           n.summary_text AS match_text, n.latest_at AS match_timestamp, 4 AS match_weight,
+           'summary_node' AS match_kind, n.node_id AS match_node_id, n.depth AS match_depth,
+           n.topics_json AS match_topics_json,
+           n.source_event_ids_json AS match_source_event_ids_json,
+           n.source_token_count AS match_source_token_count
+    FROM summary_node_fts f
+    JOIN summary_nodes n ON n.node_id = f.node_id
+    JOIN sessions s ON s.session_id = n.session_id
+    WHERE summary_node_fts MATCH ?1
+      AND (?2 IS NULL OR s.cwd = ?2)
+      AND (?3 IS NULL OR s.repo_root = ?3)
+    ORDER BY bm25(summary_node_fts) ASC, n.depth DESC, n.latest_at DESC
+    LIMIT ?4
+  `);
+  for (const ftsQuery of toFtsQueries(query)) {
+    const candidateRows = [summaryNodeStatement, summaryStatement, eventStatement]
+      .flatMap((statement) => statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 20, 50)));
+    rows = candidateRows
+      .filter((row) => !excludedSessionIds.has(String(recordValue(row).session_id)))
+      .filter((row) => isSearchDiscoveryRow(row, query));
+    if (rows.length > 0) break;
+  }
+  return rankSessionRows(rows, query).slice(0, limit);
+}
+
+export function searchStoredOverflow(
+  db: DatabaseSync | undefined,
+  rawLogPath: string,
+  overflowDir: string,
+  args: SearchOverflowArgs,
+): OverflowSearchMatch[] {
+  const limit = clampLimit(args.limit, 10, 50);
+  const events = db
+    ? db.prepare(`
+        SELECT raw_json
+        FROM events
+        WHERE json_extract(raw_json, '$.payload.overflow_ref.sha256') IS NOT NULL
+          AND (?1 IS NULL OR cwd = ?1)
+          AND (?2 IS NULL OR repo_root = ?2)
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT ?3
+      `).all(args.cwd ?? null, args.repoRoot ?? null, MAX_OVERFLOW_SEARCH_REFERENCES)
+      .map((row) => decodePersistedEvent(String(recordValue(row).raw_json)))
+    : readRawEvents(rawLogPath)
+      .filter((event) => !args.cwd || event.cwd === args.cwd)
+      .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
+      .reverse()
+      .slice(0, MAX_OVERFLOW_SEARCH_REFERENCES);
+  const matches: OverflowSearchMatch[] = [];
+  let scannedBytes = 0;
+  for (const event of events) {
+    const reference = overflowReferenceFromEvent(event);
+    if (!reference) continue;
+    if (scannedBytes >= MAX_OVERFLOW_SEARCH_BYTES) break;
+    try {
+      const match = searchOverflowContent({
+        overflowDir,
+        reference,
+        query: args.query,
+        maxScanBytes: MAX_OVERFLOW_SEARCH_BYTES - scannedBytes,
+        onRead: (bytes) => { scannedBytes += bytes; },
+      });
+      if (match) matches.push(match);
+    } catch {
+      // A missing, moved, or invalid overflow file cannot block other recall.
+    }
+    if (matches.length >= limit) break;
+  }
+  return matches;
+}
+
+function excludedSearchSessionIds(
+  db: DatabaseSync | undefined,
+  rawLogPath: string,
+  args: SearchSessionArgs,
+): Set<string> {
+  const excluded = new Set(args.excludeSessionIds?.filter((sessionId) => sessionId.trim().length > 0) ?? []);
+  if (args.excludeCurrentSession) {
+    const currentSession = getCurrentStoredSession(db, rawLogPath, { cwd: args.cwd, repoRoot: args.repoRoot });
+    if (currentSession) excluded.add(currentSession.session_id);
+  }
+  return excluded;
 }
