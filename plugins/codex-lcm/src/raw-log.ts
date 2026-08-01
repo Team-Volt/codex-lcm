@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { threadId } from "node:worker_threads";
 
 import { parsePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
@@ -34,7 +35,7 @@ export class RawLogLockTimeoutError extends Error {
 export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
   const lockPath = `${rawLogPath}.lock`;
-  const token = `${process.pid}:${randomUUID()}`;
+  const token = `${process.pid}:${threadId}:${randomUUID()}`;
   const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
   let descriptor: number;
 
@@ -101,10 +102,12 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
 function clearStaleRawLogLock(lockPath: string): boolean {
   try {
     const token = fs.readFileSync(lockPath, "utf8");
-    const [ownerText] = token.split(":", 1);
+    const [ownerText, ownerThreadText] = token.split(":", 2);
     const owner = Number(ownerText);
     if (Number.isSafeInteger(owner) && owner > 0) {
       if (owner === process.pid) {
+        const ownerThread = Number(ownerThreadText);
+        if (!Number.isSafeInteger(ownerThread) || ownerThread < 0 || ownerThread !== threadId) return false;
         if (activeRawLogLockTokens.has(token)) return false;
       } else {
         try {

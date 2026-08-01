@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { Worker } from "node:worker_threads";
+import { threadId, Worker } from "node:worker_threads";
 
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
 import { appendRawEvents, readRawLog, withRawLogLock } from "../src/raw-log.ts";
@@ -979,7 +979,7 @@ test("same-process orphaned raw-log lock is cleared", () => {
   const home = tempHome();
   const rawLogPath = path.join(home, "events.jsonl");
   const lockPath = `${rawLogPath}.lock`;
-  fs.writeFileSync(lockPath, `${process.pid}:orphan-token`, { mode: 0o600 });
+  fs.writeFileSync(lockPath, `${process.pid}:${threadId}:orphan-token`, { mode: 0o600 });
 
   // When
   let entered = false;
@@ -990,6 +990,59 @@ test("same-process orphaned raw-log lock is cleared", () => {
   // Then
   assert.equal(entered, true);
   assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("raw-log workers with the same PID do not clear each other's active lock", async () => {
+  // Given: worker A owns the raw lock long enough for worker B to poll it.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const activePath = path.join(home, "worker-holder-active");
+  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
+  const holder = new Worker(String.raw`
+    const fs = require("node:fs");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    (async () => {
+      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
+      withRawLogLock(workerData.rawLogPath, () => {
+        fs.writeFileSync(workerData.activePath, "active");
+        parentPort.postMessage("locked");
+        Atomics.wait(wait, 0, 0, 250);
+        fs.unlinkSync(workerData.activePath);
+      });
+    })();
+  `, { eval: true, workerData: { activePath, rawLogModuleUrl, rawLogPath } });
+  const holderDone = new Promise<void>((resolve, reject) => {
+    holder.once("error", reject);
+    holder.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`holder worker exited ${code}`)));
+  });
+  await new Promise<void>((resolve, reject) => {
+    holder.once("error", reject);
+    holder.once("message", () => resolve());
+  });
+  const waiter = new Worker(String.raw`
+    const fs = require("node:fs");
+    const { workerData } = require("node:worker_threads");
+    (async () => {
+      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
+      withRawLogLock(workerData.rawLogPath, () => {
+        if (fs.existsSync(workerData.activePath)) throw new Error("waiter worker entered concurrently");
+      });
+    })();
+  `, { eval: true, workerData: { activePath, rawLogModuleUrl, rawLogPath } });
+
+  // When: worker B attempts to acquire the same raw-log lock.
+  const waiterDone = new Promise<void>((resolve, reject) => {
+    waiter.once("error", reject);
+    waiter.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`waiter worker exited ${code}`)));
+  });
+
+  // Then: worker B enters only after worker A releases.
+  try {
+    await Promise.all([holderDone, waiterDone]);
+  } finally {
+    await Promise.all([holder.terminate(), waiter.terminate()]);
+  }
 });
 
 test("dead-owner raw-log lock does not delay a hook append", () => {
