@@ -1,5 +1,5 @@
 import type { FileReference } from "./file-refs.ts";
-import type { SessionSummary } from "./storage.ts";
+import type { SessionSummary } from "./storage-types.ts";
 import type { SessionMemorySummary, SummaryNode } from "./summary.ts";
 
 export function rowToSessionSummary(row: unknown): SessionSummary {
@@ -122,10 +122,10 @@ export function parseStringArray(value: unknown): string[] {
   }
 }
 
-function recordValue(value: unknown): Record<string, unknown> {
+export function recordValue(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
