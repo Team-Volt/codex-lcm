@@ -2773,6 +2773,8 @@ export class LcmStorage {
         UNION ALL
         SELECT 'checkpoint', COUNT(*) FROM ordered_events
         WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+        UNION ALL
+        SELECT 'summary', COUNT(*) FROM summary_nodes
       )
       SELECT key, count FROM counts WHERE count > 0 ORDER BY key
     `);

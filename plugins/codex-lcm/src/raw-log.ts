@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 
 import { parsePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
@@ -16,55 +16,33 @@ export type RawLogState = {
   readonly ctimeMs: number;
 };
 
-const RAW_LOG_LOCK_TIMEOUT_MS = 10_000;
 const RAW_LOG_LOCK_POLL_MS = 10;
 const RAW_LOG_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
-  const lockPath = `${rawLogPath}.lock`;
-  const token = `${process.pid}:${randomUUID()}`;
-  const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
-  let descriptor: number;
-
-  while (true) {
-    try {
-      descriptor = fs.openSync(lockPath, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (clearStaleRawLogLock(lockPath)) continue;
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for raw log lock: ${lockPath}`);
-      Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
-      continue;
-    }
-    try {
-      fs.writeFileSync(descriptor, token);
-      break;
-    } catch (error) {
-      try {
-        fs.closeSync(descriptor);
-      } catch {
-        // Preserve the lock setup failure.
-      }
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        // A later writer can clear a stale lock if cleanup also failed.
-      }
-      throw error;
-    }
-  }
-
-  // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
+  const lockPath = `${rawLogPath}.lock.sqlite`;
+  const lock = new DatabaseSync(lockPath, { timeout: RAW_LOG_LOCK_POLL_MS });
   try {
-    return callback();
-  } finally {
-    fs.closeSync(descriptor);
-    try {
-      if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    fs.chmodSync(lockPath, 0o600);
+    while (true) {
+      try {
+        lock.exec("BEGIN IMMEDIATE");
+        break;
+      } catch (error) {
+        if (!isSqliteBusy(error)) throw error;
+        Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
+      }
     }
+
+    // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
+    try {
+      return callback();
+    } finally {
+      lock.exec("ROLLBACK");
+    }
+  } finally {
+    lock.close();
   }
 }
 
@@ -72,33 +50,34 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
   if (events.length === 0) return;
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
   const existed = fs.existsSync(rawLogPath);
+  const previousSize = existed ? fs.statSync(rawLogPath).size : 0;
   const separator = rawLogNeedsSeparator(rawLogPath) ? "\n" : "";
-  fs.appendFileSync(rawLogPath, `${separator}${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
-  fsyncPath(rawLogPath);
-  if (!existed && process.platform !== "win32") fsyncPath(path.dirname(rawLogPath));
-}
-
-function clearStaleRawLogLock(lockPath: string): boolean {
   try {
-    const stale = Date.now() - fs.statSync(lockPath).mtimeMs >= RAW_LOG_LOCK_TIMEOUT_MS;
-    const [ownerText] = fs.readFileSync(lockPath, "utf8").split(":", 1);
-    const owner = Number(ownerText);
-    if (!stale && Number.isSafeInteger(owner) && owner > 0) {
-      try {
-        process.kill(owner, 0);
-        return false;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
-      }
-    } else if (!stale) {
-      return false;
-    }
-    fs.unlinkSync(lockPath);
-    return true;
+    fs.appendFileSync(rawLogPath, `${separator}${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
+    fsyncPath(rawLogPath);
+    if (!existed && process.platform !== "win32") fsyncPath(path.dirname(rawLogPath));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    try {
+      restoreRawLog(rawLogPath, existed, previousSize);
+    } catch (rollbackError) {
+      throw new AggregateError([error, rollbackError], "Raw log append failed and rollback failed.");
+    }
     throw error;
   }
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  return error instanceof Error && Reflect.get(error, "errcode") === 5;
+}
+
+function restoreRawLog(rawLogPath: string, existed: boolean, previousSize: number): void {
+  if (existed) {
+    fs.truncateSync(rawLogPath, previousSize);
+    fsyncPath(rawLogPath);
+    return;
+  }
+  if (fs.existsSync(rawLogPath)) fs.unlinkSync(rawLogPath);
+  if (process.platform !== "win32") fsyncPath(path.dirname(rawLogPath));
 }
 
 function rawLogNeedsSeparator(rawLogPath: string): boolean {

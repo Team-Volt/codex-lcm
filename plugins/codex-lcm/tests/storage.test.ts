@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -77,6 +77,7 @@ test("stats reports aggregate summary and graph shape without raw content", () =
   assert.equal(stats.latest_summary_node_at, "2026-06-09T12:00:08.000Z");
   assert.equal(stats.graph_nodes_by_kind.event, 9);
   assert.equal(stats.graph_nodes_by_kind.session, 1);
+  assert.equal(stats.graph_nodes_by_kind.summary, 3);
   assert.equal(stats.graph_edges_by_kind.contains, 9);
   assert.equal(stats.graph_edges_by_kind.summary_source, 11);
   assert.equal("raw_json" in stats, false);
@@ -866,7 +867,7 @@ test("single ingest keeps a raw-durable event when SQLite indexing fails", () =>
   storage.close();
 });
 
-test("single ingest surfaces a raw-log fsync failure", () => {
+test("retry after a raw-log fsync failure appends and syncs the event again", () => {
   const home = tempHome();
   const storage = createStorage({ home });
   const event = normalizeHookEvent({
@@ -880,19 +881,26 @@ test("single ingest surfaces a raw-log fsync failure", () => {
     now,
   });
   const originalFsyncSync = fs.fsyncSync;
-  fs.fsyncSync = () => {
-    throw new Error("forced raw fsync failure");
+  let fsyncCalls = 0;
+  fs.fsyncSync = (descriptor) => {
+    fsyncCalls += 1;
+    if (fsyncCalls === 1) throw new Error("forced raw fsync failure");
+    return originalFsyncSync(descriptor);
   };
 
   try {
     assert.throws(() => storage.ingest(event), /forced raw fsync failure/u);
+    assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events, []);
+    storage.ingest(event);
+    assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events.map(({ event_id }) => event_id), [event.event_id]);
+    assert.equal(fsyncCalls >= 3, true);
   } finally {
     fs.fsyncSync = originalFsyncSync;
     storage.close();
   }
 });
 
-test("raw-log lock setup failures do not leave a stale lock", () => {
+test("raw-log lock setup failures do not enter the append callback", () => {
   const home = tempHome();
   const storage = createStorage({ home });
   const event = normalizeHookEvent({
@@ -905,17 +913,17 @@ test("raw-log lock setup failures do not leave a stale lock", () => {
     env: {},
     now,
   });
-  const originalWriteFileSync = fs.writeFileSync;
-  fs.writeFileSync = (...args) => {
-    if (typeof args[0] === "number") throw new Error("forced lock token write failure");
-    return originalWriteFileSync(...args);
+  const originalChmodSync = fs.chmodSync;
+  fs.chmodSync = (targetPath, mode) => {
+    if (String(targetPath).endsWith("events.jsonl.lock.sqlite")) throw new Error("forced lock setup failure");
+    return originalChmodSync(targetPath, mode);
   };
 
   try {
-    assert.throws(() => storage.ingest(event), /forced lock token write failure/u);
-    assert.equal(fs.existsSync(path.join(home, "events.jsonl.lock")), false);
+    assert.throws(() => storage.ingest(event), /forced lock setup failure/u);
+    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
   } finally {
-    fs.writeFileSync = originalWriteFileSync;
+    fs.chmodSync = originalChmodSync;
     storage.close();
   }
 });
@@ -966,13 +974,20 @@ test("constructor replay leaves an interleaved raw append visible to the next op
   reopened.close();
 });
 
-test("old raw-log lock with a live PID does not delay a hook append", () => {
-  // Given: an abandoned lock whose PID is still live but whose age exceeds the lock timeout.
+test("orphaned raw-log lock database does not delay a hook append", () => {
+  // Given: a lock database left behind after its owning process exits without cleanup.
   const home = tempHome();
-  const lockPath = path.join(home, "events.jsonl.lock");
-  fs.writeFileSync(lockPath, `${process.pid}:abandoned`, { mode: 0o600 });
-  const old = new Date(Date.now() - 20_000);
-  fs.utimesSync(lockPath, old, old);
+  const lockPath = path.join(home, "events.jsonl.lock.sqlite");
+  const abandoned = spawnSync(process.execPath, [
+    "--no-warnings",
+    "--input-type=module",
+    "--eval",
+    `const { DatabaseSync } = await import("node:sqlite"); const db = new DatabaseSync(process.env.RAW_LOCK_PATH); db.exec("BEGIN IMMEDIATE"); process.exit(0);`,
+  ], {
+    encoding: "utf8",
+    env: { ...process.env, RAW_LOCK_PATH: lockPath },
+  });
+  assert.equal(abandoned.status, 0, abandoned.stderr);
   const storage = createStorage({ home });
   const event = normalizeHookEvent({
     hookEvent: "UserPromptSubmit",
@@ -990,6 +1005,69 @@ test("old raw-log lock with a live PID does not delay a hook append", () => {
   assert.equal(elapsedMs < 1_000, true, `stale lock delayed append by ${elapsedMs}ms`);
   assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events.map(({ event_id }) => event_id), [event.event_id]);
   storage.close();
+});
+
+test("raw-log waiter never evicts an active owner after ten seconds", async () => {
+  // Given: a separate process that holds the writer lock beyond the former stale timeout.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const activePath = path.join(home, "holder-active");
+  const moduleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
+  const holderEvent = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "slow-holder", cwd: "/tmp/slow-holder", prompt: "holder" }),
+    env: {},
+    now,
+  });
+  const waiterEvent = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "slow-waiter", cwd: "/tmp/slow-waiter", prompt: "waiter" }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:01.000Z"),
+  });
+  const holder = spawn(process.execPath, [
+    "--no-warnings",
+    "--input-type=module",
+    "--eval",
+    `const fs = await import("node:fs"); const { appendRawEvents, withRawLogLock } = await import(process.env.RAW_LOG_MODULE_URL); const wait = new Int32Array(new SharedArrayBuffer(4)); withRawLogLock(process.env.RAW_LOG_PATH, () => { fs.writeFileSync(process.env.ACTIVE_PATH, "active"); process.stdout.write("locked\\n"); Atomics.wait(wait, 0, 0, 10500); fs.unlinkSync(process.env.ACTIVE_PATH); appendRawEvents(process.env.RAW_LOG_PATH, [JSON.parse(process.env.RAW_EVENT)]); });`,
+  ], {
+    env: {
+      ...process.env,
+      ACTIVE_PATH: activePath,
+      RAW_EVENT: JSON.stringify(holderEvent),
+      RAW_LOG_MODULE_URL: moduleUrl,
+      RAW_LOG_PATH: rawLogPath,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const holderReady = await new Promise<string>((resolve, reject) => {
+    holder.once("error", reject);
+    holder.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString("utf8")));
+    holder.once("exit", (code) => reject(new Error(`holder exited before acquiring lock: ${code}`)));
+  });
+  assert.match(holderReady, /locked/u);
+
+  // When: another process waits to append while the owner stays active beyond ten seconds.
+  const waiter = spawnSync(process.execPath, [
+    "--no-warnings",
+    "--input-type=module",
+    "--eval",
+    `const fs = await import("node:fs"); const { appendRawEvents, withRawLogLock } = await import(process.env.RAW_LOG_MODULE_URL); withRawLogLock(process.env.RAW_LOG_PATH, () => { if (fs.existsSync(process.env.ACTIVE_PATH)) throw new Error("waiter entered concurrently"); appendRawEvents(process.env.RAW_LOG_PATH, [JSON.parse(process.env.RAW_EVENT)]); });`,
+  ], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      ACTIVE_PATH: activePath,
+      RAW_EVENT: JSON.stringify(waiterEvent),
+      RAW_LOG_MODULE_URL: moduleUrl,
+      RAW_LOG_PATH: rawLogPath,
+    },
+    timeout: 15_000,
+  });
+
+  // Then: the waiter enters only after release and neither event is dropped.
+  assert.equal(waiter.status, 0, waiter.stderr || `waiter terminated with ${waiter.signal}`);
+  assert.deepEqual(readRawLog(rawLogPath).events.map(({ event_id }) => event_id), [holderEvent.event_id, waiterEvent.event_id]);
 });
 
 test("derived index work does not hold the raw-log writer lock", () => {
