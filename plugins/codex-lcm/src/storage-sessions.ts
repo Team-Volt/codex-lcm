@@ -156,7 +156,7 @@ function maxOptional(current: number | undefined, incoming: number | undefined):
   return Math.max(current, incoming);
 }
 
-export function stringField(value: unknown): string | undefined {
+function stringField(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 

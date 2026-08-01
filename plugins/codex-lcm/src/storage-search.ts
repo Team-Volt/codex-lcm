@@ -424,7 +424,9 @@ export function searchStoredOverflow(
         onRead: (bytes) => { scannedBytes += bytes; },
       });
       if (match) matches.push(match);
-    } catch {
+    } catch (error) {
+      if (error instanceof Error) void error.message;
+      else void String(error);
       // A missing, moved, or invalid overflow file cannot block other recall.
     }
     if (matches.length >= limit) break;
