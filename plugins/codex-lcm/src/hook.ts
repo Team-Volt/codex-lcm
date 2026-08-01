@@ -5,7 +5,6 @@ import { DEFAULT_LIMITS, loadConfig } from "./config.ts";
 import { importCodexSessions } from "./codex-import.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
-import { RawLogLockTimeoutError } from "./raw-log.ts";
 import { sha256 } from "./redact.ts";
 import { createStorage } from "./storage.ts";
 
@@ -55,10 +54,8 @@ export async function runHook(args: string[]): Promise<void> {
     event.repo_root = session?.repo_root;
     event.git_branch = session?.git_branch;
   }
-  let stored = false;
   try {
     storage.ingest(event);
-    stored = true;
     if (transcriptPath) {
       try {
         const report = await importCodexSessions(storage, { from: transcriptPath });
@@ -71,13 +68,9 @@ export async function runHook(args: string[]): Promise<void> {
         );
       }
     }
-  } catch (error) {
-    if (error instanceof RawLogLockTimeoutError) throw error;
-    process.stderr.write(`codex-lcm: failed to store hook event: ${error instanceof Error ? error.message : String(error)}\n`);
   } finally {
     storage.close();
   }
-  if (!stored) return;
   const output = postCompactRecoveryOutput({
     home: config.home,
     hookEvent: event.hook_event,

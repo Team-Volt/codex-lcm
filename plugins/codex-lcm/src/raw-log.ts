@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { threadId } from "node:worker_threads";
 
 import { parsePersistedEvent } from "./event-codec.ts";
@@ -35,33 +36,38 @@ export class RawLogLockTimeoutError extends Error {
 export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
   const lockPath = `${rawLogPath}.lock`;
+  const coordinatorPath = `${rawLogPath}.lock.sqlite`;
   const token = `${process.pid}:${threadId}:${randomUUID()}`;
   const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
   let descriptor: number;
 
-  while (true) {
-    try {
-      descriptor = fs.openSync(lockPath, "wx", 0o600);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (clearStaleRawLogLock(lockPath)) continue;
+  const coordinator = new DatabaseSync(coordinatorPath, { timeout: RAW_LOG_LOCK_POLL_MS });
+  try {
+    fs.chmodSync(coordinatorPath, 0o600);
+    while (true) {
+      const acquired = tryAcquireRawLogLock(coordinator, lockPath);
+      if (acquired !== undefined) {
+        descriptor = acquired;
+        break;
+      }
       if (Date.now() >= deadline) throw new RawLogLockTimeoutError(lockPath);
       Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
-      continue;
     }
+  } finally {
+    coordinator.close();
+  }
+
+  try {
+    fs.writeFileSync(descriptor, token);
+    activeRawLogLockTokens.add(token);
+  } catch (error) {
     try {
-      fs.writeFileSync(descriptor, token);
-      activeRawLogLockTokens.add(token);
-      break;
-    } catch (error) {
-      try {
-        fs.closeSync(descriptor);
-      } catch {}
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {}
-      throw error;
-    }
+      fs.closeSync(descriptor);
+    } catch {}
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {}
+    throw error;
   }
 
   // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
@@ -77,6 +83,37 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
       activeRawLogLockTokens.delete(token);
     }
   }
+}
+
+function tryAcquireRawLogLock(coordinator: DatabaseSync, lockPath: string): number | undefined {
+  let transactionOpen = false;
+  try {
+    try {
+      coordinator.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+    } catch (error) {
+      if (isSqliteBusy(error)) return undefined;
+      throw error;
+    }
+    try {
+      return fs.openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (!clearStaleRawLogLock(lockPath)) return undefined;
+      try {
+        return fs.openSync(lockPath, "wx", 0o600);
+      } catch (retryError) {
+        if ((retryError as NodeJS.ErrnoException).code === "EEXIST") return undefined;
+        throw retryError;
+      }
+    }
+  } finally {
+    if (transactionOpen) coordinator.exec("ROLLBACK");
+  }
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  return error instanceof Error && Reflect.get(error, "errcode") === 5;
 }
 
 export function appendRawEvents(rawLogPath: string, events: readonly NormalizedEvent[]): void {
@@ -117,7 +154,7 @@ function clearStaleRawLogLock(lockPath: string): boolean {
           if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
         }
       }
-    } else if (Date.now() - fs.statSync(lockPath).mtimeMs < RAW_LOG_LOCK_TIMEOUT_MS) {
+    } else {
       return false;
     }
     if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);

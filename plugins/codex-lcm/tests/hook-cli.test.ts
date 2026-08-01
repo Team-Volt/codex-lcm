@@ -74,6 +74,51 @@ test("hook command reports raw-log lock timeout and persists on retry", () => {
   assert.equal(JSON.parse(health.stdout).event_count, 1);
 });
 
+test("hook command reports raw fsync failure and persists on retry", () => {
+  // Given: the real hook CLI loads a fault injector that fails raw fsync.
+  const home = tempHome();
+  const preloadPath = path.join(tempHome("codex-lcm-fsync-preload-"), "fail-fsync.mjs");
+  fs.writeFileSync(
+    preloadPath,
+    'import fs from "node:fs"; const original = fs.fsyncSync; let calls = 0; fs.fsyncSync = (...args) => { calls += 1; if (calls === 1) throw new Error("forced raw fsync failure"); return original(...args); };\n',
+  );
+  const input = JSON.stringify({
+    session_id: "hook-fsync-retry",
+    cwd: "/tmp/hook-fsync-retry",
+    prompt: "persist once after fsync recovers",
+  });
+
+  // When: raw durability fails before the hook can acknowledge the event.
+  const blocked = spawnSync(process.execPath, [
+    "--no-warnings",
+    "--import",
+    preloadPath,
+    "bin/codex-lcm",
+    "hook",
+    "UserPromptSubmit",
+  ], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    input,
+    env: { ...process.env, CODEX_LCM_HOME: home },
+  });
+
+  // Then: failure is visible and rollback leaves no acknowledged raw event.
+  assert.equal(blocked.status, 1, blocked.stderr);
+  assert.match(blocked.stderr, /forced raw fsync failure/u);
+  assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+
+  // When: the same hook is retried without the injected failure.
+  const retried = runCli(["hook", "UserPromptSubmit"], { input, env: { CODEX_LCM_HOME: home } });
+
+  // Then: exactly one raw and indexed event persists.
+  assertCliOk(retried);
+  assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
+  const health = runCli(["health", "--json"], { env: { CODEX_LCM_HOME: home } });
+  assertCliOk(health);
+  assert.equal(JSON.parse(health.stdout).event_count, 1);
+});
+
 test("hook command redacts credential URI passwords before persistence", () => {
   const home = tempHome();
   const password = "audit-password";
