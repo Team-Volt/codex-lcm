@@ -23,10 +23,10 @@ import {
   getFileRefsForSession as readFileRefsForSession,
   getOverflowRef as readOverflowRef,
   getRecentContext as readRecentContext,
-  packContext as packStoredContext,
   parseCursor,
   parseTimestamp,
 } from "./storage-context.ts";
+import { packContext as packStoredContext } from "./storage-pack.ts";
 import {
   derivedGraphEdgeCounts,
   derivedGraphNodeCounts,
