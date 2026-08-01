@@ -1,6 +1,6 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 import { parsePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
@@ -16,33 +16,65 @@ export type RawLogState = {
   readonly ctimeMs: number;
 };
 
+const RAW_LOG_LOCK_TIMEOUT_MS = 10_000;
 const RAW_LOG_LOCK_POLL_MS = 10;
 const RAW_LOG_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+const activeRawLogLockTokens = new Set<string>();
+
+export class RawLogLockTimeoutError extends Error {
+  readonly lockPath: string;
+
+  constructor(lockPath: string) {
+    super(`codex-lcm: raw log lock timeout: ${lockPath}`);
+    this.name = "RawLogLockTimeoutError";
+    this.lockPath = lockPath;
+  }
+}
 
 export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
-  const lockPath = `${rawLogPath}.lock.sqlite`;
-  const lock = new DatabaseSync(lockPath, { timeout: RAW_LOG_LOCK_POLL_MS });
-  try {
-    fs.chmodSync(lockPath, 0o600);
-    while (true) {
-      try {
-        lock.exec("BEGIN IMMEDIATE");
-        break;
-      } catch (error) {
-        if (!isSqliteBusy(error)) throw error;
-        Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
-      }
-    }
+  const lockPath = `${rawLogPath}.lock`;
+  const token = `${process.pid}:${randomUUID()}`;
+  const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
+  let descriptor: number;
 
-    // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
+  while (true) {
     try {
-      return callback();
-    } finally {
-      lock.exec("ROLLBACK");
+      descriptor = fs.openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (clearStaleRawLogLock(lockPath)) continue;
+      if (Date.now() >= deadline) throw new RawLogLockTimeoutError(lockPath);
+      Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
+      continue;
     }
+    try {
+      fs.writeFileSync(descriptor, token);
+      activeRawLogLockTokens.add(token);
+      break;
+    } catch (error) {
+      try {
+        fs.closeSync(descriptor);
+      } catch {}
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {}
+      throw error;
+    }
+  }
+
+  // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
+  try {
+    return callback();
   } finally {
-    lock.close();
+    try {
+      fs.closeSync(descriptor);
+      if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    } finally {
+      activeRawLogLockTokens.delete(token);
+    }
   }
 }
 
@@ -66,8 +98,31 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
   }
 }
 
-function isSqliteBusy(error: unknown): boolean {
-  return error instanceof Error && Reflect.get(error, "errcode") === 5;
+function clearStaleRawLogLock(lockPath: string): boolean {
+  try {
+    const token = fs.readFileSync(lockPath, "utf8");
+    const [ownerText] = token.split(":", 1);
+    const owner = Number(ownerText);
+    if (Number.isSafeInteger(owner) && owner > 0) {
+      if (owner === process.pid) {
+        if (activeRawLogLockTokens.has(token)) return false;
+      } else {
+        try {
+          process.kill(owner, 0);
+          return false;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+        }
+      }
+    } else if (Date.now() - fs.statSync(lockPath).mtimeMs < RAW_LOG_LOCK_TIMEOUT_MS) {
+      return false;
+    }
+    if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw error;
+  }
 }
 
 function restoreRawLog(rawLogPath: string, existed: boolean, previousSize: number): void {

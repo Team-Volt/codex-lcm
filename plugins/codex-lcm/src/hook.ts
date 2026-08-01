@@ -5,6 +5,7 @@ import { DEFAULT_LIMITS, loadConfig } from "./config.ts";
 import { importCodexSessions } from "./codex-import.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
+import { RawLogLockTimeoutError } from "./raw-log.ts";
 import { sha256 } from "./redact.ts";
 import { createStorage } from "./storage.ts";
 
@@ -71,6 +72,7 @@ export async function runHook(args: string[]): Promise<void> {
       }
     }
   } catch (error) {
+    if (error instanceof RawLogLockTimeoutError) throw error;
     process.stderr.write(`codex-lcm: failed to store hook event: ${error instanceof Error ? error.message : String(error)}\n`);
   } finally {
     storage.close();

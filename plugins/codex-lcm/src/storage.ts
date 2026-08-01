@@ -20,6 +20,7 @@ import {
   readRawEventIds,
   readRawEvents,
   readRawLog,
+  RawLogLockTimeoutError,
   withRawLogLock,
   type RawLogState,
 } from "./raw-log.ts";
@@ -422,6 +423,7 @@ export class LcmStorage {
       }
     } catch (error) {
       this.db = undefined;
+      if (error instanceof RawLogLockTimeoutError) throw error;
       this.indexError = error instanceof Error ? error.message : String(error);
     }
   }
@@ -474,6 +476,7 @@ export class LcmStorage {
         indexedEventIds = this.knownEventIds(events.map((event) => event.event_id));
       }
     } catch (error) {
+      if (error instanceof RawLogLockTimeoutError) throw error;
       this.indexError = error instanceof Error ? error.message : String(error);
       indexedRawLogState = undefined;
     }
