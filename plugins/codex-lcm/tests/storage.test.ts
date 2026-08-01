@@ -992,6 +992,93 @@ test("same-process orphaned raw-log lock is cleared", () => {
   assert.equal(fs.existsSync(lockPath), false);
 });
 
+test("raw-log reclaims a candidate left by a terminated worker", async () => {
+  // Given: a worker terminates after candidate creation but before atomic lock publication.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
+  const worker = new Worker(String.raw`
+    const fs = require("node:fs");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const originalLinkSync = fs.linkSync;
+    fs.linkSync = (existingPath, newPath) => {
+      if (String(newPath).endsWith(".lock")) {
+        parentPort.postMessage("candidate-created");
+        process.exit(0);
+      }
+      return originalLinkSync(existingPath, newPath);
+    };
+    (async () => {
+      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
+      withRawLogLock(workerData.rawLogPath, () => {});
+    })();
+  `, { eval: true, workerData: { rawLogModuleUrl, rawLogPath } });
+  const workerDone = new Promise<void>((resolve, reject) => {
+    worker.once("error", reject);
+    worker.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`worker exited ${code}`)));
+  });
+
+  // When: the parent enters after the worker has released its coordinator transaction.
+  await new Promise<void>((resolve, reject) => {
+    worker.once("error", reject);
+    worker.once("message", () => resolve());
+  });
+  await workerDone;
+  withRawLogLock(rawLogPath, () => {});
+
+  // Then: the abandoned same-process candidate is gone.
+  assert.deepEqual(fs.readdirSync(home).filter((name) => name.endsWith(".candidate")), []);
+});
+
+test("raw-log does not create a candidate before it owns the coordinator", async () => {
+  // Given: a separate writer reaches the coordinator while another process owns it.
+  const home = tempHome();
+  const rawLogPath = path.join(home, "events.jsonl");
+  const coordinator = new DatabaseSync(`${rawLogPath}.lock.sqlite`);
+  const barrier = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
+  coordinator.exec("BEGIN IMMEDIATE");
+  const waiter = new Worker(String.raw`
+    const { DatabaseSync } = require("node:sqlite");
+    const { parentPort, workerData } = require("node:worker_threads");
+    const barrier = new Int32Array(workerData.barrier);
+    const originalExec = DatabaseSync.prototype.exec;
+    DatabaseSync.prototype.exec = function(sql) {
+      if (sql === "BEGIN IMMEDIATE") {
+        parentPort.postMessage("before-coordinator");
+        Atomics.wait(barrier, 0, 0);
+      }
+      return originalExec.call(this, sql);
+    };
+    (async () => {
+      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
+      withRawLogLock(workerData.rawLogPath, () => {});
+    })();
+  `, { eval: true, workerData: { barrier: barrier.buffer, rawLogModuleUrl, rawLogPath } });
+  const waiterDone = new Promise<void>((resolve, reject) => {
+    waiter.once("error", reject);
+    waiter.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`waiter worker exited ${code}`)));
+  });
+
+  // When: the waiter has not yet attempted to acquire the held coordinator.
+  try {
+    await new Promise<void>((resolve, reject) => {
+      waiter.once("error", reject);
+      waiter.once("message", () => resolve());
+    });
+
+    // Then: it has no candidate that a cleaner could mistake for a crashed owner.
+    assert.deepEqual(fs.readdirSync(home).filter((name) => name.endsWith(".candidate")), []);
+  } finally {
+    coordinator.exec("ROLLBACK");
+    coordinator.close();
+    Atomics.store(barrier, 0, 1);
+    Atomics.notify(barrier, 0);
+    await waiterDone;
+    await waiter.terminate();
+  }
+});
+
 test("raw-log workers with the same PID do not clear each other's active lock", async () => {
   // Given: worker A owns the raw lock long enough for worker B to poll it.
   const home = tempHome();

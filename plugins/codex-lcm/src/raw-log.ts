@@ -45,7 +45,6 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   let transactionOpen = false;
   let published = false;
 
-  fs.writeFileSync(candidatePath, token, { flag: "wx", mode: 0o600 });
   try {
     coordinator = new DatabaseSync(coordinatorPath, { timeout: RAW_LOG_LOCK_POLL_MS });
     fs.chmodSync(coordinatorPath, 0o600);
@@ -54,6 +53,8 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
         try {
           coordinator.exec("BEGIN IMMEDIATE");
           transactionOpen = true;
+          clearStaleRawLogCandidates(lockPath);
+          fs.writeFileSync(candidatePath, token, { flag: "wx", mode: 0o600 });
         } catch (error) {
           if (!isSqliteBusy(error)) throw error;
           waitForRawLogLock(deadline, lockPath);
@@ -154,6 +155,34 @@ function clearStaleRawLogLock(lockPath: string): boolean {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
     throw error;
+  }
+}
+
+function clearStaleRawLogCandidates(lockPath: string): void {
+  const directory = path.dirname(lockPath);
+  const candidatePrefix = `${path.basename(lockPath)}.`;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.startsWith(candidatePrefix) || !entry.name.endsWith(".candidate")) continue;
+    clearStaleRawLogCandidate(path.join(directory, entry.name));
+  }
+}
+
+function clearStaleRawLogCandidate(candidatePath: string): void {
+  try {
+    const token = fs.readFileSync(candidatePath, "utf8");
+    const tokenParts = token.split(":");
+    const tokenId = tokenParts[2];
+    const currentToken = tokenParts.length === 3
+      && Number.isSafeInteger(Number(tokenParts[0]))
+      && Number(tokenParts[0]) > 0
+      && Number.isSafeInteger(Number(tokenParts[1]))
+      && Number(tokenParts[1]) >= 0
+      && typeof tokenId === "string"
+      && RAW_LOG_LOCK_TOKEN_ID_PATTERN.test(tokenId);
+    if (!currentToken) return;
+    if (fs.readFileSync(candidatePath, "utf8") === token) fs.unlinkSync(candidatePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
