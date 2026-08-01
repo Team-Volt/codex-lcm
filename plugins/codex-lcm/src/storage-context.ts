@@ -1,18 +1,80 @@
+import type { DatabaseSync } from "node:sqlite";
+
+import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
-import { bestMatchSnippet, compactWhitespace, truncateSnippet } from "./storage-search.ts";
-import { extractEventMetadata } from "./storage-sessions.ts";
-import type { ContextPlan, ContextPlanState, GraphNode, SessionSummary } from "./storage-types.ts";
+import type { FileReference } from "./file-refs.ts";
+import { overflowReferenceFromEvent, readOverflowContent, type OverflowReference } from "./overflow.ts";
+import { readRawEvents } from "./raw-log.ts";
+import { getLatestCheckpoint } from "./storage-graph.ts";
+import { recordValue, rowToFileReference } from "./storage-rows.ts";
+import {
+  bestMatchSnippet,
+  clampLimit,
+  compactWhitespace,
+  positiveInteger,
+  searchStoredSessions,
+  truncateSnippet,
+} from "./storage-search.ts";
+import {
+  getCurrentStoredSession,
+  getStoredSessionSummary,
+  isCodexLcmToolEvent,
+  resolveStoredSessionIdentifier,
+  extractEventMetadata,
+} from "./storage-sessions.ts";
+import {
+  getSessionMemorySummary,
+  getSessionSummarySourceEvents,
+  getSourceSummaryNodes,
+  getSummaryNode,
+  getSummaryNodesForSession,
+  getSummaryNodeSourceEvents,
+  getTopSummaryNodesForSession,
+  searchSummaryNodes,
+} from "./storage-summaries.ts";
+import type {
+  ContextPlan,
+  ContextPlanState,
+  GraphNode,
+  LcmDescription,
+  LcmExpansion,
+  LcmQueryExpansion,
+  PackedContext,
+  PackContextArgs,
+  QueryExpansionSource,
+  RecentContext,
+  SearchSessionArgs,
+  SessionSummary,
+} from "./storage-types.ts";
 import {
   HISTORICAL_SOURCE_TEXT_NOTICE,
+  SUMMARY_NODE_PACK_LIMIT,
+  SUMMARY_NODE_SOURCE_EVENT_LIMIT,
+  estimateTokenCount,
   eventSignalText,
+  isSummarySourceEvent,
+  matchesQueryText,
   queryTermHitCount,
   quoteHistoricalText,
   rankSummaryNodesForContext,
+  sessionSummaryToMarkdown,
+  summaryNodeExpansionToMarkdown,
   summaryNodeSearchText,
+  summaryNodeTitle,
+  summaryNodeToCompactMarkdown,
+  summaryNodeToMarkdown,
+  summarySearchText,
+  toFtsQueries,
+  type SessionMemorySummary,
   type SummaryNode,
 } from "./summary.ts";
 
-export function rankContextEvents(events: NormalizedEvent[], query: string): NormalizedEvent[] {
+const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
+const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
+const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
+const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
+
+function rankContextEvents(events: NormalizedEvent[], query: string): NormalizedEvent[] {
   const phrase = compactWhitespace(query).toLowerCase();
   return [...events].sort((a, b) => {
     const aText = eventSignalText(a);
@@ -25,7 +87,7 @@ export function rankContextEvents(events: NormalizedEvent[], query: string): Nor
   });
 }
 
-export function contextEventToMarkdown(event: NormalizedEvent, query: string, heading: string): string {
+function contextEventToMarkdown(event: NormalizedEvent, query: string, heading: string): string {
   const signal = eventSignalText(event);
   if (signal.length === 0) return "";
   const snippet = query.length > 0 ? bestMatchSnippet(signal, query, 280) : truncateSnippet(signal, 280);
@@ -40,7 +102,7 @@ export function contextEventToMarkdown(event: NormalizedEvent, query: string, he
   ].join("\n");
 }
 
-export function buildContextPlan(args: {
+function buildContextPlan(args: {
   session?: SessionSummary;
   modelContextWindow: number;
   autoCompactTokenLimit: number;
@@ -93,7 +155,7 @@ function contextPlanRecommendation(state: ContextPlanState, summaryNodeCount: nu
   return "Past the soft context limit; use lcm_pack_context or lcm_expand_query before relying on raw recent context.";
 }
 
-export function rankQueryExpansionNodes(nodes: SummaryNode[], query: string, overview: boolean): SummaryNode[] {
+function rankQueryExpansionNodes(nodes: SummaryNode[], query: string, overview: boolean): SummaryNode[] {
   const ranked = rankSummaryNodesForContext(nodes, query);
   if (!overview) return ranked;
   return ranked.sort((left, right) =>
@@ -105,7 +167,7 @@ export function rankQueryExpansionNodes(nodes: SummaryNode[], query: string, ove
     right.node_id.localeCompare(left.node_id));
 }
 
-export function focusedExcerpt(value: string, query: string, maxChars: number): string {
+function focusedExcerpt(value: string, query: string, maxChars: number): string {
   if (maxChars <= 0) return "";
   if (value.length <= maxChars) return value;
   const terms = query.toLowerCase().split(/[^a-z0-9_-]+/u).filter((term) => term.length > 0);
@@ -149,7 +211,7 @@ export function eventSearchText(event: NormalizedEvent): string {
   ].filter(Boolean).join("\n");
 }
 
-export function checkpointToMarkdown(node: GraphNode): string {
+function checkpointToMarkdown(node: GraphNode): string {
   return [
     `## ${node.timestamp} Checkpoint`,
     `session: ${node.session_id}`,
@@ -159,13 +221,784 @@ export function checkpointToMarkdown(node: GraphNode): string {
   ].join("\n");
 }
 
-function uniqueEvents(events: NormalizedEvent[]): NormalizedEvent[] {
-  const seen = new Set<string>();
-  const result: NormalizedEvent[] = [];
-  for (const event of events) {
-    if (seen.has(event.event_id)) continue;
-    seen.add(event.event_id);
-    result.push(event);
+export function getRecentContext(
+  db: DatabaseSync | undefined,
+  rawLogPath: string,
+  args: { sessionId?: string; cwd?: string; repoRoot?: string; limit?: number } = {},
+): RecentContext {
+  const session = getCurrentStoredSession(db, rawLogPath, {
+    sessionId: args.sessionId,
+    cwd: args.cwd,
+    repoRoot: args.repoRoot,
+  });
+  if (!session) return { events: [] };
+  const limit = clampLimit(args.limit, 20);
+  if (!db) {
+    const events = readRawEvents(rawLogPath)
+      .filter((event) => event.session_id === session.session_id)
+      .slice(-limit);
+    return { session_id: session.session_id, events };
   }
-  return result;
+  const rows = db.prepare(`
+    SELECT raw_json FROM (
+      SELECT raw_json, timestamp, rowid
+      FROM events
+      WHERE session_id = ?1
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT ?2
+    )
+    ORDER BY timestamp ASC, rowid ASC
+  `).all(session.session_id, limit);
+  return {
+    session_id: session.session_id,
+    events: rows.map((row) => decodePersistedEvent(String(recordValue(row).raw_json))),
+  };
+}
+
+export function getContextPlan(
+  db: DatabaseSync | undefined,
+  rawLogPath: string,
+  args: {
+    sessionId?: string;
+    cwd?: string;
+    repoRoot?: string;
+    modelContextWindow?: number;
+    autoCompactTokenLimit?: number;
+    recentEventLimit?: number;
+  } = {},
+): ContextPlan {
+  const modelContextWindow = positiveInteger(args.modelContextWindow, DEFAULT_MODEL_CONTEXT_WINDOW);
+  const autoCompactTokenLimit = Math.min(
+    positiveInteger(args.autoCompactTokenLimit, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
+    modelContextWindow,
+  );
+  const recentEventLimit = clampLimit(args.recentEventLimit, DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT, 500);
+  const session = getCurrentStoredSession(db, rawLogPath, {
+    sessionId: args.sessionId,
+    cwd: args.cwd,
+    repoRoot: args.repoRoot,
+  });
+  if (!session) {
+    return buildContextPlan({
+      modelContextWindow,
+      autoCompactTokenLimit,
+      recentEventLimit,
+      estimatedRecentTokens: 0,
+      estimatedSummaryTokens: 0,
+      summaryNodeCount: 0,
+      latestEventAt: null,
+    });
+  }
+
+  const events = getContextPlanEvents(db, rawLogPath, session.session_id, recentEventLimit);
+  const summaryStats = getContextPlanSummaryStats(db, session.session_id);
+  const estimatedRecentTokens = estimateTokenCount(events.map(eventSearchText).join("\n"));
+  const latestEventAt = events[events.length - 1]?.timestamp ?? session.last_seen ?? null;
+
+  return buildContextPlan({
+    session,
+    modelContextWindow,
+    autoCompactTokenLimit,
+    recentEventLimit,
+    estimatedRecentTokens,
+    estimatedSummaryTokens: summaryStats.estimatedSummaryTokens,
+    summaryNodeCount: summaryStats.summaryNodeCount,
+    latestEventAt,
+  });
+}
+
+export function getFileRefsForSession(db: DatabaseSync | undefined, sessionId: string, limit = 50): FileReference[] {
+  if (!db) return [];
+  return db.prepare(`
+    SELECT file_ref_id, session_id, observed_event_id, timestamp, path, mime_type,
+           byte_count, sha256, exploration_summary, metadata_json
+    FROM file_refs
+    WHERE session_id = ?1
+    ORDER BY timestamp ASC, file_ref_id ASC
+    LIMIT ?2
+  `).all(sessionId, clampLimit(limit, 50, 500)).map(rowToFileReference);
+}
+
+export function getFileRef(db: DatabaseSync | undefined, fileRefId: string): FileReference | undefined {
+  if (!db) return undefined;
+  const row = db.prepare(`
+    SELECT file_ref_id, session_id, observed_event_id, timestamp, path, mime_type,
+           byte_count, sha256, exploration_summary, metadata_json
+    FROM file_refs
+    WHERE file_ref_id = ?1
+  `).get(fileRefId);
+  return row ? rowToFileReference(row) : undefined;
+}
+
+export function getOverflowRef(db: DatabaseSync | undefined, rawLogPath: string, fileRefId: string): OverflowReference | undefined {
+  if (!fileRefId.startsWith("overflow:")) return undefined;
+  const hash = fileRefId.slice("overflow:".length);
+  if (!/^[a-f0-9]{64}$/u.test(hash)) return undefined;
+  if (!db) {
+    return readRawEvents(rawLogPath)
+      .map(overflowReferenceFromEvent)
+      .find((reference) => reference?.sha256 === hash);
+  }
+  const rawJson = recordValue(db.prepare(`
+    SELECT raw_json
+    FROM events
+    WHERE json_extract(raw_json, '$.payload.overflow_ref.sha256') = ?1
+    ORDER BY timestamp DESC, rowid DESC
+    LIMIT 1
+  `).get(hash)).raw_json;
+  if (typeof rawJson !== "string") return undefined;
+  return overflowReferenceFromEvent(decodePersistedEvent(rawJson));
+}
+
+export function describeMemory(db: DatabaseSync | undefined, rawLogPath: string, overflowDir: string, args: {
+  sessionId?: string;
+  nodeId?: string;
+  fileId?: string;
+  limit?: number;
+  offset?: number;
+  maxBytes?: number;
+}): LcmDescription {
+  if (args.fileId) {
+    if (args.fileId.startsWith("overflow:")) {
+      const reference = getOverflowRef(db, rawLogPath, args.fileId);
+      if (!reference) throw new Error(`Overflow reference not found: ${args.fileId}`);
+      return {
+        target: "overflow_ref",
+        overflow_ref: readOverflowContent({
+          overflowDir,
+          reference,
+          offset: args.offset,
+          maxBytes: args.maxBytes,
+        }),
+      };
+    }
+    const fileRef = getFileRef(db, args.fileId);
+    if (!fileRef) throw new Error(`File reference not found: ${args.fileId}`);
+    return {
+      target: "file_ref",
+      file_ref: fileRef,
+    };
+  }
+
+  if (args.nodeId) {
+    const node = findSummaryNode(db, args.nodeId);
+    if (!node) throw new Error(`Summary node not found: ${args.nodeId}`);
+    return {
+      target: "summary_node",
+      node,
+      source_nodes: sourceSummaryNodes(db, node, args.limit),
+      source_event_count: node.source_event_ids.length,
+    };
+  }
+
+  if (!args.sessionId) throw new Error("sessionId or nodeId is required.");
+  const session = getStoredSessionSummary(db, rawLogPath, args.sessionId);
+  const summary = getSessionMemorySummary(db, rawLogPath, args.sessionId);
+  const summaryNodes = getSummaryNodesForSession(db, args.sessionId, clampLimit(args.limit, 50, 500));
+  if (!session && !summary && summaryNodes.length === 0) {
+    throw new Error(`Session not found: ${args.sessionId}`);
+  }
+  return {
+    target: "session",
+    session,
+    summary,
+    summary_nodes: summaryNodes,
+    file_refs: getFileRefsForSession(db, args.sessionId, clampLimit(args.limit, 50, 500)),
+  };
+}
+
+export function expandMemory(db: DatabaseSync | undefined, args: { nodeId: string; query?: string; limit?: number }): LcmExpansion {
+  const node = findSummaryNode(db, args.nodeId);
+  if (!node) throw new Error(`Summary node not found: ${args.nodeId}`);
+  const sourceNodes = sourceSummaryNodes(db, node, args.limit);
+  const sourceEvents = summaryNodeSourceEvents(db, node, args.query, args.limit);
+  const markdown = [
+    summaryNodeToMarkdown(node),
+    summaryNodeExpansionToMarkdown({
+      sourceNodes,
+      sourceEvents,
+    }),
+  ].filter(Boolean).join("\n");
+  return {
+    target: "summary_node",
+    node,
+    source_nodes: sourceNodes,
+    source_events: sourceEvents,
+    markdown,
+  };
+}
+
+export function expandQuery(db: DatabaseSync | undefined, rawLogPath: string, args: {
+  query: string;
+  cwd?: string;
+  repoRoot?: string;
+  sessionIds?: string[];
+  budgetTokens?: number;
+  limit?: number;
+  sourceLimit?: number;
+  overview?: boolean;
+}): LcmQueryExpansion {
+  const query = args.query.trim();
+  if (query.length === 0) throw new Error("query must be a non-empty string.");
+  const budgetTokens = Math.max(32, args.budgetTokens ?? 2000);
+  const budgetChars = budgetTokens * 4;
+  const candidateLimit = clampLimit(args.limit, 4, 12);
+  const searchLimit = args.overview ? Math.max(candidateLimit * 4, 24) : candidateLimit;
+  const sourceLimit = clampLimit(args.sourceLimit, 6, 24);
+  const maxNodes = Math.max(candidateLimit * 12, 24);
+
+  let candidates = findSummaryNodes(db, {
+    query,
+    cwd: args.cwd,
+    repoRoot: args.repoRoot,
+    sessionIds: args.sessionIds,
+    limit: searchLimit,
+  });
+  if (candidates.length === 0 && args.cwd && !args.sessionIds?.length) {
+    candidates = findSummaryNodes(db, {
+      query,
+      repoRoot: args.repoRoot,
+      limit: searchLimit,
+    });
+  }
+  if (candidates.length === 0 && !args.sessionIds?.length) {
+    const sessions = searchStoredSessions(db, rawLogPath, {
+      query,
+      cwd: args.cwd,
+      repoRoot: args.repoRoot,
+      limit: candidateLimit,
+    });
+    for (const session of sessions) {
+      candidates.push(...topSummaryNodesForSession(db, session.session_id, 1));
+    }
+  }
+
+  const nodesById = new Map<string, SummaryNode>();
+  const eventsById = new Map<string, NormalizedEvent>();
+  if (candidates.length === 0 && args.sessionIds?.length) {
+    for (const sessionId of args.sessionIds) {
+      const summary = getSessionMemorySummary(db, rawLogPath, sessionId);
+      if (!summary || (args.cwd && summary.cwd !== args.cwd) || (args.repoRoot && summary.repo_root !== args.repoRoot)) continue;
+      if (!matchesQueryText(summarySearchText(summary), query)) continue;
+      candidates.push(...topSummaryNodesForSession(db, sessionId, 1));
+      for (const event of sessionSummarySourceEvents(db, summary, query, sourceLimit)) {
+        eventsById.set(event.event_id, event);
+      }
+    }
+  }
+  const visit = (node: SummaryNode) => {
+    if (nodesById.has(node.node_id) || nodesById.size >= maxNodes) return;
+    nodesById.set(node.node_id, node);
+    for (const event of summaryNodeSourceEvents(db, node, query, sourceLimit)) {
+      eventsById.set(event.event_id, event);
+    }
+    if (node.source_type !== "nodes") return;
+    const sourceNodes = rankQueryExpansionNodes(sourceSummaryNodes(db, node, sourceLimit), query, args.overview === true);
+    for (const sourceNode of sourceNodes) {
+      visit(sourceNode);
+      if (nodesById.size >= maxNodes) break;
+    }
+  };
+  for (const candidate of rankQueryExpansionNodes(candidates, query, args.overview === true).slice(0, candidateLimit)) visit(candidate);
+
+  const nodes = rankQueryExpansionNodes([...nodesById.values()], query, args.overview === true);
+  const events = [...eventsById.values()].sort((a, b) =>
+    queryTermHitCount(eventSignalText(b), query) - queryTermHitCount(eventSignalText(a), query) ||
+    a.timestamp.localeCompare(b.timestamp) ||
+    a.event_id.localeCompare(b.event_id));
+  const sources: QueryExpansionSource[] = [
+    ...nodes.map((node) => ({
+      kind: "summary" as const,
+      session_id: node.session_id,
+      node_id: node.node_id,
+      timestamp: node.latest_at,
+      depth: node.depth,
+    })),
+    ...events.map((event) => ({
+      kind: "event" as const,
+      session_id: event.session_id,
+      event_id: event.event_id,
+      timestamp: event.timestamp,
+      hook_event: event.hook_event,
+    })),
+  ];
+
+  const lines = [
+    "# Codex LCM Recursive Evidence",
+    "",
+    `query: ${query}`,
+    "",
+  ];
+  let chars = lines.join("\n").length;
+  let truncated = false;
+  const addBlock = (text: string): boolean => {
+    if (chars + text.length > budgetChars) {
+      truncated = true;
+      return false;
+    }
+    lines.push(text);
+    chars += text.length;
+    return true;
+  };
+  const addFocusedEventFallback = (event: NormalizedEvent): void => {
+    let prefix = [
+      "### Focused Source Events",
+      `- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}:`,
+      `  ${HISTORICAL_SOURCE_TEXT_NOTICE}`,
+      "",
+    ].join("\n");
+    const suffix = "\n";
+    let available = budgetChars - chars - prefix.length - suffix.length;
+    if (available <= 0) {
+      prefix = "### Focused Source Events\n- ";
+      available = budgetChars - chars - prefix.length - suffix.length;
+    }
+    if (available <= 0) {
+      lines.push("Budget too small to include evidence.\n");
+      chars += "Budget too small to include evidence.\n".length;
+      truncated = true;
+      return;
+    }
+    const signal = quoteHistoricalText(focusedExcerpt(eventSignalText(event), query, Math.max(0, available - 4)), "  ");
+    lines.push(`${prefix}${signal}${suffix}`);
+    chars += prefix.length + signal.length + suffix.length;
+    truncated = true;
+  };
+
+  if (events.length > 0) {
+    const eventLines = ["### Focused Source Events"];
+    for (const event of events.slice(0, sourceLimit)) {
+      const signal = eventSignalText(event);
+      if (signal.length === 0) continue;
+      eventLines.push(`- ${event.timestamp} ${event.hook_event} ${event.event_id.slice(0, 12)}:`);
+      eventLines.push(`  ${HISTORICAL_SOURCE_TEXT_NOTICE}`);
+      eventLines.push(quoteHistoricalText(signal, "  "));
+    }
+    eventLines.push("");
+    if (!addBlock(eventLines.join("\n"))) addFocusedEventFallback(events[0]);
+  }
+
+  if (nodes.length === 0 && events.length === 0) {
+    addBlock("No matching evidence found.\n");
+  }
+
+  for (const node of nodes) {
+    if (!addBlock(summaryNodeToMarkdown(node))) {
+      const compact = [
+        `## Summary Node d${node.depth}`,
+        `node: ${node.node_id}`,
+        `session: ${node.session_id}`,
+        `Focus: ${summaryNodeTitle(node)}`,
+        "",
+      ].join("\n");
+      addBlock(compact);
+    }
+  }
+
+  const markdown = lines.join("\n");
+
+  return {
+    query,
+    markdown,
+    estimated_tokens: estimateTokenCount(markdown),
+    truncated,
+    nodes,
+    events,
+    sources,
+  };
+}
+
+function topSummaryNodesForSession(db: DatabaseSync | undefined, sessionId: string, limit = 3): SummaryNode[] {
+  return getTopSummaryNodesForSession(db, sessionId, limit);
+}
+
+function findSummaryNodes(db: DatabaseSync | undefined, args: SearchSessionArgs & { sessionIds?: string[] }): SummaryNode[] {
+  return searchSummaryNodes(db, args);
+}
+
+function findSummaryNode(db: DatabaseSync | undefined, nodeId: string): SummaryNode | undefined {
+  return getSummaryNode(db, nodeId);
+}
+
+function sourceSummaryNodes(db: DatabaseSync | undefined, node: SummaryNode, limit = 4): SummaryNode[] {
+  return getSourceSummaryNodes(db, node, limit);
+}
+
+function summaryNodeSourceEvents(
+  db: DatabaseSync | undefined,
+  node: SummaryNode,
+  query = "",
+  limit = SUMMARY_NODE_SOURCE_EVENT_LIMIT,
+): NormalizedEvent[] {
+  return getSummaryNodeSourceEvents(db, node, query, limit);
+}
+
+function sessionSummarySourceEvents(
+  db: DatabaseSync | undefined,
+  summary: SessionMemorySummary,
+  query: string,
+  limit: number,
+): NormalizedEvent[] {
+  return getSessionSummarySourceEvents(db, summary, query, limit);
+}
+
+function searchContextEvents(db: DatabaseSync | undefined, rawLogPath: string, args: {
+  query: string;
+  cwd?: string;
+  sessionIds?: string[];
+  limit: number;
+}): NormalizedEvent[] {
+  const sessionIds = [...new Set(args.sessionIds?.filter(Boolean) ?? [])];
+  const sessionFilter = sessionIds.length > 0 ? new Set(sessionIds) : undefined;
+  if (!db) {
+    return rankContextEvents(readRawEvents(rawLogPath)
+      .filter(isSummarySourceEvent)
+      .filter((event) => !isCodexLcmToolEvent(event))
+      .filter((event) => !args.cwd || event.cwd === args.cwd)
+      .filter((event) => !sessionFilter || sessionFilter.has(event.session_id))
+      .filter((event) => matchesQueryText(eventSignalText(event), args.query)), args.query)
+      .slice(0, args.limit);
+  }
+
+  const sessionClause = sessionIds.length > 0
+    ? `AND e.session_id IN (${sessionIds.map((_, index) => `?${index + 3}`).join(", ")})`
+    : "";
+  const limitParameter = sessionIds.length + 3;
+  const statement = db.prepare(`
+    SELECT e.raw_json
+    FROM event_fts f
+    JOIN events e ON e.event_id = f.event_id
+    WHERE event_fts MATCH ?1
+      AND (?2 IS NULL OR e.cwd = ?2)
+      AND e.hook_event IN ${SUMMARY_SOURCE_HOOKS}
+      ${sessionClause}
+    ORDER BY bm25(event_fts) ASC, e.timestamp DESC
+    LIMIT ?${limitParameter}
+  `);
+  let rows: unknown[] = [];
+  for (const ftsQuery of toFtsQueries(args.query)) {
+    rows = statement.all(ftsQuery, args.cwd ?? null, ...sessionIds, Math.max(args.limit * 10, 50));
+    if (rows.length > 0) break;
+  }
+  return rankContextEvents(rows
+    .map((row) => decodePersistedEvent(String(recordValue(row).raw_json)))
+    .filter(isSummarySourceEvent)
+    .filter((event) => !isCodexLcmToolEvent(event)), args.query)
+    .slice(0, args.limit);
+}
+
+function getRecentContextEvents(db: DatabaseSync | undefined, rawLogPath: string, sessionId: string, limit: number): NormalizedEvent[] {
+  if (!db) {
+    return readRawEvents(rawLogPath)
+      .filter((event) => event.session_id === sessionId)
+      .filter(isSummarySourceEvent)
+      .filter((event) => !isCodexLcmToolEvent(event))
+      .slice(-limit)
+      .reverse();
+  }
+  return db.prepare(`
+    SELECT raw_json FROM events
+    WHERE session_id = ?1
+      AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
+    ORDER BY timestamp DESC, rowid DESC
+    LIMIT ?2
+  `).all(sessionId, limit)
+    .map((row) => decodePersistedEvent(String(recordValue(row).raw_json)))
+    .filter((event) => !isCodexLcmToolEvent(event));
+}
+
+function getContextPlanEvents(db: DatabaseSync | undefined, rawLogPath: string, sessionId: string, limit: number): NormalizedEvent[] {
+  if (!db) {
+    return readRawEvents(rawLogPath)
+      .filter((event) => event.session_id === sessionId)
+      .slice(-limit);
+  }
+  const rows = db.prepare(`
+    SELECT raw_json FROM (
+      SELECT raw_json, timestamp, rowid
+      FROM events
+      WHERE session_id = ?1
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT ?2
+    )
+    ORDER BY timestamp ASC, rowid ASC
+  `).all(sessionId, limit);
+  return rows.map((row) => decodePersistedEvent(String(recordValue(row).raw_json)));
+}
+
+function getContextPlanSummaryStats(db: DatabaseSync | undefined, sessionId: string): { summaryNodeCount: number; estimatedSummaryTokens: number } {
+  if (!db) return { summaryNodeCount: 0, estimatedSummaryTokens: 0 };
+  const row = recordValue(db.prepare(`
+    SELECT COUNT(*) AS summary_node_count, COALESCE(SUM(token_count), 0) AS estimated_summary_tokens
+    FROM summary_nodes
+    WHERE session_id = ?1
+  `).get(sessionId));
+  return {
+    summaryNodeCount: Number(row.summary_node_count ?? 0),
+    estimatedSummaryTokens: Number(row.estimated_summary_tokens ?? 0),
+  };
+}
+
+export function packContext(db: DatabaseSync | undefined, rawLogPath: string, args: PackContextArgs = {}): PackedContext {
+  const budgetTokens = Math.max(16, args.budgetTokens ?? 1200);
+  const budgetChars = budgetTokens * 4;
+  const summaryCandidates = new Map<string, SessionMemorySummary>();
+  const checkpointCandidates = new Map<string, GraphNode>();
+  const summaryNodeCandidates = new Map<string, SummaryNode>();
+  const exactEventCandidates = new Map<string, NormalizedEvent>();
+  const recentEventCandidates = new Map<string, NormalizedEvent>();
+  const query = args.query?.trim() ?? "";
+  const candidateSessionIds = new Set(args.sessionIds ?? []);
+  const explicitSessionIds = args.sessionIds ?? [];
+  const currentThreadId = !explicitSessionIds.length ? args.currentThreadId?.trim() : undefined;
+  const currentSessionId = currentThreadId ? resolveStoredSessionIdentifier(db, rawLogPath, currentThreadId) : undefined;
+  const queryTermCount = query.length > 0 ? queryTermHitCount(query, query) : 0;
+
+  const addSummaryNode = (node: SummaryNode) => {
+    if (query.length > 0 && queryTermHitCount(summaryNodeSearchText(node), query) === 0) return;
+    summaryNodeCandidates.set(node.node_id, node);
+    candidateSessionIds.add(node.session_id);
+  };
+
+  const addRankedSessionNodes = (sessionId: string, limit: number): number => {
+    const nodes = query.length > 0
+      ? rankSummaryNodesForContext(getSummaryNodesForSession(db, sessionId, 2_000), query)
+        .filter((node) => queryTermHitCount(summaryNodeSearchText(node), query) > 0)
+        .slice(0, limit)
+      : topSummaryNodesForSession(db, sessionId, limit);
+    for (const node of nodes) addSummaryNode(node);
+    return nodes.length;
+  };
+
+  const addSessionIfSummaryMatches = (sessionId: string): void => {
+    if (query.length === 0) {
+      candidateSessionIds.add(sessionId);
+      return;
+    }
+    const summary = getSessionMemorySummary(db, rawLogPath, sessionId);
+    if (summary && queryTermHitCount(summarySearchText(summary), query) > 0) {
+      candidateSessionIds.add(sessionId);
+    }
+  };
+
+  if (query.length > 0) {
+    let events = searchContextEvents(db, rawLogPath, {
+      query,
+      cwd: args.cwd,
+      sessionIds: explicitSessionIds,
+      limit: 3,
+    });
+    if (events.length === 0 && args.cwd && explicitSessionIds.length === 0) {
+      events = searchContextEvents(db, rawLogPath, { query, limit: 3 });
+    }
+    for (const event of events) {
+      exactEventCandidates.set(event.event_id, event);
+      candidateSessionIds.add(event.session_id);
+    }
+  }
+
+  if (currentSessionId) {
+    const added = addRankedSessionNodes(currentSessionId, 3);
+    if (added === 0) addSessionIfSummaryMatches(currentSessionId);
+  }
+
+  if (query.length > 0) {
+    let nodes = findSummaryNodes(db, {
+      query,
+      cwd: args.cwd,
+      sessionIds: explicitSessionIds,
+      limit: SUMMARY_NODE_PACK_LIMIT,
+    });
+    if (nodes.length === 0 && args.cwd && !explicitSessionIds.length) {
+      nodes = findSummaryNodes(db, { query, limit: SUMMARY_NODE_PACK_LIMIT });
+    }
+    for (const node of nodes) addSummaryNode(node);
+
+    const bestSummaryHitCount = [...summaryNodeCandidates.values()].reduce(
+      (max, node) => Math.max(max, queryTermHitCount(summaryNodeSearchText(node), query)),
+      0,
+    );
+    const hasWeakScopedMatches = args.cwd && !explicitSessionIds.length && queryTermCount >= 4 && bestSummaryHitCount <= 1;
+    if (hasWeakScopedMatches) {
+      const sessions = searchStoredSessions(db, rawLogPath, { query, limit: 8 });
+      for (const session of sessions) {
+        addSessionIfSummaryMatches(session.session_id);
+        addRankedSessionNodes(session.session_id, 2);
+      }
+    }
+
+    if (summaryNodeCandidates.size === 0 && !explicitSessionIds.length) {
+      let sessions = searchStoredSessions(db, rawLogPath, { query, cwd: args.cwd, limit: 8 });
+      if (sessions.length === 0 && args.cwd) {
+        sessions = searchStoredSessions(db, rawLogPath, { query, limit: 8 });
+      }
+      for (const session of sessions) {
+        candidateSessionIds.add(session.session_id);
+        addRankedSessionNodes(session.session_id, 2);
+      }
+    }
+  } else {
+    if (candidateSessionIds.size === 0) {
+      const session = getCurrentStoredSession(db, rawLogPath, { cwd: args.cwd });
+      if (session) candidateSessionIds.add(session.session_id);
+    }
+    for (const sessionId of candidateSessionIds) {
+      for (const node of topSummaryNodesForSession(db, sessionId, 3)) addSummaryNode(node);
+    }
+  }
+
+  if (candidateSessionIds.size === 0) {
+    let sessions = searchStoredSessions(db, rawLogPath, { query: args.query, cwd: args.cwd, limit: 8 });
+    if (sessions.length === 0 && query.length > 0 && args.cwd && !explicitSessionIds.length) {
+      sessions = searchStoredSessions(db, rawLogPath, { query: args.query, limit: 8 });
+    }
+    for (const session of sessions) candidateSessionIds.add(session.session_id);
+  }
+
+  const recentSessionIds = currentSessionId
+    ? [currentSessionId]
+    : explicitSessionIds.length > 0
+      ? explicitSessionIds
+      : query.length === 0
+        ? [...candidateSessionIds].slice(0, 1)
+        : [];
+  for (const sessionId of recentSessionIds) {
+    for (const event of getRecentContextEvents(db, rawLogPath, sessionId, 2)) {
+      if (!exactEventCandidates.has(event.event_id)) recentEventCandidates.set(event.event_id, event);
+      if (recentEventCandidates.size >= 4) break;
+    }
+    if (recentEventCandidates.size >= 4) break;
+  }
+
+  for (const sessionId of candidateSessionIds) {
+    const summary = getSessionMemorySummary(db, rawLogPath, sessionId);
+    if (summary) summaryCandidates.set(sessionId, summary);
+    const checkpoint = getLatestCheckpoint(db, sessionId);
+    if (checkpoint) checkpointCandidates.set(checkpoint.node_id, checkpoint);
+  }
+
+  const lines = ["# Codex LCM Context", ""];
+  const sources: PackedContext["sources"] = [];
+  let chars = lines.join("\n").length;
+
+  const eventItems = [
+    ...rankContextEvents([...exactEventCandidates.values()], query)
+      .map((event) => ({ event, text: contextEventToMarkdown(event, query, "Matching Event") })),
+    ...[...recentEventCandidates.values()]
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.event_id.localeCompare(a.event_id))
+      .map((event) => ({ event, text: contextEventToMarkdown(event, "", "Recent Event") })),
+  ].filter(({ text }) => text.length > 0);
+  const packedEventIds = new Set(eventItems.map(({ event }) => event.event_id));
+  const summaryItems = [...summaryCandidates.values()]
+    .sort((a, b) =>
+      queryTermHitCount(summarySearchText(b), query) - queryTermHitCount(summarySearchText(a), query) ||
+      b.updated_at.localeCompare(a.updated_at))
+    .map((summary) => ({ summary, text: sessionSummaryToMarkdown(summary) }));
+  const checkpointItems = [...checkpointCandidates.values()]
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    .map((checkpoint) => ({ checkpoint, text: checkpointToMarkdown(checkpoint) }));
+  const summaryNodeItems = rankSummaryNodesForContext([...summaryNodeCandidates.values()], query)
+    .map((node) => {
+      const sourceNodes = node.source_type === "nodes"
+        ? node.source_ids.flatMap((nodeId) => findSummaryNode(db, nodeId) ?? []).slice(0, 4)
+        : [];
+      const sourceEvents = summaryNodeSourceEvents(db, node, query)
+        .filter((event) => !packedEventIds.has(event.event_id));
+      const text = [
+        summaryNodeToMarkdown(node),
+        summaryNodeExpansionToMarkdown({
+          sourceNodes,
+          sourceEvents,
+        }),
+      ].filter(Boolean).join("\n");
+      const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents, query });
+      return { node, sourceEvents, text, compactText };
+    });
+  const addEventItems = () => {
+    for (const { event, text } of eventItems) {
+      const remainingChars = budgetChars - chars;
+      if (remainingChars <= 80) continue;
+      const outputText = text.length > remainingChars
+        ? `${text.slice(0, Math.max(0, remainingChars - 18)).trimEnd()}\n...(truncated)\n`
+        : text;
+      lines.push(outputText);
+      chars += outputText.length;
+      sources.push({
+        kind: event.hook_event === "Note" ? "note" : "event",
+        session_id: event.session_id,
+        event_id: event.event_id,
+        timestamp: event.timestamp,
+      });
+    }
+  };
+  const addCheckpointItems = () => {
+    for (const { checkpoint, text } of checkpointItems) {
+      if (chars + text.length > budgetChars) continue;
+      lines.push(text);
+      chars += text.length;
+      sources.push({
+        kind: "checkpoint",
+        session_id: checkpoint.session_id,
+        node_id: checkpoint.node_id,
+        timestamp: checkpoint.timestamp,
+      });
+    }
+  };
+
+  const addSummaryItems = () => {
+    if (query.length > 0 && budgetTokens < 250) return;
+    if (query.length > 0 && summaryNodeItems.length > 0 && budgetTokens < 350) return;
+    if (query.length > 0 && summaryItems.length > 1 && budgetTokens < 700) return;
+    for (const { summary, text } of summaryItems) {
+      if (chars + text.length > budgetChars) continue;
+      lines.push(text);
+      chars += text.length;
+      sources.push({
+        kind: "summary",
+        session_id: summary.session_id,
+        event_id: summary.source_event_ids[0],
+        timestamp: summary.updated_at,
+      });
+    }
+  };
+
+  const addSummaryNodeItems = () => {
+    for (const { node, sourceEvents, text, compactText } of summaryNodeItems) {
+      const remainingChars = budgetChars - chars;
+      if (remainingChars <= 80) continue;
+      const candidateText = text.length <= remainingChars ? text : compactText;
+      const outputText = candidateText.length > remainingChars
+        ? `${candidateText.slice(0, Math.max(0, remainingChars - 18)).trimEnd()}\n...(truncated)\n`
+        : candidateText;
+      lines.push(outputText);
+      chars += outputText.length;
+      sources.push({
+        kind: "summary",
+        session_id: node.session_id,
+        node_id: node.node_id,
+        event_id: node.source_event_ids[0],
+        timestamp: node.latest_at,
+      });
+      const note = sourceEvents.find((event) => event.hook_event === "Note");
+      if (note) {
+        sources.push({
+          kind: "note",
+          session_id: note.session_id,
+          event_id: note.event_id,
+          timestamp: note.timestamp,
+        });
+      }
+    }
+  };
+
+  addEventItems();
+  addSummaryNodeItems();
+  addSummaryItems();
+  addCheckpointItems();
+
+  return {
+    markdown: lines.join("\n"),
+    estimated_tokens: Math.ceil(chars / 4),
+    sources,
+  };
 }
