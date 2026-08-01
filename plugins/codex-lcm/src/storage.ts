@@ -55,6 +55,7 @@ import {
   readCachedRawEventIds,
   recordRawLogState as storeRawLogState,
   replaceCleanupSearchIndex,
+  rollbackPreservingError,
   writableIndexHealth,
   type IndexEventResult,
   type RawEventIdCache,
@@ -212,11 +213,8 @@ export class LcmStorage {
     try {
       this.db.exec("BEGIN IMMEDIATE");
     } catch (error) {
-      if (error instanceof Error) void error.message;
-      else void String(error);
-      const failure = new DerivedIndexError(error);
-      this.indexError = failure.message;
-      throw failure;
+      this.indexError = error instanceof Error ? error.message : String(error);
+      throw new DerivedIndexError(error);
     }
 
     const touchedSessions = new Set<string>();
@@ -240,19 +238,13 @@ export class LcmStorage {
         touchedSessions: rebuiltSessions,
       };
     } catch (error) {
-      if (error instanceof Error) void error.message;
-      else void String(error);
       let failure = error;
-      try {
-        this.db.exec("ROLLBACK");
-      } catch (rollbackError) {
-        if (rollbackError instanceof Error) void rollbackError.message;
-        else void String(rollbackError);
-        failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
+      const rollback = rollbackPreservingError(this.db, error);
+      if (rollback.kind !== "rolled_back") {
+        failure = new AggregateError([rollback.original, rollback.rollbackError], "Bulk ingest rollback failed after indexing failure.");
       }
-      const indexFailure = new DerivedIndexError(failure);
-      this.indexError = indexFailure.message;
-      throw indexFailure;
+      this.indexError = failure instanceof Error ? failure.message : String(failure);
+      throw new DerivedIndexError(failure);
     }
   }
 
@@ -274,16 +266,9 @@ export class LcmStorage {
       this.db.exec("COMMIT");
       return rebuiltSessions;
     } catch (error) {
-      let rollbackError: unknown;
-      try {
-        this.db.exec("ROLLBACK");
-      } catch (caught) {
-        if (caught instanceof Error) void caught.message;
-        else void String(caught);
-        rollbackError = caught;
-      }
+      const rollback = rollbackPreservingError(this.db, error);
       const message = error instanceof Error ? error.message : String(error);
-      this.indexError = rollbackError === undefined ? message : `${message}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+      this.indexError = rollback.kind === "rolled_back" ? message : `${message}; rollback failed: ${rollback.rollbackError instanceof Error ? rollback.rollbackError.message : String(rollback.rollbackError)}`;
       return [];
     }
   }
@@ -307,9 +292,8 @@ export class LcmStorage {
     } catch (error) {
       try {
         this.db.exec("ROLLBACK");
-      } catch (rollbackError) {
-        if (rollbackError instanceof Error) void rollbackError.message;
-        else void String(rollbackError);
+      } catch {
+        throw error;
       }
       throw error;
     }
@@ -323,9 +307,8 @@ export class LcmStorage {
       } catch (error) {
         try {
           this.db?.exec("ROLLBACK");
-        } catch (rollbackError) {
-          if (rollbackError instanceof Error) void rollbackError.message;
-          else void String(rollbackError);
+        } catch {
+          throw error;
         }
         throw error;
       }
@@ -353,9 +336,9 @@ export class LcmStorage {
       this.indexError = error instanceof Error ? error.message : String(error);
       try {
         this.db.close();
-      } catch (closeError) {
-        if (closeError instanceof Error) void closeError.message;
-        else void String(closeError);
+      } catch {
+        this.db = undefined;
+        return this.rawHealth();
       }
       this.db = undefined;
       return this.rawHealth();
@@ -413,13 +396,8 @@ export class LcmStorage {
       if (rawLog.malformedLineCount === 0) this.recordRawLogState(snapshot.state);
       this.db.exec("COMMIT");
     } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch (rollbackError) {
-        if (rollbackError instanceof Error) void rollbackError.message;
-        else void String(rollbackError);
-      }
-      this.indexError = error instanceof Error ? error.message : String(error);
+      const failure = rollbackPreservingError(this.db, error).original;
+      this.indexError = failure instanceof Error ? failure.message : String(failure);
     }
   }
 
@@ -437,16 +415,9 @@ export class LcmStorage {
       this.recordRawLogState(state);
       this.db.exec("COMMIT");
     } catch (error) {
-      let rollbackError: unknown;
-      try {
-        this.db.exec("ROLLBACK");
-      } catch (caught) {
-        if (caught instanceof Error) void caught.message;
-        else void String(caught);
-        rollbackError = caught;
-      }
+      const rollback = rollbackPreservingError(this.db, error);
       const message = error instanceof Error ? error.message : String(error);
-      this.indexError = rollbackError === undefined ? message : `${message}; rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+      this.indexError = rollback.kind === "rolled_back" ? message : `${message}; rollback failed: ${rollback.rollbackError instanceof Error ? rollback.rollbackError.message : String(rollback.rollbackError)}`;
     }
   }
 
@@ -550,9 +521,9 @@ export class LcmStorage {
       this.indexError = error instanceof Error ? error.message : String(error);
       try {
         this.db?.close();
-      } catch (closeError) {
-        if (closeError instanceof Error) void closeError.message;
-        else void String(closeError);
+      } catch {
+        this.db = undefined;
+        return readContextPlan(this.db, this.config.rawLogPath, args);
       }
       this.db = undefined;
       return readContextPlan(this.db, this.config.rawLogPath, args);

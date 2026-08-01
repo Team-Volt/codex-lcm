@@ -35,11 +35,25 @@ export type CleanupInspection = {
   readonly searchableEvents: readonly NormalizedEvent[];
   readonly sessionIds: readonly string[];
 };
+type RollbackResult =
+  | { readonly kind: "rolled_back"; readonly original: unknown }
+  | { readonly kind: "error"; readonly original: unknown; readonly rollbackError: Error }
+  | { readonly kind: "unknown"; readonly original: unknown; readonly rollbackError: unknown };
 
 export class DerivedIndexError extends Error {
   constructor(cause: unknown) {
     super(cause instanceof Error ? cause.message : String(cause), { cause });
     this.name = "DerivedIndexError";
+  }
+}
+
+export function rollbackPreservingError(db: DatabaseSync | undefined, original: unknown): RollbackResult {
+  try {
+    db?.exec("ROLLBACK");
+    return { kind: "rolled_back", original };
+  } catch (rollbackError) {
+    if (rollbackError instanceof Error) return { kind: "error", original, rollbackError };
+    return { kind: "unknown", original, rollbackError };
   }
 }
 
@@ -321,9 +335,10 @@ function backfillExistingEventMetadata(db: DatabaseSync): void {
     `).run(EVENT_METADATA_BACKFILL_KEY);
     db.exec("COMMIT");
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch (rollbackError) {
-      if (rollbackError instanceof Error) void rollbackError.message;
-      else void String(rollbackError);
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      throw error;
     }
     throw error;
   }
@@ -363,11 +378,8 @@ export function backfillDelegationParents(db: DatabaseSync | undefined): string 
     db.exec("COMMIT");
     return undefined;
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch (rollbackError) {
-      if (rollbackError instanceof Error) void rollbackError.message;
-      else void String(rollbackError);
-    }
-    return error instanceof Error ? error.message : String(error);
+    const failure = rollbackPreservingError(db, error).original;
+    return failure instanceof Error ? failure.message : String(failure);
   }
 }
 
@@ -392,11 +404,8 @@ export function backfillFileRefs(db: DatabaseSync | undefined): string | undefin
     db.exec("COMMIT");
     return undefined;
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch (rollbackError) {
-      if (rollbackError instanceof Error) void rollbackError.message;
-      else void String(rollbackError);
-    }
-    return error instanceof Error ? error.message : String(error);
+    const failure = rollbackPreservingError(db, error).original;
+    return failure instanceof Error ? failure.message : String(failure);
   }
 }
 
@@ -410,11 +419,8 @@ export function backfillSessionMemorySummaries(db: DatabaseSync | undefined): st
     db.exec("COMMIT");
     return undefined;
   } catch (error) {
-    try { db.exec("ROLLBACK"); } catch (rollbackError) {
-      if (rollbackError instanceof Error) void rollbackError.message;
-      else void String(rollbackError);
-    }
-    return error instanceof Error ? error.message : String(error);
+    const failure = rollbackPreservingError(db, error).original;
+    return failure instanceof Error ? failure.message : String(failure);
   }
 }
 
