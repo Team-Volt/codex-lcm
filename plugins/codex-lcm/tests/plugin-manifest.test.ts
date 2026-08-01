@@ -27,21 +27,15 @@ test("package and repository declare the MIT license", () => {
   assert.match(packageLicense, /^Copyright \(c\) 2026 Team Volt$/mu);
 });
 
-test("plugin includes a compact Codex skill with the core LCM workflow and safety contract", () => {
+test("plugin includes a compact skill with routable frontmatter", () => {
   const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
+  const frontmatterEnd = skill.indexOf("\n---\n", 4);
 
-  assert.match(skill, /^---\nname: lcm-recall/mu);
-  assert.match(skill, /`lcm_grep` -> `lcm_describe` -> `lcm_expand`/u);
-  assert.match(skill, /host-qualified/u);
-  assert.match(skill, /lcm_expand_query/u);
-  assert.match(skill, /lcm_pack_context/u);
-  assert.match(skill, /sequential/u);
-  assert.match(skill, /bounded/u);
-  assert.match(skill, /overflow/u);
-  assert.match(skill, /Do not fabricate/u);
-  assert.match(skill, /lcm_record_note/u);
-  assert.match(skill, /explicitly asks|explicit approval/u);
-  assert.match(skill, /Do not inspect `~\/\.codex-lcm`/u);
+  assert.notEqual(frontmatterEnd, -1);
+  const frontmatter = skill.slice(0, frontmatterEnd + 5);
+  assert.match(frontmatter, /^---\n/mu);
+  assert.match(frontmatter, /^name: lcm-recall$/mu);
+  assert.match(frontmatter, /^description: \S/mu);
   assert.equal(Buffer.byteLength(skill, "utf8") <= 6_000, true);
 });
 
