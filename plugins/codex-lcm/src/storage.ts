@@ -36,7 +36,6 @@ import {
   parseTimestamp,
   rankContextEvents,
   rankQueryExpansionNodes,
-  uniqueEvents,
 } from "./storage-context.ts";
 import {
   buildFallbackGraph,
@@ -48,9 +47,7 @@ import {
 } from "./storage-graph.ts";
 import {
   rowToFileReference,
-  rowToSessionMemorySummary,
   rowToSessionSummary,
-  rowToSummaryNode,
 } from "./storage-rows.ts";
 import {
   clampLimit,
@@ -60,11 +57,24 @@ import {
   rankSessionRows,
 } from "./storage-search.ts";
 import {
+  getSessionMemorySummary as readSessionMemorySummary,
+  getSessionSummarySourceEvents as readSessionSummarySourceEvents,
+  getSourceSummaryNodes as readSourceSummaryNodes,
+  getSummaryBackfillSessionIds,
+  getSummaryNode as readSummaryNode,
+  getSummaryNodesForGraph as readSummaryNodesForGraph,
+  getSummaryNodeSourceEvents as readSummaryNodeSourceEvents,
+  getSummaryNodesForSession as readSummaryNodesForSession,
+  getTopSummaryNodesForSession as readTopSummaryNodesForSession,
+  rebuildSessionMemorySummary as materializeSessionMemorySummary,
+  searchSummaryNodes as searchPersistedSummaryNodes,
+  shouldRebuildSessionMemorySummary as shouldMaterializeSessionMemorySummary,
+} from "./storage-summaries.ts";
+import {
   extractEventMetadata,
   extractSessionMetadata,
   isCodexLcmToolEvent,
   isSearchIndexEvent,
-  isSummaryHook,
   maxNullable,
   sessionListSummary,
   sessionsWithDescendants,
@@ -76,15 +86,10 @@ import {
 } from "./storage-sessions.ts";
 import {
   SUMMARY_ALGORITHM_VERSION,
-  SUMMARY_NODE_CHUNK_SIZE,
-  SUMMARY_NODE_FANOUT,
-  SUMMARY_NODE_MAX_DEPTH,
+  SUMMARY_NODE_VERSION,
   SUMMARY_NODE_PACK_LIMIT,
   SUMMARY_NODE_SOURCE_EVENT_LIMIT,
-  SUMMARY_NODE_VERSION,
   HISTORICAL_SOURCE_TEXT_NOTICE,
-  buildCondensedSummaryNode,
-  buildLeafSummaryNode,
   buildSessionMemorySummary,
   estimateTokenCount,
   eventSignalText,
@@ -100,7 +105,6 @@ import {
   summaryNodeToCompactMarkdown,
   summaryNodeToMarkdown,
   summarySearchText,
-  takeHeadTail,
   toFtsQueries,
   type SessionMemorySummary,
   type SummaryNode,
@@ -117,15 +121,8 @@ export type { FileReference, OverflowContent, OverflowReference, OverflowSearchM
 
 import type { StorageOptions, IngestManyResult, IngestManyOptions, SearchSessionArgs, SearchOverflowArgs, ListSessionsArgs, SessionPage, UsageReport, IndexCleanupReport, SessionSummary, SessionDetail, RecentContext, ContextPlan, PackedContext, PackContextArgs, QueryExpansionSource, LcmQueryExpansion, LcmDescription, LcmExpansion, GraphNode, SessionGraph, Health, LcmStats } from "./storage-types.ts";
 
-type SummaryNodeSearchArgs = SearchSessionArgs & {
-  sessionIds?: string[];
-};
-
-const SUMMARY_EARLY_SIGNAL_LIMIT = 120;
-const SUMMARY_LATEST_SIGNAL_LIMIT = 240;
-const SUMMARY_RECENT_EVENT_LIMIT = 40;
-const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
 const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
+const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
 const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
@@ -1306,30 +1303,11 @@ export class LcmStorage {
   }
 
   getSessionMemorySummary(sessionId: string): SessionMemorySummary | undefined {
-    if (!this.db) {
-      const events = readRawEvents(this.config.rawLogPath).filter((event) => event.session_id === sessionId);
-      return events.length > 0 ? buildSessionMemorySummary(events) : undefined;
-    }
-    const row = this.db.prepare(`
-      SELECT session_id, updated_at, cwd, repo_root, git_branch, title, overview, topics_json,
-             key_prompts_json, outcomes_json, tools_json, source_event_ids_json
-      FROM session_summaries
-      WHERE session_id = ?1
-    `).get(sessionId);
-    return row ? rowToSessionMemorySummary(row) : undefined;
+    return readSessionMemorySummary(this.db, this.config.rawLogPath, sessionId);
   }
 
   getSummaryNodesForSession(sessionId: string, limit = 200): SummaryNode[] {
-    if (!this.db) return [];
-    return this.db.prepare(`
-      SELECT node_id, session_id, depth, summary_text, token_count, source_token_count, source_type,
-             source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
-             cwd, repo_root, git_branch, topics_json
-      FROM summary_nodes
-      WHERE session_id = ?1
-      ORDER BY depth ASC, earliest_at ASC, node_id ASC
-      LIMIT ?2
-    `).all(sessionId, clampLimit(limit, 200, 2_000)).map(rowToSummaryNode);
+    return readSummaryNodesForSession(this.db, sessionId, limit);
   }
 
   getFileRefsForSession(sessionId: string, limit = 50): FileReference[] {
@@ -1634,115 +1612,23 @@ export class LcmStorage {
   }
 
   private getTopSummaryNodesForSession(sessionId: string, limit = 3): SummaryNode[] {
-    if (!this.db) return [];
-    return this.db.prepare(`
-      SELECT node_id, session_id, depth, summary_text, token_count, source_token_count, source_type,
-             source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
-             cwd, repo_root, git_branch, topics_json
-      FROM summary_nodes
-      WHERE session_id = ?1
-        AND depth = (SELECT MAX(depth) FROM summary_nodes WHERE session_id = ?1)
-      ORDER BY latest_at DESC
-      LIMIT ?2
-    `).all(sessionId, clampLimit(limit, 3, 20)).map(rowToSummaryNode);
+    return readTopSummaryNodesForSession(this.db, sessionId, limit);
   }
 
   private getSummaryNodesForGraph(sessionId: string, limit = 50): SummaryNode[] {
-    const cappedLimit = clampLimit(limit, 50, 500);
-    const nodes = this.getSummaryNodesForSession(sessionId, 2_000);
-    const byId = new Map(nodes.map((node) => [node.node_id, node]));
-    const selected = new Map<string, SummaryNode>();
-
-    const addWithLineage = (node: SummaryNode) => {
-      if (selected.has(node.node_id) || selected.size >= cappedLimit) return;
-      selected.set(node.node_id, node);
-      if (node.source_type !== "nodes") return;
-      for (const sourceId of node.source_ids) {
-        const sourceNode = byId.get(sourceId);
-        if (!sourceNode) continue;
-        addWithLineage(sourceNode);
-        if (selected.size >= cappedLimit) break;
-      }
-    };
-
-    const roots = [...nodes].sort((a, b) =>
-      b.depth - a.depth ||
-      b.latest_at.localeCompare(a.latest_at) ||
-      a.earliest_at.localeCompare(b.earliest_at) ||
-      a.node_id.localeCompare(b.node_id));
-    for (const node of roots) {
-      addWithLineage(node);
-      if (selected.size >= cappedLimit) break;
-    }
-
-    return [...selected.values()].sort((a, b) =>
-      a.depth - b.depth ||
-      a.earliest_at.localeCompare(b.earliest_at) ||
-      a.node_id.localeCompare(b.node_id));
+    return readSummaryNodesForGraph(this.db, sessionId, limit);
   }
 
-  private searchSummaryNodes(args: SummaryNodeSearchArgs): SummaryNode[] {
-    const limit = clampLimit(args.limit, 10);
-    if (!this.db) return [];
-    const query = args.query?.trim() ?? "";
-    const sessionFilter = args.sessionIds?.length ? new Set(args.sessionIds) : undefined;
-    if (query.length === 0) {
-      const rows = this.db.prepare(`
-        SELECT node_id, session_id, depth, summary_text, token_count, source_token_count, source_type,
-               source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
-               cwd, repo_root, git_branch, topics_json
-        FROM summary_nodes
-        WHERE (?1 IS NULL OR cwd = ?1)
-          AND (?2 IS NULL OR repo_root = ?2)
-        ORDER BY depth DESC, latest_at DESC
-        LIMIT ?3
-      `).all(args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 4, 20));
-      return rows
-        .map(rowToSummaryNode)
-        .filter((node) => !sessionFilter || sessionFilter.has(node.session_id))
-        .slice(0, limit);
-    }
-
-    let rows: unknown[] = [];
-    const statement = this.db.prepare(`
-      SELECT n.node_id, n.session_id, n.depth, n.summary_text, n.token_count, n.source_token_count,
-             n.source_type, n.source_ids_json, n.source_event_ids_json, n.earliest_at, n.latest_at,
-             n.created_at, n.cwd, n.repo_root, n.git_branch, n.topics_json
-      FROM summary_node_fts f
-      JOIN summary_nodes n ON n.node_id = f.node_id
-      WHERE summary_node_fts MATCH ?1
-        AND (?2 IS NULL OR n.cwd = ?2)
-        AND (?3 IS NULL OR n.repo_root = ?3)
-      ORDER BY bm25(summary_node_fts) ASC, n.depth DESC, n.latest_at DESC
-      LIMIT ?4
-    `);
-    for (const ftsQuery of toFtsQueries(query)) {
-      rows = statement.all(ftsQuery, args.cwd ?? null, args.repoRoot ?? null, Math.max(limit * 10, 50));
-      if (rows.length > 0) break;
-    }
-    const nodes = rows
-      .map(rowToSummaryNode)
-      .filter((node) => !sessionFilter || sessionFilter.has(node.session_id));
-    return rankSummaryNodesForContext(nodes, query).slice(0, limit);
+  private searchSummaryNodes(args: SearchSessionArgs & { sessionIds?: string[] }): SummaryNode[] {
+    return searchPersistedSummaryNodes(this.db, args);
   }
 
   private getSummaryNode(nodeId: string): SummaryNode | undefined {
-    if (!this.db) return undefined;
-    const row = this.db.prepare(`
-      SELECT node_id, session_id, depth, summary_text, token_count, source_token_count, source_type,
-             source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
-             cwd, repo_root, git_branch, topics_json
-      FROM summary_nodes
-      WHERE node_id = ?1
-    `).get(nodeId);
-    return row ? rowToSummaryNode(row) : undefined;
+    return readSummaryNode(this.db, nodeId);
   }
 
   private getSourceSummaryNodes(node: SummaryNode, limit = 4): SummaryNode[] {
-    if (node.source_type !== "nodes") return [];
-    return node.source_ids
-      .flatMap((nodeId) => this.getSummaryNode(nodeId) ?? [])
-      .slice(0, clampLimit(limit, 4, 50));
+    return readSourceSummaryNodes(this.db, node, limit);
   }
 
   private getSummaryNodeSourceEvents(
@@ -1750,30 +1636,7 @@ export class LcmStorage {
     query = "",
     limit = SUMMARY_NODE_SOURCE_EVENT_LIMIT,
   ): NormalizedEvent[] {
-    if (!this.db) return [];
-    const sourceEventIds = node.source_type === "events"
-      ? node.source_ids
-      : node.source_event_ids;
-    const maxFetch = node.source_type === "events"
-      ? sourceEventIds.length
-      : Math.max(clampLimit(limit, SUMMARY_NODE_SOURCE_EVENT_LIMIT, 20) * 8, 32);
-    const selectedIds = takeHeadTail(sourceEventIds, Math.min(sourceEventIds.length, maxFetch), Math.ceil(maxFetch / 2));
-    if (selectedIds.length === 0) return [];
-    const placeholders = selectedIds.map((_, index) => `?${index + 1}`).join(", ");
-    const rows = this.db.prepare(`
-      SELECT raw_json FROM events
-      WHERE event_id IN (${placeholders})
-      ORDER BY timestamp ASC, rowid ASC
-    `).all(...selectedIds);
-    return rows
-      .map((row) => decodePersistedEvent((row as { raw_json: string }).raw_json))
-      .filter(isSummarySourceEvent)
-      .filter((event) => !isCodexLcmToolEvent(event))
-      .sort((a, b) =>
-        queryTermHitCount(eventSignalText(b), query) - queryTermHitCount(eventSignalText(a), query) ||
-        a.timestamp.localeCompare(b.timestamp) ||
-        a.event_id.localeCompare(b.event_id))
-      .slice(0, clampLimit(limit, SUMMARY_NODE_SOURCE_EVENT_LIMIT, 20));
+    return readSummaryNodeSourceEvents(this.db, node, query, limit);
   }
 
   private getSessionSummarySourceEvents(
@@ -1781,24 +1644,7 @@ export class LcmStorage {
     query: string,
     limit: number,
   ): NormalizedEvent[] {
-    if (!this.db || summary.source_event_ids.length === 0) return [];
-    const placeholders = summary.source_event_ids.map((_, index) => `?${index + 1}`).join(", ");
-    const events = (this.db.prepare(`
-      SELECT raw_json
-      FROM events
-      WHERE event_id IN (${placeholders})
-      ORDER BY timestamp ASC, rowid ASC
-    `).all(...summary.source_event_ids) as Array<{ raw_json: string }>)
-      .map((row) => decodePersistedEvent(row.raw_json))
-      .filter(isSummarySourceEvent)
-      .filter((event) => !isCodexLcmToolEvent(event));
-    const matching = events.filter((event) => matchesQueryText(eventSignalText(event), query));
-    return (matching.length > 0 ? matching : events)
-      .sort((a, b) =>
-        queryTermHitCount(eventSignalText(b), query) - queryTermHitCount(eventSignalText(a), query) ||
-        a.timestamp.localeCompare(b.timestamp) ||
-        a.event_id.localeCompare(b.event_id))
-      .slice(0, clampLimit(limit, SUMMARY_NODE_SOURCE_EVENT_LIMIT, 20));
+    return readSessionSummarySourceEvents(this.db, summary, query, limit);
   }
 
   private searchContextEvents(args: {
@@ -2456,30 +2302,12 @@ export class LcmStorage {
 
   private backfillSessionMemorySummaries(): void {
     if (!this.db) return;
-    const rows = this.db.prepare(`
-      SELECT s.session_id
-      FROM sessions s
-      LEFT JOIN session_summaries ss ON ss.session_id = s.session_id
-      LEFT JOIN (
-        SELECT session_id, MAX(summary_version) AS summary_node_version
-        FROM summary_nodes
-        GROUP BY session_id
-      ) sn ON sn.session_id = s.session_id
-      WHERE ss.session_id IS NULL
-         OR ss.summary_version IS NULL
-         OR ss.summary_version < ${SUMMARY_ALGORITHM_VERSION}
-         OR sn.summary_node_version IS NULL
-         OR sn.summary_node_version < ${SUMMARY_NODE_VERSION}
-      ORDER BY s.last_seen DESC
-      LIMIT 5
-    `).all();
-    if (rows.length === 0) return;
+    const sessionIds = getSummaryBackfillSessionIds(this.db);
+    if (sessionIds.length === 0) return;
 
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      for (const row of rows) {
-        this.rebuildSessionMemorySummary(String((row as { session_id: string }).session_id));
-      }
+      for (const sessionId of sessionIds) this.rebuildSessionMemorySummary(sessionId);
       this.db.exec("COMMIT");
     } catch (error) {
       try {
@@ -2586,209 +2414,11 @@ export class LcmStorage {
   }
 
   private shouldRebuildSessionMemorySummary(event: NormalizedEvent): boolean {
-    if (!this.db || !isSummarySourceEvent(event)) return false;
-    if (event.hook_event !== "UserPromptSubmit") return true;
-    const existingSummary = this.db.prepare("SELECT 1 FROM session_summaries WHERE session_id = ?1 LIMIT 1").get(event.session_id);
-    if (!existingSummary) return true;
-    const highSignalCount = Number(this.db.prepare(`
-      SELECT COUNT(*) AS count FROM events
-      WHERE session_id = ?1
-        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
-    `).get(event.session_id)?.count ?? 0);
-    const chunkOffset = highSignalCount % SUMMARY_NODE_CHUNK_SIZE;
-    return chunkOffset === 0 || chunkOffset === 1;
+    return shouldMaterializeSessionMemorySummary(this.db, event);
   }
 
   private rebuildSessionMemorySummary(sessionId: string): void {
-    if (!this.db) return;
-    const events = this.getSummaryEventsForSession(sessionId);
-    if (events.length === 0) {
-      this.db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
-      this.db.prepare("DELETE FROM session_summaries WHERE session_id = ?1").run(sessionId);
-      this.rebuildSummaryNodes(sessionId);
-      return;
-    }
-    const summary = buildSessionMemorySummary(events);
-    const summaryText = summarySearchText(summary);
-    this.db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
-    this.db.prepare(`
-      INSERT INTO session_summaries
-        (session_id, summary_version, updated_at, cwd, repo_root, git_branch, title, overview, topics_json,
-         key_prompts_json, outcomes_json, tools_json, source_event_ids_json, summary_text)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-      ON CONFLICT(session_id) DO UPDATE SET
-        summary_version = excluded.summary_version,
-        updated_at = excluded.updated_at,
-        cwd = excluded.cwd,
-        repo_root = excluded.repo_root,
-        git_branch = excluded.git_branch,
-        title = excluded.title,
-        overview = excluded.overview,
-        topics_json = excluded.topics_json,
-        key_prompts_json = excluded.key_prompts_json,
-        outcomes_json = excluded.outcomes_json,
-        tools_json = excluded.tools_json,
-        source_event_ids_json = excluded.source_event_ids_json,
-        summary_text = excluded.summary_text
-    `).run(
-      summary.session_id,
-      SUMMARY_ALGORITHM_VERSION,
-      summary.updated_at,
-      summary.cwd,
-      summary.repo_root ?? null,
-      summary.git_branch ?? null,
-      summary.title,
-      summary.overview,
-      JSON.stringify(summary.topics),
-      JSON.stringify(summary.key_prompts),
-      JSON.stringify(summary.outcomes),
-      JSON.stringify(summary.tools),
-      JSON.stringify(summary.source_event_ids),
-      summaryText,
-    );
-    this.db.prepare(`
-      INSERT INTO session_summary_fts (session_id, cwd, repo_root, content)
-      VALUES (?1, ?2, ?3, ?4)
-    `).run(summary.session_id, summary.cwd, summary.repo_root ?? "", summaryText);
-    this.rebuildSummaryNodes(sessionId);
-  }
-
-  private rebuildSummaryNodes(sessionId: string): void {
-    if (!this.db) return;
-    const sourceEvents = this.getAllSummarySourceEventsForSession(sessionId);
-    let previousDepth = chunkArray(sourceEvents, SUMMARY_NODE_CHUNK_SIZE)
-      .map((events) => buildLeafSummaryNode(events));
-    const nodes: SummaryNode[] = [];
-    nodes.push(...previousDepth);
-
-    for (let depth = 1; depth <= SUMMARY_NODE_MAX_DEPTH && previousDepth.length > 1; depth += 1) {
-      const condensed = chunkArray(previousDepth, SUMMARY_NODE_FANOUT)
-        .map((nodes) => buildCondensedSummaryNode(nodes, depth));
-      nodes.push(...condensed);
-      previousDepth = condensed;
-    }
-
-    const existing = new Map((this.db.prepare(`
-      SELECT node_id, summary_version FROM summary_nodes WHERE session_id = ?1
-    `).all(sessionId) as Array<{ node_id: string; summary_version: number }>)
-      .map((row) => [row.node_id, row.summary_version]));
-    const nextIds = new Set(nodes.map((node) => node.node_id));
-    const deleteFts = this.db.prepare("DELETE FROM summary_node_fts WHERE node_id = ?1");
-    const deleteNode = this.db.prepare("DELETE FROM summary_nodes WHERE node_id = ?1");
-    for (const nodeId of existing.keys()) {
-      if (nextIds.has(nodeId)) continue;
-      deleteFts.run(nodeId);
-      deleteNode.run(nodeId);
-    }
-    for (const node of nodes) {
-      const existingVersion = existing.get(node.node_id);
-      if (existingVersion === SUMMARY_NODE_VERSION) continue;
-      if (existingVersion !== undefined) {
-        deleteFts.run(node.node_id);
-      }
-      this.insertSummaryNode(node);
-    }
-  }
-
-  private insertSummaryNode(node: SummaryNode): void {
-    if (!this.db) return;
-    this.db.prepare(`
-      INSERT INTO summary_nodes
-        (node_id, session_id, summary_version, depth, summary_text, token_count, source_token_count,
-         source_type, source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at,
-         cwd, repo_root, git_branch, topics_json)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-      ON CONFLICT(node_id) DO UPDATE SET
-        summary_version = excluded.summary_version,
-        depth = excluded.depth,
-        summary_text = excluded.summary_text,
-        token_count = excluded.token_count,
-        source_token_count = excluded.source_token_count,
-        source_type = excluded.source_type,
-        source_ids_json = excluded.source_ids_json,
-        source_event_ids_json = excluded.source_event_ids_json,
-        earliest_at = excluded.earliest_at,
-        latest_at = excluded.latest_at,
-        created_at = excluded.created_at,
-        cwd = excluded.cwd,
-        repo_root = excluded.repo_root,
-        git_branch = excluded.git_branch,
-        topics_json = excluded.topics_json
-    `).run(
-      node.node_id,
-      node.session_id,
-      SUMMARY_NODE_VERSION,
-      node.depth,
-      node.summary_text,
-      node.token_count,
-      node.source_token_count,
-      node.source_type,
-      JSON.stringify(node.source_ids),
-      JSON.stringify(node.source_event_ids),
-      node.earliest_at,
-      node.latest_at,
-      node.created_at,
-      node.cwd,
-      node.repo_root ?? null,
-      node.git_branch ?? null,
-      JSON.stringify(node.topics),
-    );
-    this.db.prepare(`
-      INSERT INTO summary_node_fts (node_id, session_id, cwd, repo_root, depth, content)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-    `).run(
-      node.node_id,
-      node.session_id,
-      node.cwd,
-      node.repo_root ?? "",
-      String(node.depth),
-      summaryNodeSearchText(node),
-    );
-  }
-
-
-  private getAllSummarySourceEventsForSession(sessionId: string): NormalizedEvent[] {
-    if (!this.db) return [];
-    const rows = this.db.prepare(`
-      SELECT raw_json FROM events
-      WHERE session_id = ?1
-        AND hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')
-      ORDER BY timestamp ASC, rowid ASC
-    `).all(sessionId);
-    return rows
-      .map((row) => decodePersistedEvent((row as { raw_json: string }).raw_json))
-      .filter((event) => !isCodexLcmToolEvent(event))
-      .filter(isSummarySourceEvent);
-  }
-
-  private getSummaryEventsForSession(sessionId: string): NormalizedEvent[] {
-    if (!this.db) return [];
-    const earlySignals = this.db.prepare(`
-      SELECT raw_json FROM events
-      WHERE session_id = ?1
-        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
-      ORDER BY timestamp ASC, rowid ASC
-      LIMIT ?2
-    `).all(sessionId, SUMMARY_EARLY_SIGNAL_LIMIT);
-    const latestSignals = this.db.prepare(`
-      SELECT raw_json FROM events
-      WHERE session_id = ?1
-        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
-      ORDER BY timestamp DESC, rowid DESC
-      LIMIT ?2
-    `).all(sessionId, SUMMARY_LATEST_SIGNAL_LIMIT);
-    const recentEvents = this.db.prepare(`
-      SELECT raw_json FROM events
-      WHERE session_id = ?1
-      ORDER BY timestamp DESC, rowid DESC
-      LIMIT ?2
-    `).all(sessionId, SUMMARY_RECENT_EVENT_LIMIT);
-    const events = uniqueEvents([...earlySignals, ...latestSignals, ...recentEvents]
-      .map((row) => decodePersistedEvent((row as { raw_json: string }).raw_json))
-      .filter((event) => !isCodexLcmToolEvent(event))
-      .filter((event) => !isSummaryHook(event.hook_event) || isSummarySourceEvent(event)))
-      .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.event_id.localeCompare(b.event_id));
-    return events.some(isSummarySourceEvent) ? events : [];
+    materializeSessionMemorySummary(this.db, sessionId);
   }
 }
 
