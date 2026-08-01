@@ -3,7 +3,7 @@ export const TOOLS = [
   {
     name: "lcm_health",
     title: "LCM Health",
-    description: "Report Codex LCM storage and index health.",
+    description: "Compatibility tool; prefer lcm_stats for health and aggregate index diagnostics.",
     inputSchema: { type: "object", properties: {} },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -162,7 +162,7 @@ export const TOOLS = [
   {
     name: "lcm_search_sessions",
     title: "LCM Search Sessions",
-    description: "Search across Codex sessions with SQLite FTS.",
+    description: "Compatibility tool; prefer lcm_grep with contentScope set to memory.",
     inputSchema: {
       type: "object",
       properties: {
@@ -194,7 +194,7 @@ export const TOOLS = [
   {
     name: "lcm_get_session_summary",
     title: "LCM Get Session Summary",
-    description: "Retrieve the deterministic extractive summary for a session, including topics and source event pointers.",
+    description: "Compatibility tool; prefer lcm_describe with sessionId.",
     inputSchema: {
       type: "object",
       properties: {

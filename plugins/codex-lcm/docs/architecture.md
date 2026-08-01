@@ -67,8 +67,6 @@ SQLite tables:
 - `summary_nodes`
 - `summary_node_fts`
 - `file_refs`
-- `graph_nodes`
-- `graph_edges`
 
 Codex LCM creates the index opportunistically during ingestion. If indexing is unavailable, raw-log fallback scans keep health, session lookup, retrieval, and basic search usable.
 
@@ -99,8 +97,8 @@ Each summary records:
 - source event IDs
 
 `session_summary_fts` lets broad topic queries match these compact clues before
-the caller loads raw events. `lcm_get_session_summary` exposes a summary
-directly.
+the caller loads raw events. `lcm_describe` exposes a session summary directly;
+`lcm_get_session_summary` remains as a compatibility tool.
 
 `summary_nodes` stores a multi-depth summary DAG. D0 nodes summarize bounded
 chunks of high-signal source events. D1 and deeper nodes summarize lower-depth
@@ -138,9 +136,9 @@ sample before extracting topics and outcomes. The summary should capture the
 initial task, recent drift, and the latest result without scanning an entire
 giant transcript on every hook event.
 
-## DAG Index
+## Derived DAG
 
-The graph index is derived and deterministic. Raw JSONL remains the source of truth.
+Graph slices are derived on demand from indexed events and summary source IDs. No duplicate node/edge projection is persisted; raw JSONL remains the source of truth.
 
 Node kinds:
 
@@ -158,13 +156,7 @@ Edge kinds:
 - `checkpoint`: session to checkpoint.
 - `summary_source`: summary node to source event node or lower-depth summary node.
 
-`summary_source` edges are persisted when summary nodes are rebuilt. Older
-indexes without persisted summary-source rows still get a synthesized fallback
-when graph slices are read. Unknown edge kinds run a recursive reachability
-check from the prospective child to the prospective parent. Known internal edge
-kinds (`contains`, `next`, `tool_result`, `checkpoint`, and `summary_source`)
-skip that expensive check because they are derived from append-only session
-order or summary-source lineage.
+All edge kinds are synthesized from append-only session order or summary-source lineage when graph slices are read.
 
 For very long sessions, callers should prefer bounded graph and event access:
 

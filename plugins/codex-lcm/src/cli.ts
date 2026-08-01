@@ -165,8 +165,8 @@ function printHelp(): void {
 Commands:
   codex-lcm mcp
   codex-lcm hook <event>
-  codex-lcm status [--json]
-  codex-lcm doctor [--json]              Diagnose install, storage, and capture state
+  codex-lcm status [--codex-home PATH] [--json]
+  codex-lcm doctor [--codex-home PATH] [--json]  Diagnose install, storage, and capture state
   codex-lcm health [--json]
   codex-lcm stats [--json]
   codex-lcm cleanup [--apply] [--json]   Preview or apply safe derived-index compaction; raw events are preserved
@@ -182,14 +182,17 @@ Commands:
 function optionValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   if (index === -1) return undefined;
-  return args[index + 1];
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value.`);
+  return value;
 }
 
 function numberOptionValue(args: string[], flag: string): number | undefined {
   const value = optionValue(args, flag);
   if (value === undefined) return undefined;
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  if (!Number.isFinite(parsed) || parsed <= 0) throw new Error(`${flag} requires a positive number.`);
+  return parsed;
 }
 
 function printObjectOrText(value: unknown): void {

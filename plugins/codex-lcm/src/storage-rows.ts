@@ -1,5 +1,5 @@
 import type { FileReference } from "./file-refs.ts";
-import type { GraphEdge, GraphNode, SessionSummary } from "./storage.ts";
+import type { SessionSummary } from "./storage.ts";
 import type { SessionMemorySummary, SummaryNode } from "./summary.ts";
 
 export function rowToSessionSummary(row: unknown): SessionSummary {
@@ -93,53 +93,12 @@ export function rowToFileReference(row: unknown): FileReference {
   };
 }
 
-export function rowToGraphNode(row: unknown): GraphNode {
-  const record = recordValue(row);
-  return {
-    node_id: String(record.node_id),
-    kind: graphNodeKind(record.kind),
-    session_id: String(record.session_id),
-    ...(record.event_id ? { event_id: String(record.event_id) } : {}),
-    ...(record.turn_id ? { turn_id: String(record.turn_id) } : {}),
-    timestamp: String(record.timestamp),
-    cwd: String(record.cwd),
-    ...(record.repo_root ? { repo_root: String(record.repo_root) } : {}),
-    ...(record.git_branch ? { git_branch: String(record.git_branch) } : {}),
-    label: String(record.label),
-    metadata: parseMetadata(record.metadata_json),
-  };
-}
-
-export function rowToGraphEdge(row: unknown): GraphEdge {
-  const record = recordValue(row);
-  return {
-    from_node_id: String(record.from_node_id),
-    to_node_id: String(record.to_node_id),
-    kind: String(record.kind),
-    session_id: String(record.session_id),
-    position: Number(record.position),
-    created_at: String(record.created_at),
-    metadata: parseMetadata(record.metadata_json),
-  };
-}
 
 function optionalNumber(record: Record<string, unknown>, key: string): Record<string, number> {
   const value = record[key];
   return value === null || value === undefined ? {} : { [key]: Number(value) };
 }
 
-function graphNodeKind(value: unknown): GraphNode["kind"] {
-  switch (value) {
-    case "session":
-    case "turn":
-    case "event":
-    case "checkpoint":
-    case "summary":
-      return value;
-    default:
-      throw new TypeError(`Invalid graph node kind: ${String(value)}`);
-  }
-}
 
 function parseMetadata(value: unknown): Record<string, unknown> {
   if (typeof value !== "string") return {};

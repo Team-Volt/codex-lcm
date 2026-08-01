@@ -23,7 +23,7 @@ export function readStatus(options: InstallerOptions = {}) {
   const pluginDeclaresMcp = pluginManifestText !== undefined && /"mcpServers"\s*:/u.test(pluginManifestText);
   const pluginDeclaresHooks = pluginManifestText !== undefined && /"hooks"\s*:/u.test(pluginManifestText);
   const marketplaceConfigured = configText !== undefined && /\[marketplaces\.codex-lcm\]/u.test(configText);
-  const pluginConfigured = configText !== undefined && /\[plugins\."codex-lcm@codex-lcm"\]/u.test(configText);
+  const pluginConfigured = configText !== undefined && pluginSectionEnabled(configText);
   const manualMcpConfigured =
     configText !== undefined && /mcp_servers\.(?:"codex-lcm"|codex-lcm)|command\s*=\s*".*codex-lcm/u.test(configText);
   const manualHooksConfigured = hooksText !== undefined && hooksText.includes("codex-lcm");
@@ -45,6 +45,18 @@ export function readStatus(options: InstallerOptions = {}) {
     hooks_configured: manualHooksConfigured || (pluginOwnedWiringAvailable && pluginDeclaresHooks && hookManifestAvailable),
     recall_skill_available: fs.existsSync(path.join(root, "skills", "lcm-recall", "SKILL.md")),
   };
+}
+
+function pluginSectionEnabled(configText: string): boolean {
+  const lines = configText.split(/\r?\n/u);
+  const start = lines.findIndex((line) => line.trim() === '[plugins."codex-lcm@codex-lcm"]');
+  if (start < 0) return false;
+  for (const line of lines.slice(start + 1)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("[")) break;
+    if (/^enabled\s*=\s*false(?:\s*#.*)?$/u.test(trimmed)) return false;
+  }
+  return true;
 }
 
 function readOptional(filePath: string): string | undefined {

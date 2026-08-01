@@ -20,14 +20,13 @@ import {
   readRawEventIds,
   readRawEvents,
   readRawLog,
+  withRawLogLock,
   type RawLogState,
 } from "./raw-log.ts";
 import { initializeStorageSchema } from "./storage-schema.ts";
 import {
   parseStringArray,
   rowToFileReference,
-  rowToGraphEdge,
-  rowToGraphNode,
   rowToSessionMemorySummary,
   rowToSessionSummary,
   rowToSummaryNode,
@@ -363,12 +362,14 @@ const SUMMARY_EARLY_SIGNAL_LIMIT = 120;
 const SUMMARY_LATEST_SIGNAL_LIMIT = 240;
 const SUMMARY_RECENT_EVENT_LIMIT = 40;
 const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')";
-const KNOWN_ACYCLIC_EDGE_KINDS = new Set(["contains", "next", "tool_result", "checkpoint", "summary_source"]);
 const DEFAULT_MODEL_CONTEXT_WINDOW = 128_000;
 const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT = 96_000;
 const DEFAULT_CONTEXT_PLAN_RECENT_EVENT_LIMIT = 80;
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
 const DELEGATION_PARENT_BACKFILL_KEY = "delegation_parent_backfilled_v1";
+const EVENT_METADATA_BACKFILL_KEY = "event_metadata_backfilled_v1";
+const MAX_OVERFLOW_SEARCH_BYTES = 64 * 1024 * 1024;
+const MAX_OVERFLOW_SEARCH_REFERENCES = 4_096;
 const RAW_LOG_INDEX_STATE_KEY = "raw_log_index_state_v1";
 
 type IndexEventResult = {
@@ -383,6 +384,13 @@ type RawEventIdCache = {
   mtimeMs: number;
   eventIds: Set<string>;
 };
+
+class DerivedIndexError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "DerivedIndexError";
+  }
+}
 
 export class LcmStorage {
   readonly config: LcmConfig;
@@ -408,7 +416,6 @@ export class LcmStorage {
         this.initialize();
         this.replayRawLogToIndex();
         this.backfillDelegationParents();
-        this.backfillGraph();
         this.backfillFileRefs();
         this.backfillSessionMemorySummaries();
       }
@@ -436,6 +443,7 @@ export class LcmStorage {
     try {
       this.ingestSerialized([event], "event");
     } catch (error) {
+      if (!(error instanceof DerivedIndexError)) throw error;
       let rawDurable: boolean;
       try {
         rawDurable = readRawEventIds(this.config.rawLogPath).has(event.event_id);
@@ -456,104 +464,74 @@ export class LcmStorage {
 
   private ingestSerialized(events: NormalizedEvent[], summaryRebuild: SummaryRebuildStrategy): IngestManyResult {
     if (events.length === 0) return { imported: 0, skippedDuplicate: 0, touchedSessions: [] };
+    return withRawLogLock(this.config.rawLogPath, () => {
+      let rawLogWasIndexed = false;
+      let rawEventIds: Set<string>;
+      try {
+        if (this.db && this.indexError) this.replayRawLogToIndex();
+        rawLogWasIndexed = this.db ? this.rawLogIsIndexed() : false;
+        rawEventIds = this.db && rawLogWasIndexed
+          ? this.knownEventIds(events.map((event) => event.event_id))
+          : this.readRawEventIds();
+      } catch (error) {
+        this.indexError = error instanceof Error ? error.message : String(error);
+        rawEventIds = this.readRawEventIds();
+      }
 
-    if (this.db) {
+      const rawSeen = new Set(rawEventIds);
+      const eventsToAppend: NormalizedEvent[] = [];
+      let skippedDuplicate = 0;
+      for (const event of events) {
+        if (rawSeen.has(event.event_id)) {
+          skippedDuplicate += 1;
+          continue;
+        }
+        rawSeen.add(event.event_id);
+        eventsToAppend.push(event);
+      }
+
+      if (eventsToAppend.length > 0) {
+        appendRawEvents(this.config.rawLogPath, eventsToAppend);
+        this.storeRawEventIds(rawSeen);
+      }
+      if (!this.db) return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
+
       try {
         this.db.exec("BEGIN IMMEDIATE");
       } catch (error) {
-        this.indexError = error instanceof Error ? error.message : String(error);
-        throw error;
+        const failure = new DerivedIndexError(error);
+        this.indexError = failure.message;
+        throw failure;
       }
-    }
 
-    let rawEventIds: Set<string>;
-    let indexedEventIds: Set<string>;
-    let rawLogWasIndexed = false;
-    try {
-      rawLogWasIndexed = this.db ? this.rawLogIsIndexed() : false;
-      if (this.db) {
-        indexedEventIds = this.knownEventIds(events.map((event) => event.event_id));
-        rawEventIds = rawLogWasIndexed ? new Set(indexedEventIds) : this.readRawEventIds();
-      } else {
-        rawEventIds = this.readRawEventIds();
-        indexedEventIds = rawEventIds;
-      }
-    } catch (error) {
-      if (this.db) {
+      const touchedSessions = new Set<string>();
+      try {
+        const indexSeen = this.knownEventIds(events.map((event) => event.event_id));
+        for (const event of events) {
+          if (indexSeen.has(event.event_id)) continue;
+          indexSeen.add(event.event_id);
+          const result = this.indexEventInTransaction(event, { rebuildSummary: summaryRebuild === "event" });
+          if (result.summaryTouched) touchedSessions.add(event.session_id);
+        }
+        const rebuiltSessions = summaryRebuild === "sessions"
+          ? this.rebuildTouchedSummarySessions(touchedSessions)
+          : sortedSessionIds(touchedSessions);
+        if (rawLogWasIndexed) this.recordRawLogState();
+        this.db.exec("COMMIT");
+        if (rawLogWasIndexed) this.indexError = undefined;
+        return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
+      } catch (error) {
+        let failure = error;
         try {
           this.db.exec("ROLLBACK");
         } catch (rollbackError) {
-          throw new AggregateError([error, rollbackError], "Bulk ingest rollback failed after raw-log read or index lookup failure.");
+          failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
         }
+        const indexFailure = new DerivedIndexError(failure);
+        this.indexError = indexFailure.message;
+        throw indexFailure;
       }
-      throw error;
-    }
-    const rawSeen = new Set(rawEventIds);
-    const indexSeen = new Set(indexedEventIds);
-    const eventsToAppend: NormalizedEvent[] = [];
-    const eventsToIndex: NormalizedEvent[] = [];
-    let skippedDuplicate = 0;
-    for (const event of events) {
-      if (rawSeen.has(event.event_id)) {
-        skippedDuplicate += 1;
-        if (this.db && !indexSeen.has(event.event_id)) {
-          indexSeen.add(event.event_id);
-          eventsToIndex.push(event);
-        }
-        continue;
-      }
-      rawSeen.add(event.event_id);
-      indexSeen.add(event.event_id);
-      eventsToAppend.push(event);
-      eventsToIndex.push(event);
-    }
-
-    if (!this.db && eventsToAppend.length === 0 && eventsToIndex.length === 0) {
-      return { imported: 0, skippedDuplicate, touchedSessions: [] };
-    }
-
-    if (eventsToAppend.length > 0) {
-      try {
-        appendRawEvents(this.config.rawLogPath, eventsToAppend);
-      } catch (error) {
-        if (this.db) {
-          try {
-            this.db.exec("ROLLBACK");
-          } catch (rollbackError) {
-            throw new AggregateError([error, rollbackError], "Bulk ingest rollback failed after raw-log append failure.");
-          }
-        }
-        throw error;
-      }
-      for (const event of eventsToAppend) {
-        rawEventIds.add(event.event_id);
-      }
-      this.storeRawEventIds(rawEventIds);
-    }
-    if (!this.db) return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: [] };
-
-    const touchedSessions = new Set<string>();
-    try {
-      for (const event of eventsToIndex) {
-        const result = this.indexEventInTransaction(event, { rebuildSummary: summaryRebuild === "event" });
-        if (result.summaryTouched) touchedSessions.add(event.session_id);
-      }
-      const rebuiltSessions = summaryRebuild === "sessions"
-        ? this.rebuildTouchedSummarySessions(touchedSessions)
-        : sortedSessionIds(touchedSessions);
-      if (rawLogWasIndexed) this.recordRawLogState();
-      this.db.exec("COMMIT");
-      return { imported: eventsToAppend.length, skippedDuplicate, touchedSessions: rebuiltSessions };
-    } catch (error) {
-      let failure = error;
-      try {
-        this.db.exec("ROLLBACK");
-      } catch (rollbackError) {
-        failure = new AggregateError([error, rollbackError], "Bulk ingest rollback failed after indexing failure.");
-      }
-      this.indexError = failure instanceof Error ? failure.message : String(failure);
-      throw failure;
-    }
+    });
   }
 
   private readRawEventIds(): Set<string> {
@@ -729,6 +707,9 @@ export class LcmStorage {
       }
     }
 
+    this.db.exec("INSERT INTO event_fts(event_fts) VALUES('optimize')");
+    this.db.exec("INSERT INTO session_summary_fts(session_summary_fts) VALUES('optimize')");
+    this.db.exec("INSERT INTO summary_node_fts(summary_node_fts) VALUES('optimize')");
     this.db.exec("PRAGMA optimize");
     this.db.exec("VACUUM");
     return {
@@ -783,6 +764,8 @@ export class LcmStorage {
   health(): Health {
     if (!this.db) return this.rawHealth();
     try {
+      const graphNodeCounts = this.derivedGraphNodeCounts();
+      const graphEdgeCounts = this.derivedGraphEdgeCounts();
       return {
         home: this.config.home,
         raw_log_path: this.config.rawLogPath,
@@ -793,8 +776,8 @@ export class LcmStorage {
         ...(this.indexError ? { index_error: this.indexError } : {}),
         event_count: Number(this.scalar("SELECT COUNT(*) AS count FROM events")),
         session_count: Number(this.scalar("SELECT COUNT(*) AS count FROM sessions")),
-        graph_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_nodes")),
-        graph_edge_count: Number(this.scalar("SELECT COUNT(*) AS count FROM graph_edges")),
+        graph_node_count: sumCounts(graphNodeCounts),
+        graph_edge_count: sumCounts(graphEdgeCounts),
         summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
         summary_node_count: Number(this.scalar("SELECT COUNT(*) AS count FROM summary_nodes")),
       };
@@ -910,8 +893,6 @@ export class LcmStorage {
     this.db.prepare("DELETE FROM summary_nodes").run();
     this.db.prepare("DELETE FROM session_summaries").run();
     this.db.prepare("DELETE FROM file_refs").run();
-    this.db.prepare("DELETE FROM graph_edges").run();
-    this.db.prepare("DELETE FROM graph_nodes").run();
     this.db.prepare("DELETE FROM events").run();
     this.db.prepare("DELETE FROM sessions").run();
     this.db.prepare("DELETE FROM index_metadata").run();
@@ -1005,18 +986,8 @@ export class LcmStorage {
         GROUP BY source_type
         ORDER BY source_type
       `),
-      graph_nodes_by_kind: this.countMap(`
-        SELECT kind AS key, COUNT(*) AS count
-        FROM graph_nodes
-        GROUP BY kind
-        ORDER BY kind
-      `),
-      graph_edges_by_kind: this.countMap(`
-        SELECT kind AS key, COUNT(*) AS count
-        FROM graph_edges
-        GROUP BY kind
-        ORDER BY kind
-      `),
+      graph_nodes_by_kind: this.derivedGraphNodeCounts(),
+      graph_edges_by_kind: this.derivedGraphEdgeCounts(),
       session_summary_count: Number(this.scalar("SELECT COUNT(*) AS count FROM session_summaries")),
       sessions_with_session_summary: Number(this.scalar("SELECT COUNT(DISTINCT session_id) AS count FROM session_summaries")),
       sessions_with_summary_nodes: Number(this.scalar("SELECT COUNT(DISTINCT session_id) AS count FROM summary_nodes")),
@@ -1257,23 +1228,27 @@ export class LcmStorage {
             AND (?1 IS NULL OR cwd = ?1)
             AND (?2 IS NULL OR repo_root = ?2)
           ORDER BY timestamp DESC, rowid DESC
-          LIMIT 256
-        `).all(args.cwd ?? null, args.repoRoot ?? null) as Array<{ raw_json: string }>)
+          LIMIT ?3
+        `).all(args.cwd ?? null, args.repoRoot ?? null, MAX_OVERFLOW_SEARCH_REFERENCES) as Array<{ raw_json: string }>)
         .map((row) => decodePersistedEvent(row.raw_json))
       : readRawEvents(this.config.rawLogPath)
         .filter((event) => !args.cwd || event.cwd === args.cwd)
         .filter((event) => !args.repoRoot || event.repo_root === args.repoRoot)
-        .slice(-256)
-        .reverse();
+        .reverse()
+        .slice(0, MAX_OVERFLOW_SEARCH_REFERENCES);
     const matches: OverflowSearchMatch[] = [];
+    let scannedBytes = 0;
     for (const event of events) {
       const reference = overflowReferenceFromEvent(event);
       if (!reference) continue;
+      if (scannedBytes >= MAX_OVERFLOW_SEARCH_BYTES) break;
       try {
         const match = searchOverflowContent({
           overflowDir: this.config.overflowDir,
           reference,
           query: args.query,
+          maxScanBytes: MAX_OVERFLOW_SEARCH_BYTES - scannedBytes,
+          onRead: (bytes) => { scannedBytes += bytes; },
         });
         if (match) matches.push(match);
       } catch {
@@ -1379,36 +1354,27 @@ export class LcmStorage {
       ? Math.min(Math.max(Math.ceil(limit * 0.25), 8), Math.floor(limit / 2))
       : Math.max(0, Math.floor(limit / 4));
     const graphNodeLimit = Math.max(1, limit - summaryBudget);
-    const nodes = this.db.prepare(`
-      SELECT node_id, kind, session_id, event_id, turn_id, timestamp, cwd, repo_root, git_branch, label, metadata_json
-      FROM graph_nodes
+    const events = this.db.prepare(`
+      SELECT raw_json FROM events
       WHERE session_id = ?1
-      ORDER BY timestamp ASC,
-        CASE kind WHEN 'session' THEN 0 WHEN 'turn' THEN 1 WHEN 'checkpoint' THEN 2 ELSE 3 END,
-        node_id ASC
+      ORDER BY timestamp ASC, rowid ASC
       LIMIT ?2
-    `).all(sessionId, graphNodeLimit).map(rowToGraphNode);
+    `).all(sessionId, graphNodeLimit)
+      .map((row) => decodePersistedEvent((row as { raw_json: string }).raw_json));
+    const graph = buildFallbackGraph(events, graphNodeLimit);
+    const nodes = graph.nodes.map((node) => {
+      if (node.kind !== "checkpoint") return node;
+      const eventCount = Number(node.metadata.event_count ?? 0);
+      return { ...node, metadata: this.buildCheckpointMetadata(sessionId, eventCount) };
+    });
     const remainingNodeBudget = Math.max(0, limit - nodes.length);
     const rawSummaryNodes = remainingNodeBudget > 0
       ? this.getSummaryNodesForGraph(sessionId, remainingNodeBudget)
       : [];
     const summaryNodes = rawSummaryNodes.map(summaryNodeToGraphNode);
     nodes.push(...summaryNodes);
-    if (nodes.length === 0) return { session_id: sessionId, nodes: [], edges: [] };
-
     const nodeIds = new Set(nodes.map((node) => node.node_id));
-    const nodeIdList = [...nodeIds];
-    const placeholders = nodeIdList.map((_, index) => `?${index + 2}`).join(", ");
-    const edges = this.db.prepare(`
-      SELECT from_node_id, to_node_id, kind, session_id, position, created_at, metadata_json
-      FROM graph_edges
-      WHERE session_id = ?1
-        AND from_node_id IN (${placeholders})
-        AND to_node_id IN (${placeholders})
-      ORDER BY position ASC, created_at ASC, kind ASC
-      `).all(sessionId, ...nodeIdList)
-      .map(rowToGraphEdge)
-      .filter((edge) => nodeIds.has(edge.from_node_id) && nodeIds.has(edge.to_node_id));
+    const edges = graph.edges;
     const edgeKeys = new Set(edges.map((edge) => graphEdgeKey(edge)));
     for (const edge of rawSummaryNodes.flatMap((node) => summaryGraphEdges(node, nodeIds))) {
       const key = graphEdgeKey(edge);
@@ -1422,13 +1388,19 @@ export class LcmStorage {
   private getLatestCheckpoint(sessionId: string): GraphNode | undefined {
     if (!this.db) return undefined;
     const row = this.db.prepare(`
-      SELECT node_id, kind, session_id, event_id, turn_id, timestamp, cwd, repo_root, git_branch, label, metadata_json
-      FROM graph_nodes
-      WHERE session_id = ?1 AND kind = 'checkpoint'
-      ORDER BY timestamp DESC, node_id DESC
+      SELECT raw_json, position FROM (
+        SELECT raw_json, hook_event,
+          ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
+        FROM events
+        WHERE session_id = ?1
+      )
+      WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+      ORDER BY position DESC
       LIMIT 1
-    `).get(sessionId);
-    return row ? rowToGraphNode(row) : undefined;
+    `).get(sessionId) as { raw_json: string; position: number } | undefined;
+    if (!row) return undefined;
+    const event = decodePersistedEvent(row.raw_json);
+    return checkpointGraphNode(event, Number(row.position), this.buildCheckpointMetadata(sessionId, Number(row.position)));
   }
 
   getRecentContext(args: { sessionId?: string; cwd?: string; repoRoot?: string; limit?: number } = {}): RecentContext {
@@ -2039,6 +2011,71 @@ export class LcmStorage {
       .slice(0, clampLimit(limit, SUMMARY_NODE_SOURCE_EVENT_LIMIT, 20));
   }
 
+  private searchContextEvents(args: {
+    query: string;
+    cwd?: string;
+    sessionIds?: string[];
+    limit: number;
+  }): NormalizedEvent[] {
+    const sessionIds = [...new Set(args.sessionIds?.filter(Boolean) ?? [])];
+    const sessionFilter = sessionIds.length > 0 ? new Set(sessionIds) : undefined;
+    if (!this.db) {
+      return rankContextEvents(readRawEvents(this.config.rawLogPath)
+        .filter(isSummarySourceEvent)
+        .filter((event) => !isCodexLcmToolEvent(event))
+        .filter((event) => !args.cwd || event.cwd === args.cwd)
+        .filter((event) => !sessionFilter || sessionFilter.has(event.session_id))
+        .filter((event) => matchesQueryText(eventSignalText(event), args.query)), args.query)
+        .slice(0, args.limit);
+    }
+
+    const sessionClause = sessionIds.length > 0
+      ? `AND e.session_id IN (${sessionIds.map((_, index) => `?${index + 3}`).join(", ")})`
+      : "";
+    const limitParameter = sessionIds.length + 3;
+    const statement = this.db.prepare(`
+      SELECT e.raw_json
+      FROM event_fts f
+      JOIN events e ON e.event_id = f.event_id
+      WHERE event_fts MATCH ?1
+        AND (?2 IS NULL OR e.cwd = ?2)
+        AND e.hook_event IN ${SUMMARY_SOURCE_HOOKS}
+        ${sessionClause}
+      ORDER BY bm25(event_fts) ASC, e.timestamp DESC
+      LIMIT ?${limitParameter}
+    `);
+    let rows: unknown[] = [];
+    for (const ftsQuery of toFtsQueries(args.query)) {
+      rows = statement.all(ftsQuery, args.cwd ?? null, ...sessionIds, Math.max(args.limit * 10, 50));
+      if (rows.length > 0) break;
+    }
+    return rankContextEvents(rows
+      .map((row) => decodePersistedEvent((row as { raw_json: string }).raw_json))
+      .filter(isSummarySourceEvent)
+      .filter((event) => !isCodexLcmToolEvent(event)), args.query)
+      .slice(0, args.limit);
+  }
+
+  private getRecentContextEvents(sessionId: string, limit: number): NormalizedEvent[] {
+    if (!this.db) {
+      return readRawEvents(this.config.rawLogPath)
+        .filter((event) => event.session_id === sessionId)
+        .filter(isSummarySourceEvent)
+        .filter((event) => !isCodexLcmToolEvent(event))
+        .slice(-limit)
+        .reverse();
+    }
+    return this.db.prepare(`
+      SELECT raw_json FROM events
+      WHERE session_id = ?1
+        AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
+      ORDER BY timestamp DESC, rowid DESC
+      LIMIT ?2
+    `).all(sessionId, limit)
+      .map((row) => decodePersistedEvent((row as { raw_json: string }).raw_json))
+      .filter((event) => !isCodexLcmToolEvent(event));
+  }
+
   private getContextPlanEvents(sessionId: string, limit: number): NormalizedEvent[] {
     if (!this.db) {
       return readRawEvents(this.config.rawLogPath)
@@ -2077,6 +2114,8 @@ export class LcmStorage {
     const summaryCandidates = new Map<string, SessionMemorySummary>();
     const checkpointCandidates = new Map<string, GraphNode>();
     const summaryNodeCandidates = new Map<string, SummaryNode>();
+    const exactEventCandidates = new Map<string, NormalizedEvent>();
+    const recentEventCandidates = new Map<string, NormalizedEvent>();
     const query = args.query?.trim() ?? "";
     const candidateSessionIds = new Set(args.sessionIds ?? []);
     const explicitSessionIds = args.sessionIds ?? [];
@@ -2110,6 +2149,22 @@ export class LcmStorage {
         candidateSessionIds.add(sessionId);
       }
     };
+
+    if (query.length > 0) {
+      let events = this.searchContextEvents({
+        query,
+        cwd: args.cwd,
+        sessionIds: explicitSessionIds,
+        limit: 3,
+      });
+      if (events.length === 0 && args.cwd && explicitSessionIds.length === 0) {
+        events = this.searchContextEvents({ query, limit: 3 });
+      }
+      for (const event of events) {
+        exactEventCandidates.set(event.event_id, event);
+        candidateSessionIds.add(event.session_id);
+      }
+    }
 
     if (currentSessionId) {
       const added = addRankedSessionNodes(currentSessionId, 3);
@@ -2169,6 +2224,21 @@ export class LcmStorage {
       for (const session of sessions) candidateSessionIds.add(session.session_id);
     }
 
+    const recentSessionIds = currentSessionId
+      ? [currentSessionId]
+      : explicitSessionIds.length > 0
+        ? explicitSessionIds
+        : query.length === 0
+          ? [...candidateSessionIds].slice(0, 1)
+          : [];
+    for (const sessionId of recentSessionIds) {
+      for (const event of this.getRecentContextEvents(sessionId, 2)) {
+        if (!exactEventCandidates.has(event.event_id)) recentEventCandidates.set(event.event_id, event);
+        if (recentEventCandidates.size >= 4) break;
+      }
+      if (recentEventCandidates.size >= 4) break;
+    }
+
     for (const sessionId of candidateSessionIds) {
       const summary = this.getSessionMemorySummary(sessionId);
       if (summary) summaryCandidates.set(sessionId, summary);
@@ -2180,6 +2250,14 @@ export class LcmStorage {
     const sources: PackedContext["sources"] = [];
     let chars = lines.join("\n").length;
 
+    const eventItems = [
+      ...rankContextEvents([...exactEventCandidates.values()], query)
+        .map((event) => ({ event, text: contextEventToMarkdown(event, query, "Matching Event") })),
+      ...[...recentEventCandidates.values()]
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.event_id.localeCompare(a.event_id))
+        .map((event) => ({ event, text: contextEventToMarkdown(event, "", "Recent Event") })),
+    ].filter(({ text }) => text.length > 0);
+    const packedEventIds = new Set(eventItems.map(({ event }) => event.event_id));
     const summaryItems = [...summaryCandidates.values()]
       .sort((a, b) =>
         queryTermHitCount(summarySearchText(b), query) - queryTermHitCount(summarySearchText(a), query) ||
@@ -2193,7 +2271,8 @@ export class LcmStorage {
         const sourceNodes = node.source_type === "nodes"
           ? node.source_ids.flatMap((nodeId) => this.getSummaryNode(nodeId) ?? []).slice(0, 4)
           : [];
-        const sourceEvents = this.getSummaryNodeSourceEvents(node, query);
+        const sourceEvents = this.getSummaryNodeSourceEvents(node, query)
+          .filter((event) => !packedEventIds.has(event.event_id));
         const text = [
           summaryNodeToMarkdown(node),
           summaryNodeExpansionToMarkdown({
@@ -2204,6 +2283,23 @@ export class LcmStorage {
         const compactText = summaryNodeToCompactMarkdown(node, { sourceEvents, query });
         return { node, sourceEvents, text, compactText };
       });
+    const addEventItems = () => {
+      for (const { event, text } of eventItems) {
+        const remainingChars = budgetChars - chars;
+        if (remainingChars <= 80) continue;
+        const outputText = text.length > remainingChars
+          ? `${text.slice(0, Math.max(0, remainingChars - 18)).trimEnd()}\n...(truncated)\n`
+          : text;
+        lines.push(outputText);
+        chars += outputText.length;
+        sources.push({
+          kind: event.hook_event === "Note" ? "note" : "event",
+          session_id: event.session_id,
+          event_id: event.event_id,
+          timestamp: event.timestamp,
+        });
+      }
+    };
     const addCheckpointItems = () => {
       for (const { checkpoint, text } of checkpointItems) {
         if (chars + text.length > budgetChars) continue;
@@ -2264,6 +2360,7 @@ export class LcmStorage {
       }
     };
 
+    addEventItems();
     addSummaryNodeItems();
     addSummaryItems();
     addCheckpointItems();
@@ -2278,6 +2375,7 @@ export class LcmStorage {
   private initialize(): void {
     if (!this.db) return;
     const { backfillSessionMetadata } = initializeStorageSchema(this.db);
+    this.backfillExistingEventMetadata();
     if (backfillSessionMetadata) this.backfillExistingSessionMetadata();
   }
 
@@ -2359,107 +2457,12 @@ export class LcmStorage {
         eventSearchText(event),
       );
     }
-    const eventCount = Number(this.db.prepare("SELECT event_count FROM sessions WHERE session_id = ?1").get(event.session_id)?.event_count ?? 1);
-    const currentRow = this.db.prepare("SELECT rowid FROM events WHERE event_id = ?1").get(event.event_id) as { rowid?: number } | undefined;
-    this.indexGraphForEvent(event, eventCount, Number(currentRow?.rowid ?? 0));
     this.indexFileRefsForEvent(event);
     const summaryTouched = isSummarySourceEvent(event);
     if (summaryTouched && options.rebuildSummary && this.shouldRebuildSessionMemorySummary(event)) {
       this.rebuildSessionMemorySummary(event.session_id);
     }
     return { inserted: true, summaryTouched };
-  }
-
-  private indexGraphForEvent(event: NormalizedEvent, eventCount: number, currentRowId = 0): void {
-    if (!this.db) return;
-    const metadata = extractEventMetadata(event);
-    const sessionNode = sessionNodeId(event.session_id);
-    this.insertGraphNode({
-      node_id: sessionNode,
-      kind: "session",
-      session_id: event.session_id,
-      timestamp: event.timestamp,
-      cwd: event.cwd,
-      repo_root: event.repo_root,
-      git_branch: event.git_branch,
-      label: `Session ${event.session_id}`,
-      metadata: { event_count: eventCount },
-    });
-
-    const eventNode = eventNodeId(event.event_id);
-    this.insertGraphNode({
-      node_id: eventNode,
-      kind: "event",
-      session_id: event.session_id,
-      event_id: event.event_id,
-      turn_id: metadata.turn_id,
-      timestamp: event.timestamp,
-      cwd: event.cwd,
-      repo_root: event.repo_root,
-      git_branch: event.git_branch,
-      label: `${event.hook_event} ${event.timestamp}`,
-      metadata: {
-        hook_event: event.hook_event,
-        tool_name: event.tool_name,
-        turn_id: metadata.turn_id,
-        tool_use_id: metadata.tool_use_id,
-      },
-    });
-
-    if (metadata.turn_id) {
-      const turnNode = turnNodeId(event.session_id, metadata.turn_id);
-      this.insertGraphNode({
-        node_id: turnNode,
-        kind: "turn",
-        session_id: event.session_id,
-        turn_id: metadata.turn_id,
-        timestamp: event.timestamp,
-        cwd: event.cwd,
-        repo_root: event.repo_root,
-        git_branch: event.git_branch,
-        label: `Turn ${metadata.turn_id}`,
-        metadata: { turn_id: metadata.turn_id },
-      });
-      this.insertGraphEdge(sessionNode, turnNode, "contains", event.session_id, eventCount, event.timestamp);
-      this.insertGraphEdge(turnNode, eventNode, "contains", event.session_id, eventCount, event.timestamp);
-    } else {
-      this.insertGraphEdge(sessionNode, eventNode, "contains", event.session_id, eventCount, event.timestamp);
-    }
-
-    const previous = this.db.prepare(`
-      SELECT event_id FROM events
-      WHERE session_id = ?1
-        AND event_id <> ?2
-        AND (?3 <= 0 OR rowid < ?3)
-      ORDER BY timestamp DESC, rowid DESC
-      LIMIT 1
-    `).get(event.session_id, event.event_id, currentRowId) as { event_id?: string } | undefined;
-    if (previous?.event_id) {
-      this.insertGraphEdge(eventNodeId(previous.event_id), eventNode, "next", event.session_id, eventCount, event.timestamp);
-    }
-
-    if (event.hook_event === "PostToolUse" && metadata.tool_use_id) {
-      const preTool = this.db.prepare(`
-        SELECT event_id FROM events
-        WHERE session_id = ?1
-          AND event_id <> ?2
-          AND hook_event = 'PreToolUse'
-          AND tool_use_id = ?3
-          AND (?4 <= 0 OR rowid < ?4)
-        ORDER BY timestamp DESC, rowid DESC
-        LIMIT 1
-      `).get(event.session_id, event.event_id, metadata.tool_use_id, currentRowId) as { event_id?: string } | undefined;
-      if (preTool?.event_id) {
-        this.insertGraphEdge(eventNodeId(preTool.event_id), eventNode, "tool_result", event.session_id, eventCount, event.timestamp, {
-          tool_use_id: metadata.tool_use_id,
-          tool_name: event.tool_name,
-        });
-      }
-    }
-
-    if (event.hook_event === "PreCompact" || eventCount % CHECKPOINT_INTERVAL === 0) {
-      this.insertCheckpoint(event, eventCount);
-    }
   }
 
   private indexFileRefsForEvent(event: NormalizedEvent): void {
@@ -2496,47 +2499,36 @@ export class LcmStorage {
     }
   }
 
-  private insertCheckpoint(event: NormalizedEvent, eventCount: number): void {
-    if (!this.db) return;
-    const nodeId = checkpointNodeId(event.session_id, eventCount);
-    const metadata = this.buildCheckpointMetadata(event.session_id, eventCount);
-    this.insertGraphNode({
-      node_id: nodeId,
-      kind: "checkpoint",
-      session_id: event.session_id,
-      timestamp: event.timestamp,
-      cwd: event.cwd,
-      repo_root: event.repo_root,
-      git_branch: event.git_branch,
-      label: `Checkpoint after ${eventCount} events`,
-      metadata,
-    });
-    this.insertGraphEdge(sessionNodeId(event.session_id), nodeId, "checkpoint", event.session_id, eventCount, event.timestamp, {
-      event_count: eventCount,
-      trigger_event_id: event.event_id,
-      trigger_hook_event: event.hook_event,
-    });
-  }
-
   private buildCheckpointMetadata(sessionId: string, eventCount: number): Record<string, unknown> {
     if (!this.db) return { event_count: eventCount };
     const counts = this.db.prepare(`
+      WITH ordered AS (
+        SELECT hook_event, ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
+        FROM events
+        WHERE session_id = ?1
+      )
       SELECT hook_event, COUNT(*) AS count
-      FROM events
-      WHERE session_id = ?1
+      FROM ordered
+      WHERE position <= ?2
       GROUP BY hook_event
       ORDER BY hook_event ASC
-    `).all(sessionId).map((row) => ({
+    `).all(sessionId, eventCount).map((row) => ({
       hook_event: String((row as { hook_event: string }).hook_event),
       count: Number((row as { count: number }).count),
     }));
     const recent = this.db.prepare(`
+      WITH ordered AS (
+        SELECT event_id, timestamp, hook_event,
+          ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
+        FROM events
+        WHERE session_id = ?1
+      )
       SELECT event_id, timestamp, hook_event
-      FROM events
-      WHERE session_id = ?1
-      ORDER BY timestamp DESC, rowid DESC
+      FROM ordered
+      WHERE position <= ?2
+      ORDER BY position DESC
       LIMIT 5
-    `).all(sessionId).map((row) => ({
+    `).all(sessionId, eventCount).map((row) => ({
       event_id: String((row as { event_id: string }).event_id),
       timestamp: String((row as { timestamp: string }).timestamp),
       hook_event: String((row as { hook_event: string }).hook_event),
@@ -2548,68 +2540,34 @@ export class LcmStorage {
     };
   }
 
-  private insertGraphNode(node: GraphNode): void {
+  private backfillExistingEventMetadata(): void {
     if (!this.db) return;
-    this.db.prepare(`
-      INSERT INTO graph_nodes
-        (node_id, kind, session_id, event_id, turn_id, timestamp, cwd, repo_root, git_branch, label, metadata_json)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-      ON CONFLICT(node_id) DO UPDATE SET
-        timestamp = CASE WHEN excluded.timestamp < graph_nodes.timestamp THEN excluded.timestamp ELSE graph_nodes.timestamp END,
-        cwd = excluded.cwd,
-        repo_root = COALESCE(excluded.repo_root, graph_nodes.repo_root),
-        git_branch = COALESCE(excluded.git_branch, graph_nodes.git_branch),
-        label = excluded.label,
-        metadata_json = excluded.metadata_json
-    `).run(
-      node.node_id,
-      node.kind,
-      node.session_id,
-      node.event_id ?? null,
-      node.turn_id ?? null,
-      node.timestamp,
-      node.cwd,
-      node.repo_root ?? null,
-      node.git_branch ?? null,
-      node.label,
-      JSON.stringify(node.metadata),
-    );
-  }
-
-  private insertGraphEdge(
-    fromNodeId: string,
-    toNodeId: string,
-    kind: string,
-    sessionId: string,
-    position: number,
-    createdAt: string,
-    metadata: Record<string, unknown> = {},
-  ): void {
-    if (!this.db) return;
-    if (fromNodeId === toNodeId || (!KNOWN_ACYCLIC_EDGE_KINDS.has(kind) && this.wouldCreateCycle(fromNodeId, toNodeId))) {
-      throw new Error(`Refusing to insert graph edge that would create a cycle: ${fromNodeId} -> ${toNodeId}`);
+    const marker = this.db.prepare("SELECT value FROM index_metadata WHERE key = ?1")
+      .get(EVENT_METADATA_BACKFILL_KEY) as { value?: string } | undefined;
+    if (marker?.value === "1") return;
+    const rows = this.db.prepare("SELECT raw_json FROM events").all() as Array<{ raw_json: string }>;
+    const update = this.db.prepare("UPDATE events SET turn_id = ?1, tool_use_id = ?2 WHERE event_id = ?3");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const event = decodePersistedEvent(row.raw_json);
+        const metadata = extractEventMetadata(event);
+        update.run(metadata.turn_id ?? null, metadata.tool_use_id ?? null, event.event_id);
+      }
+      this.db.prepare(`
+        INSERT INTO index_metadata (key, value)
+        VALUES (?1, '1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(EVENT_METADATA_BACKFILL_KEY);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the metadata backfill failure.
+      }
+      throw error;
     }
-    this.db.prepare(`
-      INSERT OR IGNORE INTO graph_edges
-        (from_node_id, to_node_id, kind, session_id, position, created_at, metadata_json)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-    `).run(fromNodeId, toNodeId, kind, sessionId, position, createdAt, JSON.stringify(metadata));
-  }
-
-  private wouldCreateCycle(fromNodeId: string, toNodeId: string): boolean {
-    if (!this.db) return false;
-    if (fromNodeId === toNodeId) return true;
-    const row = this.db.prepare(`
-      WITH RECURSIVE reachable(node_id) AS (
-        SELECT to_node_id FROM graph_edges WHERE from_node_id = ?1
-        UNION
-        SELECT graph_edges.to_node_id
-        FROM graph_edges
-        JOIN reachable ON graph_edges.from_node_id = reachable.node_id
-      )
-      SELECT 1 AS found FROM reachable WHERE node_id = ?2 LIMIT 1
-    `).get(toNodeId, fromNodeId);
-    return row !== undefined;
   }
 
   private backfillExistingSessionMetadata(): void {
@@ -2660,45 +2618,6 @@ export class LcmStorage {
         this.db.exec("ROLLBACK");
       } catch {
         // Preserve the original backfill failure.
-      }
-      this.indexError = error instanceof Error ? error.message : String(error);
-    }
-  }
-
-  private backfillGraph(): void {
-    if (!this.db) return;
-    const rows = this.db.prepare(`
-      SELECT e.rowid AS rowid, e.raw_json
-      FROM events e
-      LEFT JOIN graph_nodes n ON n.event_id = e.event_id
-      WHERE n.node_id IS NULL
-      ORDER BY e.timestamp ASC, e.rowid ASC
-      LIMIT 10000
-    `).all();
-    if (rows.length === 0) return;
-
-    const counts = new Map<string, number>();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      for (const row of rows) {
-        const event = decodePersistedEvent((row as { raw_json: string }).raw_json);
-        const metadata = extractEventMetadata(event);
-        const count = (counts.get(event.session_id) ?? Number(this.db.prepare(`
-          SELECT COUNT(*) AS count FROM graph_nodes WHERE session_id = ?1 AND kind = 'event'
-        `).get(event.session_id)?.count ?? 0)) + 1;
-        counts.set(event.session_id, count);
-        this.db.prepare(`
-          UPDATE events SET turn_id = ?1, tool_use_id = ?2 WHERE event_id = ?3
-        `).run(metadata.turn_id ?? null, metadata.tool_use_id ?? null, event.event_id);
-        this.indexGraphForEvent(event, count, Number((row as { rowid: number }).rowid));
-      }
-      for (const sessionId of counts.keys()) this.rebuildSessionMemorySummary(sessionId);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      try {
-        this.db.exec("ROLLBACK");
-      } catch {
-        // Ignore rollback failures; the original backfill error is more useful.
       }
       this.indexError = error instanceof Error ? error.message : String(error);
     }
@@ -2812,6 +2731,62 @@ export class LcmStorage {
     return typeof row.value === "string" && row.value.length > 0 ? row.value : null;
   }
 
+  private derivedGraphNodeCounts(): Record<string, number> {
+    return this.countMap(`
+      WITH ordered_events AS (
+        SELECT hook_event,
+          ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY timestamp, rowid) AS position
+        FROM events
+      ), counts AS (
+        SELECT 'session' AS key, COUNT(*) AS count FROM sessions
+        UNION ALL
+        SELECT 'turn', COUNT(*) FROM (
+          SELECT 1 FROM events WHERE turn_id IS NOT NULL GROUP BY session_id, turn_id
+        )
+        UNION ALL
+        SELECT 'event', COUNT(*) FROM events
+        UNION ALL
+        SELECT 'checkpoint', COUNT(*) FROM ordered_events
+        WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+      )
+      SELECT key, count FROM counts WHERE count > 0 ORDER BY key
+    `);
+  }
+
+  private derivedGraphEdgeCounts(): Record<string, number> {
+    return this.countMap(`
+      WITH ordered_events AS (
+        SELECT rowid AS event_rowid, session_id, hook_event, tool_use_id, timestamp,
+          ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY timestamp, rowid) AS position
+        FROM events
+      ), counts AS (
+        SELECT 'contains' AS key,
+          (SELECT COUNT(*) FROM events) +
+          (SELECT COUNT(*) FROM (
+            SELECT 1 FROM events WHERE turn_id IS NOT NULL GROUP BY session_id, turn_id
+          )) AS count
+        UNION ALL
+        SELECT 'next', COALESCE(SUM(MAX(event_count - 1, 0)), 0) FROM sessions
+        UNION ALL
+        SELECT 'tool_result', COUNT(*) FROM ordered_events post
+        WHERE post.hook_event = 'PostToolUse' AND post.tool_use_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM events pre
+            WHERE pre.session_id = post.session_id
+              AND pre.hook_event = 'PreToolUse'
+              AND pre.tool_use_id = post.tool_use_id
+              AND (pre.timestamp < post.timestamp OR (pre.timestamp = post.timestamp AND pre.rowid < post.event_rowid))
+          )
+        UNION ALL
+        SELECT 'checkpoint', COUNT(*) FROM ordered_events
+        WHERE hook_event = 'PreCompact' OR position % ${CHECKPOINT_INTERVAL} = 0
+        UNION ALL
+        SELECT 'summary_source', COALESCE(SUM(json_array_length(source_ids_json)), 0) FROM summary_nodes
+      )
+      SELECT key, count FROM counts WHERE count > 0 ORDER BY key
+    `);
+  }
+
   private countMap(sql: string): Record<string, number> {
     if (!this.db) return {};
     const rows = this.db.prepare(sql).all() as Array<{ key: unknown; count: unknown }>;
@@ -2908,22 +2883,18 @@ export class LcmStorage {
     const nextIds = new Set(nodes.map((node) => node.node_id));
     const deleteFts = this.db.prepare("DELETE FROM summary_node_fts WHERE node_id = ?1");
     const deleteNode = this.db.prepare("DELETE FROM summary_nodes WHERE node_id = ?1");
-    const deleteEdges = this.db.prepare("DELETE FROM graph_edges WHERE session_id = ?1 AND kind = 'summary_source' AND (from_node_id = ?2 OR to_node_id = ?2)");
     for (const nodeId of existing.keys()) {
       if (nextIds.has(nodeId)) continue;
       deleteFts.run(nodeId);
       deleteNode.run(nodeId);
-      deleteEdges.run(sessionId, nodeId);
     }
     for (const node of nodes) {
       const existingVersion = existing.get(node.node_id);
       if (existingVersion === SUMMARY_NODE_VERSION) continue;
       if (existingVersion !== undefined) {
         deleteFts.run(node.node_id);
-        deleteEdges.run(sessionId, node.node_id);
       }
       this.insertSummaryNode(node);
-      this.insertSummarySourceEdges(node);
     }
   }
 
@@ -2983,22 +2954,6 @@ export class LcmStorage {
     );
   }
 
-  private insertSummarySourceEdges(node: SummaryNode): void {
-    for (const [index, sourceId] of node.source_ids.entries()) {
-      this.insertGraphEdge(
-        node.node_id,
-        node.source_type === "events" ? eventNodeId(sourceId) : sourceId,
-        "summary_source",
-        node.session_id,
-        index,
-        node.created_at,
-        {
-          depth: node.depth,
-          source_type: node.source_type,
-        },
-      );
-    }
-  }
 
   private getAllSummarySourceEventsForSession(sessionId: string): NormalizedEvent[] {
     if (!this.db) return [];
@@ -3043,6 +2998,10 @@ export class LcmStorage {
       .sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.event_id.localeCompare(b.event_id));
     return events.some(isSummarySourceEvent) ? events : [];
   }
+}
+
+function sumCounts(counts: Record<string, number>): number {
+  return Object.values(counts).reduce((total, count) => total + count, 0);
 }
 
 export function createStorage(options: StorageOptions = {}): LcmStorage {
@@ -3326,6 +3285,34 @@ function searchMatchText(kind: SessionSearchMatch["kind"], value: unknown): stri
   }
 }
 
+function rankContextEvents(events: NormalizedEvent[], query: string): NormalizedEvent[] {
+  const phrase = compactWhitespace(query).toLowerCase();
+  return [...events].sort((a, b) => {
+    const aText = eventSignalText(a);
+    const bText = eventSignalText(b);
+    const exactDifference = Number(bText.toLowerCase().includes(phrase)) - Number(aText.toLowerCase().includes(phrase));
+    return exactDifference ||
+      queryTermHitCount(bText, query) - queryTermHitCount(aText, query) ||
+      b.timestamp.localeCompare(a.timestamp) ||
+      b.event_id.localeCompare(a.event_id);
+  });
+}
+
+function contextEventToMarkdown(event: NormalizedEvent, query: string, heading: string): string {
+  const signal = eventSignalText(event);
+  if (signal.length === 0) return "";
+  const snippet = query.length > 0 ? bestMatchSnippet(signal, query, 280) : truncateSnippet(signal, 280);
+  return [
+    `## ${event.timestamp} ${heading}`,
+    `session: ${event.session_id}`,
+    `event: ${event.event_id}`,
+    HISTORICAL_SOURCE_TEXT_NOTICE,
+    quoteHistoricalText(snippet),
+    `hook: ${event.hook_event}`,
+    "",
+  ].join("\n");
+}
+
 function compareSearchMatches(a: SessionSearchMatch, b: SessionSearchMatch): number {
   return b.score - a.score ||
     searchMatchKindWeight(b.kind) - searchMatchKindWeight(a.kind) ||
@@ -3350,7 +3337,19 @@ function bestMatchSnippet(text: string, query: string, maxChars = 220): string {
     : scoredLines;
   const bestLine = candidates
     .sort((a, b) => b.hits - a.hits || a.index - b.index)[0]?.line ?? compactText;
-  return truncateSnippet(bestLine, maxChars);
+  return queryFocusedSnippet(bestLine, query, maxChars);
+}
+
+function queryFocusedSnippet(text: string, query: string, maxChars: number): string {
+  const compact = compactWhitespace(text);
+  if (compact.length <= maxChars) return compact;
+  const phrase = compactWhitespace(query).toLowerCase();
+  const matchIndex = compact.toLowerCase().indexOf(phrase);
+  if (matchIndex < 0 || maxChars < 10) return truncateSnippet(compact, maxChars);
+  const contentLength = maxChars - 6;
+  const start = Math.max(0, Math.min(matchIndex - Math.floor(contentLength / 3), compact.length - contentLength));
+  const end = Math.min(compact.length, start + contentLength);
+  return `${start > 0 ? "..." : ""}${compact.slice(start, end)}${end < compact.length ? "..." : ""}`;
 }
 
 function truncateSnippet(text: string, maxChars: number): string {
@@ -3746,15 +3745,37 @@ function checkpointNodeId(sessionId: string, eventCount: number): string {
   return `checkpoint:${sessionId}:${eventCount}`;
 }
 
+function checkpointGraphNode(event: NormalizedEvent, eventCount: number, metadata: Record<string, unknown>): GraphNode {
+  return {
+    node_id: checkpointNodeId(event.session_id, eventCount),
+    kind: "checkpoint",
+    session_id: event.session_id,
+    timestamp: event.timestamp,
+    cwd: event.cwd,
+    repo_root: event.repo_root,
+    git_branch: event.git_branch,
+    label: `Checkpoint after ${eventCount} events`,
+    metadata,
+  };
+}
+
 function buildFallbackGraph(events: NormalizedEvent[], limit: number): SessionGraph {
   const sessionId = events[0]?.session_id ?? "";
   const nodes: GraphNode[] = [];
   const edges: GraphEdge[] = [];
   const seen = new Set<string>();
+  const edgeKeys = new Set<string>();
+  const preToolEvents = new Map<string, NormalizedEvent>();
   const addNode = (node: GraphNode) => {
     if (seen.has(node.node_id) || nodes.length >= limit) return;
     seen.add(node.node_id);
     nodes.push(node);
+  };
+  const addEdge = (edge: GraphEdge) => {
+    const key = graphEdgeKey(edge);
+    if (edgeKeys.has(key)) return;
+    edgeKeys.add(key);
+    edges.push(edge);
   };
 
   for (const [index, event] of events.entries()) {
@@ -3785,7 +3806,7 @@ function buildFallbackGraph(events: NormalizedEvent[], limit: number): SessionGr
         label: `Turn ${metadata.turn_id}`,
         metadata: { fallback: true, turn_id: metadata.turn_id },
       });
-      edges.push(fallbackEdge(sessionNode, parentNode, "contains", event.session_id, index, event.timestamp));
+      addEdge(fallbackEdge(sessionNode, parentNode, "contains", event.session_id, index, event.timestamp));
     }
     const eventNode = eventNodeId(event.event_id);
     addNode({
@@ -3799,11 +3820,29 @@ function buildFallbackGraph(events: NormalizedEvent[], limit: number): SessionGr
       repo_root: event.repo_root,
       git_branch: event.git_branch,
       label: `${event.hook_event} ${event.timestamp}`,
-      metadata: { fallback: true, hook_event: event.hook_event },
+      metadata: {
+        fallback: true,
+        hook_event: event.hook_event,
+        tool_name: event.tool_name,
+        turn_id: metadata.turn_id,
+        tool_use_id: metadata.tool_use_id,
+      },
     });
-    edges.push(fallbackEdge(parentNode, eventNode, "contains", event.session_id, index, event.timestamp));
+    addEdge(fallbackEdge(parentNode, eventNode, "contains", event.session_id, index, event.timestamp));
     if (index > 0) {
-      edges.push(fallbackEdge(eventNodeId(events[index - 1].event_id), eventNode, "next", event.session_id, index, event.timestamp));
+      addEdge(fallbackEdge(eventNodeId(events[index - 1].event_id), eventNode, "next", event.session_id, index, event.timestamp));
+    }
+    if (event.hook_event === "PreToolUse" && metadata.tool_use_id) {
+      preToolEvents.set(metadata.tool_use_id, event);
+    } else if (event.hook_event === "PostToolUse" && metadata.tool_use_id) {
+      const preTool = preToolEvents.get(metadata.tool_use_id);
+      if (preTool) addEdge(fallbackEdge(eventNodeId(preTool.event_id), eventNode, "tool_result", event.session_id, index, event.timestamp));
+    }
+    const eventCount = index + 1;
+    if (event.hook_event === "PreCompact" || eventCount % CHECKPOINT_INTERVAL === 0) {
+      const checkpoint = checkpointGraphNode(event, eventCount, { fallback: true, event_count: eventCount });
+      addNode(checkpoint);
+      addEdge(fallbackEdge(sessionNode, checkpoint.node_id, "checkpoint", event.session_id, eventCount, event.timestamp));
     }
   }
 

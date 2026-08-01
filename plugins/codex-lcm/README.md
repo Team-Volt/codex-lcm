@@ -67,7 +67,7 @@ can still be recovered through `lcm_pack_context`.
 
 Standard recall workflow:
 
-- `lcm_grep`: find relevant sessions by searching summary nodes, session summaries, and high-signal events. Set `contentScope: "overflow"` or `"both"` to scan recent sanitized overflow payloads in full, subject to the 8 MiB input safety limit.
+- `lcm_grep`: find relevant sessions by searching summary nodes, session summaries, and high-signal events. Set `contentScope: "overflow"` or `"both"` to scan sanitized overflow payloads in full, subject to the 8 MiB input safety limit.
 - `lcm_describe`: inspect a session, summary node, or indexed file reference with compact source counts. Overflow results use stable `overflow:<sha256>` IDs; pass `offset` and `maxBytes` to page their content in chunks of at most 512 KiB. Set `includeLineage: true` when exact source ID arrays are needed.
 - `lcm_expand`: expand one summary node into bounded source summary nodes and high-signal source events.
 - `lcm_expand_query`: answer a focused retrieval need by searching matching summary nodes and recursively expanding their source lineage into bounded evidence. The default budget is 2000 tokens. Use `overview: true` for broad, source-rich lineage views. `sourceLimit` is per matched node/source expansion, and tight budgets reserve room for a focused source-event excerpt when one exists.
@@ -75,18 +75,17 @@ Standard recall workflow:
 
 Diagnostics and lower-level tools:
 
-- `lcm_health`
 - `lcm_stats`
 - `lcm_context_plan`
 - `lcm_current_session`
 - `lcm_list_sessions`
 - `lcm_usage`
-- `lcm_search_sessions`
 - `lcm_get_session`
-- `lcm_get_session_summary`
 - `lcm_get_session_graph`
 - `lcm_get_recent_context`
 - `lcm_record_note`
+
+Compatibility tools remain callable but are not part of the standard workflow: `lcm_health` (use `lcm_stats`), `lcm_search_sessions` (use `lcm_grep`), and `lcm_get_session_summary` (use `lcm_describe`).
 
 ## Installing
 
@@ -129,7 +128,7 @@ Project and git data are metadata only. Search and retrieval are session-first a
 
 ## DAG And Long Sessions
 
-SQLite stores a derived DAG alongside FTS:
+`lcm_get_session_graph` derives a bounded DAG on demand from indexed events and summary lineage; it does not persist a duplicate graph projection:
 
 - Session nodes anchor each Codex session.
 - Turn nodes group events with the same `turn_id`.
@@ -138,7 +137,7 @@ SQLite stores a derived DAG alongside FTS:
 - Typed edges include `contains`, `next`, `tool_result`, `checkpoint`, and
   `summary_source`.
 
-Unknown edge kinds use recursive cycle checks. Known internal edge kinds (`contains`, `next`, `tool_result`, `checkpoint`, and `summary_source`) skip that expensive check because they are derived from append-only session order or summary-source lineage. The graph is derived from raw events and can be rebuilt; `events.jsonl` remains the source of truth.
+The graph is deterministic and rebuildable; `events.jsonl` remains the source of truth.
 
 SQLite also stores deterministic extractive summaries in `session_summaries` and
 `session_summary_fts`. A summary contains a title, overview, topics, key user
@@ -156,7 +155,7 @@ The summary-node layer adds a second derived index:
 
 - D0 summary nodes summarize bounded chunks of high-signal events.
 - D1 and deeper summary nodes summarize lower-depth summary nodes.
-- `summary_source` edges are persisted and connect summary nodes back to their child nodes or raw event nodes.
+- `summary_source` edges are derived from stored source IDs when graph slices are read.
 - `summary_node_fts` lets retrieval search the summary DAG before falling back to raw event FTS.
 
 This mirrors the lossless-context pattern used by systems such as lossless-claw
@@ -172,7 +171,7 @@ summary text; empty completion markers are still stored and counted.
 
 Use `lcm_stats` or `node bin/codex-lcm stats --json` to inspect aggregate index
 shape without reading raw transcript text. The stats output includes summary
-nodes by depth, summary source types, hook-event counts, graph node and edge
+nodes by depth, summary source types, hook-event counts, derived graph node and edge
 counts, freshness timestamps, max summary depth, `session_summary_count`,
 `sessions_with_session_summary`, and the number of sessions with summary nodes.
 The legacy `summary_count` field is kept as an alias for session summaries, not

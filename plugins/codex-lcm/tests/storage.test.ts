@@ -6,6 +6,7 @@ import test from "node:test";
 import { Worker } from "node:worker_threads";
 
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
+import { readRawLog } from "../src/raw-log.ts";
 import { sha256 } from "../src/redact.ts";
 import { createStorage } from "../src/storage.ts";
 import { clearDerivedSummaries, readJsonl, tempHome } from "./helpers.ts";
@@ -258,6 +259,22 @@ test("writable storage preserves indexed rows and replays valid events when raw 
   assert.deepEqual(reopened.searchSessions({ query: "complete raw evidence", limit: 5 }).map((match) => match.session_id), [
     "partial-raw-session",
   ]);
+
+  const afterPartial = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "partial-followup-session",
+      cwd: "/tmp/partial-followup",
+      prompt: "preserve this event after a partial JSONL tail",
+    }),
+    env: {},
+    now: () => new Date("2026-06-09T12:00:02.000Z"),
+  });
+  reopened.ingest(afterPartial);
+
+  const rawLog = readRawLog(path.join(home, "events.jsonl"));
+  assert.deepEqual(rawLog.events.map((event) => event.event_id), [rawOnly.event_id, afterPartial.event_id]);
+  assert.equal(rawLog.malformedLineCount, 1);
 
   reopened.close();
 });
@@ -829,10 +846,80 @@ test("single ingest keeps a raw-durable event when SQLite indexing fails", () =>
   assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
   assert.match(storage.health().index_error ?? "", /forced single index failure/u);
 
+  storage.ingest(normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "single-index-recovery-session",
+      cwd: "/tmp/single-index-failure",
+      prompt: "trigger same-process index recovery",
+    }),
+    env: {},
+    now,
+  }));
+
+  assert.equal(storage.health().event_count, 2);
+  assert.deepEqual(storage.searchSessions({ query: "durable hook survives", limit: 5 }).map((match) => match.session_id), [
+    "single-index-failure-session",
+  ]);
+
   storage.close();
 });
 
-test("bulk ingest surfaces SQLite lock timeouts instead of reporting a successful no-op", () => {
+test("single ingest surfaces a raw-log fsync failure", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "single-fsync-failure-session",
+      cwd: "/tmp/single-fsync-failure",
+      prompt: "do not acknowledge an event before its raw bytes are durable",
+    }),
+    env: {},
+    now,
+  });
+  const originalFsyncSync = fs.fsyncSync;
+  fs.fsyncSync = () => {
+    throw new Error("forced raw fsync failure");
+  };
+
+  try {
+    assert.throws(() => storage.ingest(event), /forced raw fsync failure/u);
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+    storage.close();
+  }
+});
+
+test("raw-log lock setup failures do not leave a stale lock", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({
+      session_id: "raw-lock-setup-failure-session",
+      cwd: "/tmp/raw-lock-setup-failure",
+      prompt: "lock setup must clean up after itself",
+    }),
+    env: {},
+    now,
+  });
+  const originalWriteFileSync = fs.writeFileSync;
+  fs.writeFileSync = (...args) => {
+    if (typeof args[0] === "number") throw new Error("forced lock token write failure");
+    return originalWriteFileSync(...args);
+  };
+
+  try {
+    assert.throws(() => storage.ingest(event), /forced lock token write failure/u);
+    assert.equal(fs.existsSync(path.join(home, "events.jsonl.lock")), false);
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+    storage.close();
+  }
+});
+
+test("bulk ingest persists raw JSONL before surfacing a SQLite lock timeout", () => {
   const home = tempHome();
   const storage = createStorage({ home });
   const blocker = new DatabaseSync(path.join(home, "index.sqlite"));
@@ -850,7 +937,7 @@ test("bulk ingest surfaces SQLite lock timeouts instead of reporting a successfu
   blocker.exec("BEGIN IMMEDIATE");
   try {
     assert.throws(() => storage.ingestMany([event]), /database is locked/iu);
-    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+    assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
   } finally {
     blocker.exec("ROLLBACK");
     blocker.close();
@@ -858,7 +945,7 @@ test("bulk ingest surfaces SQLite lock timeouts instead of reporting a successfu
   }
 });
 
-test("single ingest surfaces SQLite lock timeouts before raw persistence", () => {
+test("single ingest keeps a raw-durable event when SQLite is locked", () => {
   const home = tempHome();
   const storage = createStorage({ home });
   const blocker = new DatabaseSync(path.join(home, "index.sqlite"));
@@ -875,8 +962,9 @@ test("single ingest surfaces SQLite lock timeouts before raw persistence", () =>
 
   blocker.exec("BEGIN IMMEDIATE");
   try {
-    assert.throws(() => storage.ingest(event), /database is locked/iu);
-    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+    assert.doesNotThrow(() => storage.ingest(event));
+    assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 1);
+    assert.match(storage.health().index_error ?? "", /database is locked/iu);
   } finally {
     blocker.exec("ROLLBACK");
     blocker.close();
@@ -975,6 +1063,111 @@ test("indexes large path-backed tool outputs as file references", () => {
   const described = storage.getFileRef(refs[0].file_ref_id);
   assert.deepEqual(described, refs[0]);
 
+  storage.close();
+});
+
+test("overflow search scans references older than the former fixed ceiling", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const overflowDir = path.join(home, "overflow");
+  fs.mkdirSync(overflowDir, { recursive: true });
+  const events = Array.from({ length: 257 }, (_, index) => {
+    const content = index === 0 ? "overflow-beyond-ceiling-needle" : `overflow filler ${index}`;
+    const hash = sha256(content);
+    const overflowPath = path.join(overflowDir, `${hash}.json`);
+    fs.writeFileSync(overflowPath, content);
+    return normalizeHookEvent({
+      hookEvent: "PostToolUse",
+      rawInput: JSON.stringify({
+        session_id: `overflow-ceiling-${index}`,
+        cwd: "/tmp/overflow-ceiling",
+        overflow_ref: {
+          sha256: hash,
+          byte_count: Buffer.byteLength(content),
+          sanitized_byte_count: Buffer.byteLength(content),
+          path: overflowPath,
+        },
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    });
+  });
+  storage.ingestMany(events);
+
+  const matches = storage.searchOverflow({ query: "overflow-beyond-ceiling-needle", limit: 1 });
+
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].session_id, "overflow-ceiling-0");
+  storage.close();
+});
+
+test("overflow search bounds verified bytes without charging invalid references", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const overflowDir = path.join(home, "overflow");
+  fs.mkdirSync(overflowDir, { recursive: true });
+  const needle = "overflow-budget-old-needle";
+  const needleHash = sha256(needle);
+  const needlePath = path.join(overflowDir, `${needleHash}.json`);
+  fs.writeFileSync(needlePath, needle);
+  const events = [normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: "overflow-budget-old",
+      cwd: "/tmp/overflow-budget",
+      overflow_ref: {
+        sha256: needleHash,
+        byte_count: Buffer.byteLength(needle),
+        sanitized_byte_count: Buffer.byteLength(needle),
+        path: needlePath,
+      },
+    }),
+    env: {},
+    now,
+  })];
+  for (let index = 1; index <= 5; index += 1) {
+    const hash = sha256(`missing overflow ${index}`);
+    events.push(normalizeHookEvent({
+      hookEvent: "PostToolUse",
+      rawInput: JSON.stringify({
+        session_id: `overflow-budget-${index}`,
+        cwd: "/tmp/overflow-budget",
+        overflow_ref: {
+          sha256: hash,
+          byte_count: 16 * 1024 * 1024,
+          sanitized_byte_count: 16 * 1024 * 1024,
+          path: path.join(overflowDir, `${hash}.json`),
+        },
+      }),
+      env: {},
+      now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, index)),
+    }));
+  }
+  storage.ingestMany(events);
+
+  assert.equal(storage.searchOverflow({ query: needle, limit: 1 })[0]?.session_id, "overflow-budget-old");
+
+  const filler = Buffer.alloc(16 * 1024 * 1024, "x");
+  const fillerHash = sha256(filler);
+  const fillerPath = path.join(overflowDir, `${fillerHash}.json`);
+  fs.writeFileSync(fillerPath, filler);
+  storage.ingestMany(Array.from({ length: 5 }, (_, index) => normalizeHookEvent({
+    hookEvent: "PostToolUse",
+    rawInput: JSON.stringify({
+      session_id: `overflow-budget-valid-${index}`,
+      cwd: "/tmp/overflow-budget",
+      overflow_ref: {
+        sha256: fillerHash,
+        byte_count: filler.length,
+        sanitized_byte_count: filler.length,
+        path: fillerPath,
+      },
+    }),
+    env: {},
+    now: () => new Date(Date.UTC(2026, 5, 9, 12, 0, 10 + index)),
+  })));
+
+  assert.deepEqual(storage.searchOverflow({ query: needle, limit: 1 }), []);
   storage.close();
 });
 
@@ -1252,9 +1445,14 @@ test("cleanup acquires the write lock before snapshotting searchable events", ()
 
   const beginIndex = calls.findIndex((sql) => sql === "BEGIN IMMEDIATE");
   const snapshotIndex = calls.findIndex((sql) => sql.includes("SELECT raw_json") && sql.includes("FROM events"));
+  const optimizeIndex = calls.findIndex((sql) => sql === "INSERT INTO event_fts(event_fts) VALUES('optimize')");
+  const vacuumIndex = calls.findIndex((sql) => sql === "VACUUM");
   assert.equal(beginIndex >= 0, true);
   assert.equal(snapshotIndex >= 0, true);
+  assert.equal(optimizeIndex >= 0, true);
+  assert.equal(vacuumIndex >= 0, true);
   assert.equal(beginIndex < snapshotIndex, true);
+  assert.equal(optimizeIndex < vacuumIndex, true);
 });
 
 test("raw fallback usage includes more than one page of sessions", () => {
@@ -2184,15 +2382,7 @@ async function runConcurrentIngestWriters(
     };
     const originalAppendFileSync = fs.appendFileSync;
     fs.appendFileSync = (...args) => {
-      if (args[0] === workerData.rawLogPath) {
-        signal(2);
-        while (Atomics.load(state, 2) < 2 && Atomics.load(state, 3) < 2) {
-          const version = Atomics.load(state, 4);
-          if (Atomics.load(state, 2) < 2 && Atomics.load(state, 3) < 2) {
-            Atomics.wait(state, 4, version);
-          }
-        }
-      }
+      if (args[0] === workerData.rawLogPath) signal(2);
       return originalAppendFileSync(...args);
     };
 

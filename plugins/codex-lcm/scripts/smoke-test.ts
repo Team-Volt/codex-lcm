@@ -47,7 +47,7 @@ try {
       id: 2,
       method: "tools/call",
       params: {
-        name: "lcm_health",
+        name: "lcm_stats",
         arguments: {},
       },
     },
@@ -56,31 +56,13 @@ try {
       id: 3,
       method: "tools/call",
       params: {
-        name: "lcm_search_sessions",
-        arguments: { query: "searchable", limit: 5 },
-      },
-    },
-    {
-      jsonrpc: "2.0",
-      id: 4,
-      method: "tools/call",
-      params: {
         name: "lcm_pack_context",
         arguments: { query: "searchable", budgetTokens: 120 },
       },
     },
     {
       jsonrpc: "2.0",
-      id: 5,
-      method: "tools/call",
-      params: {
-        name: "lcm_get_session_summary",
-        arguments: { sessionId: "smoke-session" },
-      },
-    },
-    {
-      jsonrpc: "2.0",
-      id: 6,
+      id: 4,
       method: "tools/call",
       params: {
         name: "lcm_get_session_graph",
@@ -89,7 +71,7 @@ try {
     },
     {
       jsonrpc: "2.0",
-      id: 7,
+      id: 5,
       method: "tools/call",
       params: {
         name: "lcm_pack_context",
@@ -98,7 +80,7 @@ try {
     },
     {
       jsonrpc: "2.0",
-      id: 8,
+      id: 6,
       method: "tools/call",
       params: {
         name: "lcm_grep",
@@ -107,7 +89,7 @@ try {
     },
     {
       jsonrpc: "2.0",
-      id: 9,
+      id: 7,
       method: "tools/call",
       params: {
         name: "lcm_describe",
@@ -116,19 +98,16 @@ try {
     },
   ]);
 
-  assert.equal(responses[1].result.structuredContent.health.summary_node_count > 0, true);
-  assert.equal(responses[2].result.structuredContent.matches[0].session_id, "smoke-session");
-  assert.match(responses[3].result.structuredContent.markdown, /smoke searchable context/u);
-  assert.doesNotMatch(responses[3].result.content[0].text, /mcp__codex_lcm__/u);
-  assert.equal(responses[4].result.structuredContent.summary.session_id, "smoke-session");
-  assert.match(responses[4].result.structuredContent.summary.overview, /Smoke verified extractive summaries/u);
-  assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
-  assert.equal(responses[5].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "summary"), true);
-  assert.equal(responses[5].result.structuredContent.edges.some((edge: { kind: string }) => edge.kind === "summary_source"), true);
-  assert.match(responses[6].result.structuredContent.markdown, /smoke-old-dag-marker/u);
-  assert.equal(responses[7].result.structuredContent.matches[0].session_id, "smoke-session");
-  assert.equal(responses[8].result.structuredContent.description.target, "session");
-  const nodeId = responses[8].result.structuredContent.description.summary_nodes[0].node_id;
+  assert.equal(responses[1].result.structuredContent.stats.summary_node_count > 0, true);
+  assert.match(responses[2].result.structuredContent.markdown, /smoke searchable context/u);
+  assert.doesNotMatch(responses[2].result.content[0].text, /mcp__codex_lcm__/u);
+  assert.equal(responses[3].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "session"), true);
+  assert.equal(responses[3].result.structuredContent.nodes.some((node: { kind: string }) => node.kind === "summary"), true);
+  assert.equal(responses[3].result.structuredContent.edges.some((edge: { kind: string }) => edge.kind === "summary_source"), true);
+  assert.match(responses[4].result.structuredContent.markdown, /smoke-old-dag-marker/u);
+  assert.equal(responses[5].result.structuredContent.matches[0].session_id, "smoke-session");
+  assert.equal(responses[6].result.structuredContent.description.target, "session");
+  const nodeId = responses[6].result.structuredContent.description.summary_nodes[0].node_id;
   const expansionResponses = runMcp([
     { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25" } },
     {

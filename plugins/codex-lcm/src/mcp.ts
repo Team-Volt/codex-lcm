@@ -116,15 +116,11 @@ function handleMessage(message: JsonRpcRequest): void {
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
       instructions: [
-        "Use Codex LCM tools to retrieve sanitized session events, notes, graph checkpoints, summary nodes, and packed context across Codex sessions.",
+        "Use Codex LCM for sanitized local evidence from prior Codex sessions.",
         "Preferred standard workflow: lcm_grep -> lcm_describe -> lcm_expand.",
-        "Codex may surface these same tools as mcp__codex_lcm__lcm_grep, mcp__codex_lcm__lcm_describe, and mcp__codex_lcm__lcm_expand.",
-        "Use lcm_expand_query when a focused query should pick matching summary nodes and recursively expand their source evidence.",
-        "Use lcm_context_plan to estimate whether recent context is near or past a caller-provided soft limit; it does not control Codex compaction.",
-        "Call lcm_pack_context or lcm_search_sessions when resuming work, after compaction, or before answering questions that depend on prior local session context.",
-        "Use lcm_pack_context for model-ready summary-node retrieval with bounded source expansion; use lcm_get_session_summary for compact session titles, topics, outcomes, and provenance before loading raw events.",
-        "For multi-session reviews, call lcm_list_sessions once with includeSummaries instead of making one summary call per session.",
-        "Use lcm_get_session with limit/cursor or lcm_get_session_graph for long sessions instead of loading every event at once.",
+        "Codex may expose lcm_grep as mcp__codex_lcm__lcm_grep; use the equivalent host-qualified names for the other steps.",
+        "Use lcm_expand_query for focused recursive evidence and lcm_pack_context for bounded model-ready recovery after compaction, interruption, or handoff.",
+        "For multi-session reviews, call lcm_list_sessions once with includeSummaries; for exact long-session detail, use lcm_describe before bounded graph or paged event reads.",
       ].join(" "),
     });
     return;

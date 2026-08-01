@@ -40,6 +40,9 @@ test("status recognizes Codex-native plugin wiring", () => {
       'source_type = "local"',
       `source = ${JSON.stringify(path.resolve("../.."))}`,
       "",
+      '[plugins."other@other"]',
+      "enabled = false",
+      "",
       "[plugins.\"codex-lcm@codex-lcm\"]",
       "enabled = true",
       'path = "/tmp/codex-lcm"',
@@ -64,4 +67,26 @@ test("status recognizes Codex-native plugin wiring", () => {
   assert.equal(status.mcp_configured, true);
   assert.equal(status.hooks_configured, true);
   assert.equal(status.recall_skill_available, true);
+});
+
+test("status treats an explicitly disabled native plugin as disabled", () => {
+  const codexHome = tempHome();
+  fs.writeFileSync(
+    path.join(codexHome, "config.toml"),
+    [
+      "[plugins.\"codex-lcm@codex-lcm\"]",
+      "enabled = false",
+      'path = "/tmp/codex-lcm"',
+      "",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(codexHome, "hooks.json"), JSON.stringify({ hooks: {} }, null, 2));
+
+  const result = runCli(["status", "--codex-home", codexHome, "--json"]);
+
+  assertCliOk(result);
+  const status = JSON.parse(result.stdout);
+  assert.equal(status.plugin_configured, false);
+  assert.equal(status.mcp_configured, false);
+  assert.equal(status.hooks_configured, false);
 });

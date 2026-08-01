@@ -78,6 +78,8 @@ export function readOverflowContent(args: {
 function readVerifiedOverflowBuffer(args: {
   overflowDir: string;
   reference: OverflowReference;
+  maxFileBytes?: number;
+  onRead?: (bytes: number) => void;
 }): Buffer {
   const expectedPath = path.join(path.resolve(args.overflowDir), `${args.reference.sha256}.json`);
   if (path.resolve(args.reference.path) !== expectedPath) {
@@ -89,6 +91,10 @@ function readVerifiedOverflowBuffer(args: {
     if (!stat.isFile() || stat.size !== args.reference.sanitized_byte_count || stat.size > 16 * 1024 * 1024) {
       throw new Error("Overflow reference does not match a bounded regular file.");
     }
+    if (args.maxFileBytes !== undefined && stat.size > args.maxFileBytes) {
+      throw new Error("Overflow payload exceeds the remaining search budget.");
+    }
+    args.onRead?.(stat.size);
     const buffer = fs.readFileSync(file);
     if (sha256(buffer) !== args.reference.sha256) throw new Error("Overflow payload integrity check failed.");
     return buffer;
@@ -101,10 +107,17 @@ export function searchOverflowContent(args: {
   overflowDir: string;
   reference: OverflowReference;
   query: string;
+  maxScanBytes?: number;
+  onRead?: (bytes: number) => void;
 }): OverflowSearchMatch | undefined {
   const query = args.query.trim();
   if (query.length === 0) return undefined;
-  const content = readVerifiedOverflowBuffer(args).toString("utf8");
+  const content = readVerifiedOverflowBuffer({
+    overflowDir: args.overflowDir,
+    reference: args.reference,
+    maxFileBytes: args.maxScanBytes,
+    onRead: args.onRead,
+  }).toString("utf8");
   const index = content.toLowerCase().indexOf(query.toLowerCase());
   if (index < 0) return undefined;
   const byteOffset = Buffer.byteLength(content.slice(0, index), "utf8");

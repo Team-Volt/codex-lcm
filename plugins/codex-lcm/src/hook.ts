@@ -17,7 +17,8 @@ export async function runHook(args: string[]): Promise<void> {
   const transcriptPath = hookEvent === "SubagentStop"
     ? extractStringField(rawInput, "agent_transcript_path")
     : undefined;
-  const repo = resolveGitMetadata(payloadCwd);
+  const toolHook = hookEvent === "PreToolUse" || hookEvent === "PostToolUse";
+  const repo = toolHook ? {} : resolveGitMetadata(payloadCwd);
   const event = normalizeHookEvent({
     hookEvent,
     rawInput,
@@ -48,6 +49,11 @@ export async function runHook(args: string[]): Promise<void> {
     };
   }
   const storage = createStorage({ config });
+  if (toolHook) {
+    const session = storage.getCurrentSession({ sessionId: event.session_id });
+    event.repo_root = session?.repo_root;
+    event.git_branch = session?.git_branch;
+  }
   let stored = false;
   try {
     storage.ingest(event);

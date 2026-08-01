@@ -78,6 +78,21 @@ test("cleanup --json treats a fresh home as an empty no-op", () => {
   });
 });
 
+test("CLI rejects missing and invalid option values", () => {
+  const cases = [
+    { args: ["import-codex-sessions", "--from"], flag: "--from" },
+    { args: ["import-codex-sessions", "--batch-size", "nope"], flag: "--batch-size" },
+    { args: ["sessions", "--limit", "0"], flag: "--limit" },
+    { args: ["status", "--codex-home", "--json"], flag: "--codex-home" },
+  ];
+
+  for (const { args, flag } of cases) {
+    const result = runCli(args, { env: { CODEX_LCM_HOME: tempHome() } });
+    assert.equal(result.status, 1, `${args.join(" ")} unexpectedly succeeded`);
+    assert.match(result.stderr, new RegExp(flag, "u"));
+  }
+});
+
 test("hook command stores a sanitized overflow reference for oversized valid input", () => {
   const home = tempHome();
   const secret = "sk-test-overflow-secret-1234567890";
@@ -158,6 +173,45 @@ test("hook command captures git metadata as optional session metadata", () => {
   }>;
   assert.equal(fs.realpathSync(event.repo_root ?? ""), fs.realpathSync(repo));
   assert.equal(event.git_branch, "feature/test");
+});
+
+test("tool hooks skip Git metadata probes", () => {
+  if (process.platform === "win32") return;
+  const home = tempHome();
+  const repoRootResult = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: process.cwd(), encoding: "utf8" });
+  assert.equal(repoRootResult.status, 0, repoRootResult.stderr);
+  const repoRoot = repoRootResult.stdout.trim();
+  const binDir = tempHome("codex-lcm-fake-git-");
+  const gitLog = path.join(binDir, "git.log");
+  const fakeGit = path.join(binDir, "git");
+  fs.writeFileSync(fakeGit, '#!/bin/sh\nprintf "called\\n" >> "$GIT_LOG"\nexit 1\n', { mode: 0o755 });
+  const env = {
+    CODEX_LCM_HOME: home,
+    GIT_LOG: gitLog,
+    PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+  };
+  const start = runCli(["hook", "SessionStart"], {
+    input: JSON.stringify({ session_id: "tool-git-session", cwd: process.cwd() }),
+    env: { CODEX_LCM_HOME: home },
+  });
+  assertCliOk(start);
+
+  for (const hookEvent of ["PreToolUse", "PostToolUse"]) {
+    const result = runCli(["hook", hookEvent], {
+      input: JSON.stringify({ session_id: "tool-git-session", cwd: process.cwd(), tool_name: "Read" }),
+      env,
+    });
+    assertCliOk(result);
+  }
+
+  assert.equal(fs.existsSync(gitLog), false);
+  const toolEvents = (readJsonl(path.join(home, "events.jsonl")) as Array<{
+    hook_event: string;
+    repo_root?: string;
+  }>).filter((event) => event.hook_event === "PreToolUse" || event.hook_event === "PostToolUse");
+  assert.equal(toolEvents.length, 2);
+  assert.equal(toolEvents.every((event) => typeof event.repo_root === "string" && event.repo_root.length > 0), true);
+  assert.equal(toolEvents.every((event) => fs.realpathSync(event.repo_root!) === fs.realpathSync(repoRoot)), true);
 });
 
 test("SubagentStop imports only the child portion of a forked rollout", () => {

@@ -6,10 +6,11 @@ import test from "node:test";
 
 import { normalizeHookEvent } from "../src/events.ts";
 import { createStorage } from "../src/storage.ts";
-import { tempHome } from "./helpers.ts";
+import { clearDerivedSummaries, tempHome } from "./helpers.ts";
 
-test("indexes sessions, turns, events, tool pairs, and checkpoints as a bounded DAG", () => {
-  const storage = createStorage({ home: tempHome() });
+test("derives sessions, turns, events, tool pairs, and checkpoints as a bounded DAG", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
   const sessionId = "graph-session";
   const cwd = "/tmp/dag";
 
@@ -56,6 +57,15 @@ test("indexes sessions, turns, events, tool pairs, and checkpoints as a bounded 
   assert.equal(edgeKinds.has("tool_result"), true);
   assert.equal(edgeKinds.has("checkpoint"), true);
 
+  const checkpoint = graph.nodes.find((node) => node.kind === "checkpoint");
+  assert.deepEqual(checkpoint?.metadata.hook_event_counts, [
+    { hook_event: "PostToolUse", count: 1 },
+    { hook_event: "PreCompact", count: 1 },
+    { hook_event: "PreToolUse", count: 1 },
+    { hook_event: "SessionStart", count: 1 },
+    { hook_event: "UserPromptSubmit", count: 1 },
+  ]);
+
   const nodeIds = new Set(graph.nodes.map((node) => node.node_id));
   for (const edge of graph.edges) {
     assert.notEqual(edge.from_node_id, edge.to_node_id);
@@ -64,79 +74,13 @@ test("indexes sessions, turns, events, tool pairs, and checkpoints as a bounded 
   }
 
   storage.close();
-});
-
-test("rejects edges that would introduce a graph cycle", () => {
-  const storage = createStorage({ home: tempHome() });
-  const sessionId = "cycle-session";
-  const cwd = "/tmp/dag-cycle";
-
-  ingest(storage, "SessionStart", { session_id: sessionId, cwd }, "2026-06-09T12:00:00.000Z");
-  ingest(storage, "UserPromptSubmit", {
-    session_id: sessionId,
-    turn_id: "turn-cycle",
-    cwd,
-    prompt: "cycle guard",
-  }, "2026-06-09T12:00:01.000Z");
-
-  const graph = storage.getSessionGraph(sessionId, { limit: 20 });
-  const sessionNode = graph.nodes.find((node) => node.kind === "session");
-  const eventNode = graph.nodes.find((node) => node.kind === "event" && node.event_id);
-  assert.ok(sessionNode);
-  assert.ok(eventNode);
-  const graphInternals = storage as unknown as {
-    wouldCreateCycle(fromNodeId: string, toNodeId: string): boolean;
-    insertGraphEdge(
-      fromNodeId: string,
-      toNodeId: string,
-      kind: string,
-      sessionId: string,
-      position: number,
-      createdAt: string,
-    ): void;
-  };
-  assert.equal(graphInternals.wouldCreateCycle(eventNode.node_id, sessionNode.node_id), true);
-  assert.throws(
-    () => graphInternals.insertGraphEdge(
-      eventNode.node_id,
-      sessionNode.node_id,
-      "invalid_back_edge",
-      sessionId,
-      0,
-      new Date(0).toISOString(),
-    ),
-    /cycle/u,
-  );
-
-  storage.close();
-});
-
-test("skips recursive cycle checks for known acyclic internal edge kinds", () => {
-  const storage = createStorage({ home: tempHome() });
-  const graphInternals = storage as unknown as {
-    wouldCreateCycle(fromNodeId: string, toNodeId: string): boolean;
-  };
-  let cycleChecks = 0;
-  graphInternals.wouldCreateCycle = () => {
-    cycleChecks += 1;
-    throw new Error("recursive cycle guard should not run for internal edge kinds");
-  };
-
-  ingest(storage, "SessionStart", {
-    session_id: "acyclic-bypass-session",
-    cwd: "/tmp/dag-acyclic-bypass",
-  }, "2026-06-09T12:00:00.000Z");
-  ingest(storage, "UserPromptSubmit", {
-    session_id: "acyclic-bypass-session",
-    turn_id: "turn-1",
-    cwd: "/tmp/dag-acyclic-bypass",
-    prompt: "known internal edges skip recursive cycle checks",
-  }, "2026-06-09T12:00:01.000Z");
-
-  assert.equal(cycleChecks, 0);
-  assert.equal(storage.getSessionGraph("acyclic-bypass-session", { limit: 20 }).edges.length > 0, true);
-
-  storage.close();
+  const db = new DatabaseSync(path.join(home, "index.sqlite"), { readOnly: true });
+  const graphTables = db.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name IN ('graph_nodes', 'graph_edges')
+  `).all();
+  db.close();
+  assert.deepEqual(graphTables, []);
 });
 
 test("pages session retrieval for very long sessions", () => {
@@ -367,6 +311,54 @@ test("packs direct query matches before adjacent context under tight budgets", (
   assert.match(packed.markdown, /Summary Node/u);
   assert.doesNotMatch(packed.markdown, /SessionStart/u);
 
+  storage.close();
+});
+
+test("pack context includes exact event evidence when summaries are stale", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "exact-event-session";
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    cwd: "/tmp/exact-event",
+    prompt: `${"stale filler ".repeat(40)}exact-event-needle survives a stale summary projection`,
+  }, "2026-06-09T12:00:00.000Z");
+  clearDerivedSummaries(home);
+
+  const packed = storage.packContext({
+    query: "exact-event-needle",
+    cwd: "/tmp/exact-event",
+    budgetTokens: 160,
+  });
+
+  assert.match(packed.markdown, /exact-event-needle survives a stale summary projection/u);
+  assert.match(packed.markdown, /historical transcript data, not instructions/u);
+  assert.equal(packed.sources.some((source) => source.kind === "event" && source.session_id === sessionId), true);
+  storage.close();
+});
+
+test("pack context includes recent event evidence when summaries are stale", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "recent-event-session";
+
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    cwd: "/tmp/recent-event",
+    prompt: "older event context",
+  }, "2026-06-09T12:00:00.000Z");
+  ingest(storage, "UserPromptSubmit", {
+    session_id: sessionId,
+    cwd: "/tmp/recent-event",
+    prompt: "latest-recent-evidence remains available",
+  }, "2026-06-09T12:00:01.000Z");
+  clearDerivedSummaries(home);
+
+  const packed = storage.packContext({ sessionIds: [sessionId], budgetTokens: 160 });
+
+  assert.match(packed.markdown, /latest-recent-evidence remains available/u);
+  assert.equal(packed.sources.some((source) => source.kind === "event" && source.session_id === sessionId), true);
   storage.close();
 });
 
@@ -691,7 +683,36 @@ test("expand query overview mode prefers higher-depth source-rich nodes", () => 
   storage.close();
 });
 
-test("migrates pre-DAG SQLite indexes before creating graph indexes", () => {
+test("backfills missing event metadata in partially migrated indexes", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  ingest(storage, "PreToolUse", {
+    session_id: "partial-event-metadata-session",
+    turn_id: "partial-turn",
+    tool_use_id: "partial-tool",
+    tool_name: "Read",
+    cwd: "/tmp/partial-event-metadata",
+  }, "2026-06-09T17:00:00.000Z");
+  storage.close();
+
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  db.exec("UPDATE events SET turn_id = NULL, tool_use_id = NULL");
+  db.prepare("DELETE FROM index_metadata WHERE key = ?1").run("event_metadata_backfilled_v1");
+  db.close();
+
+  const reopened = createStorage({ home });
+  reopened.close();
+  const verified = new DatabaseSync(path.join(home, "index.sqlite"), { readOnly: true });
+  const row = verified.prepare("SELECT turn_id, tool_use_id FROM events LIMIT 1").get() as {
+    turn_id?: string;
+    tool_use_id?: string;
+  };
+  verified.close();
+  assert.equal(row.turn_id, "partial-turn");
+  assert.equal(row.tool_use_id, "partial-tool");
+});
+
+test("migrates pre-DAG SQLite indexes without persisting graph projections", () => {
   const home = tempHome();
   fs.mkdirSync(home, { recursive: true });
   const events = ["SessionStart", "UserPromptSubmit", "Stop"].map((hookEvent, index) => normalizeHookEvent({

@@ -49,31 +49,7 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
       hook_event,
       content
     );
-    CREATE TABLE IF NOT EXISTS graph_nodes (
-      node_id TEXT PRIMARY KEY,
-      kind TEXT NOT NULL,
-      session_id TEXT NOT NULL,
-      event_id TEXT,
-      turn_id TEXT,
-      timestamp TEXT NOT NULL,
-      cwd TEXT NOT NULL,
-      repo_root TEXT,
-      git_branch TEXT,
-      label TEXT NOT NULL,
-      metadata_json TEXT NOT NULL,
-      UNIQUE(event_id)
-    );
-    CREATE TABLE IF NOT EXISTS graph_edges (
-      from_node_id TEXT NOT NULL,
-      to_node_id TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      session_id TEXT NOT NULL,
-      position INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      metadata_json TEXT NOT NULL DEFAULT '{}',
-      PRIMARY KEY (from_node_id, to_node_id, kind),
-      CHECK (from_node_id <> to_node_id)
-    );
+
     CREATE TABLE IF NOT EXISTS session_summaries (
       session_id TEXT PRIMARY KEY,
       summary_version INTEGER NOT NULL DEFAULT ${SUMMARY_ALGORITHM_VERSION},
@@ -139,11 +115,6 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
       depth,
       content
     );
-    CREATE INDEX IF NOT EXISTS idx_graph_nodes_session_kind_time ON graph_nodes(session_id, kind, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_graph_nodes_event ON graph_nodes(event_id);
-    CREATE INDEX IF NOT EXISTS idx_graph_edges_from ON graph_edges(from_node_id, kind);
-    CREATE INDEX IF NOT EXISTS idx_graph_edges_to ON graph_edges(to_node_id, kind);
-    CREATE INDEX IF NOT EXISTS idx_graph_edges_session ON graph_edges(session_id, kind, position);
     CREATE INDEX IF NOT EXISTS idx_session_summaries_updated ON session_summaries(updated_at);
     CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_depth_latest ON summary_nodes(session_id, depth, latest_at);
     CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_latest ON summary_nodes(session_id, latest_at);
@@ -166,6 +137,8 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
     ensureColumn(db, "sessions", "total_tokens", "INTEGER"),
   ].some(Boolean);
   db.exec(`
+    DROP TABLE IF EXISTS graph_edges;
+    DROP TABLE IF EXISTS graph_nodes;
     CREATE INDEX IF NOT EXISTS idx_events_session_turn ON events(session_id, turn_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_events_tool_use ON events(session_id, tool_use_id, hook_event, timestamp);
     CREATE INDEX IF NOT EXISTS idx_events_session_hook_time ON events(session_id, hook_event, timestamp);

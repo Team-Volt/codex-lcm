@@ -27,27 +27,22 @@ test("package and repository declare the MIT license", () => {
   assert.match(packageLicense, /^Copyright \(c\) 2026 Team Volt$/mu);
 });
 
-test("plugin includes a Codex skill that nudges agents to use LCM", () => {
+test("plugin includes a compact Codex skill with the core LCM workflow and safety contract", () => {
   const skill = fs.readFileSync("skills/lcm-recall/SKILL.md", "utf8");
 
   assert.match(skill, /^---\nname: lcm-recall/mu);
-  assert.match(skill, /preferred standard workflow is `lcm_grep` -> `lcm_describe` -> `lcm_expand`/u);
-  assert.match(
-    skill,
-    /`mcp__codex_lcm__lcm_grep` -> `mcp__codex_lcm__lcm_describe` -> `mcp__codex_lcm__lcm_expand` are those same standard tools/u,
-  );
-  assert.match(skill, /Agents must use the host-qualified form Codex shows/u);
-  assert.match(skill, /rather than fall back to lower-level session APIs/u);
-  assert.match(skill, /`lcm_expand_query` as the focused query-first alternative/u);
-  assert.match(skill, /lcm_current_session/u);
-  assert.match(skill, /lcm_search_sessions/u);
+  assert.match(skill, /`lcm_grep` -> `lcm_describe` -> `lcm_expand`/u);
+  assert.match(skill, /host-qualified/u);
+  assert.match(skill, /lcm_expand_query/u);
   assert.match(skill, /lcm_pack_context/u);
-  assert.match(skill, /lcm_get_session_graph/u);
-  assert.match(skill, /limit/u);
-  assert.match(skill, /cursor/u);
+  assert.match(skill, /sequential/u);
+  assert.match(skill, /bounded/u);
+  assert.match(skill, /overflow/u);
+  assert.match(skill, /Do not fabricate/u);
   assert.match(skill, /lcm_record_note/u);
-  assert.match(skill, /Use the MCP tools/u);
+  assert.match(skill, /explicitly asks|explicit approval/u);
   assert.match(skill, /Do not inspect `~\/\.codex-lcm`/u);
+  assert.equal(Buffer.byteLength(skill, "utf8") <= 6_000, true);
 });
 
 test("MCP manifest registers the local stdio server", () => {

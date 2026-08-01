@@ -38,6 +38,7 @@ test("MCP server initializes and lists LCM tools", () => {
     /Preferred standard workflow: lcm_grep -> lcm_describe -> lcm_expand\./u,
   );
   assert.match(responses[0].result.instructions, /mcp__codex_lcm__lcm_grep/u);
+  assert.doesNotMatch(responses[0].result.instructions, /lcm_search_sessions|lcm_get_session_summary/u);
   const toolNames = responses[1].result.tools.map((tool: { name: string }) => tool.name);
   assert.deepEqual(
     toolNames,
@@ -81,6 +82,10 @@ test("MCP server initializes and lists LCM tools", () => {
   const listTool = responses[1].result.tools.find((tool: { name: string }) => tool.name === "lcm_list_sessions");
   assert.equal(listTool.inputSchema.properties.includeSummaries.type, "boolean");
   assert.equal(describeTool.inputSchema.properties.includeLineage.type, "boolean");
+  for (const name of ["lcm_health", "lcm_search_sessions", "lcm_get_session_summary"]) {
+    const tool = responses[1].result.tools.find((candidate: { name: string }) => candidate.name === name);
+    assert.match(tool.description, /Compatibility tool/u);
+  }
 });
 
 test("MCP server falls back to its supported protocol version", () => {
