@@ -41,30 +41,25 @@ test("hook command reports raw-log lock timeout and persists on retry", () => {
   // Given: a confirmed-live foreign owner holds the shared legacy lock.
   const home = tempHome();
   const lockPath = path.join(home, "events.jsonl.lock");
-  const lockDescriptor = fs.openSync(lockPath, "wx", 0o600);
-  fs.writeFileSync(lockDescriptor, `${process.pid}:test-owner`);
+  fs.writeFileSync(lockPath, `${process.pid}:test-owner`, { mode: 0o600 });
   const input = JSON.stringify({
     session_id: "hook-lock-timeout",
     cwd: "/tmp/hook-lock-timeout",
     prompt: "persist exactly once after lock release",
   });
 
-  try {
-    // When: the real hook CLI reaches its ten-second lock deadline.
-    const blocked = runCli(["hook", "UserPromptSubmit"], {
-      input,
-      env: { CODEX_LCM_HOME: home },
-      timeout: 15_000,
-    });
+  // When: the real hook CLI reaches its ten-second lock deadline.
+  const blocked = runCli(["hook", "UserPromptSubmit"], {
+    input,
+    env: { CODEX_LCM_HOME: home },
+    timeout: 15_000,
+  });
 
-    // Then: failure is machine-visible and no event was acknowledged.
-    assert.equal(blocked.status, 1, blocked.stderr);
-    assert.match(blocked.stderr, /codex-lcm: raw log lock timeout:/u);
-    assert.match(blocked.stderr, new RegExp(`legacy raw lock owner PID ${process.pid}`, "u"));
-    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
-  } finally {
-    fs.closeSync(lockDescriptor);
-  }
+  // Then: failure is machine-visible and no event was acknowledged.
+  assert.equal(blocked.status, 1, blocked.stderr);
+  assert.match(blocked.stderr, /codex-lcm: raw log lock timeout:/u);
+  assert.match(blocked.stderr, new RegExp(`legacy raw lock owner PID ${process.pid}`, "u"));
+  assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
 
   // When: the owner releases and the same hook is retried.
   fs.unlinkSync(lockPath);

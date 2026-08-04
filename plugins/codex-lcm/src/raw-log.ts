@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
 import { threadId } from "node:worker_threads";
 
 import { parsePersistedEvent } from "./event-codec.ts";
@@ -24,7 +22,6 @@ const RAW_LOG_LOCK_TIMEOUT_MS = 10_000;
 const RAW_LOG_LOCK_POLL_MS = 10;
 const RAW_LOG_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 const RAW_LOG_LOCK_TOKEN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const WINDOWS_LOCK_OWNER_SCRIPT = fileURLToPath(new URL("../scripts/windows-lock-owner.ps1", import.meta.url));
 
 export class RawLogLockTimeoutError extends Error {
   readonly lockPath: string;
@@ -46,7 +43,6 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   const token = `${process.pid}:${threadId}:${tokenId}`;
   const candidatePath = `${lockPath}.${tokenId}.candidate`;
   const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
-  const inspectedLegacyTokens = new Set<string>();
   let coordinator: DatabaseSync | undefined;
   let transactionOpen = false;
   let published = false;
@@ -72,7 +68,7 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
         published = true;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (clearStaleRawLogLock(lockPath, inspectedLegacyTokens)) continue;
+        if (clearStaleRawLogLock(lockPath)) continue;
         coordinator.exec("ROLLBACK");
         transactionOpen = false;
         waitForRawLogLock(deadline, lockPath);
@@ -145,7 +141,7 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
   }
 }
 
-function clearStaleRawLogLock(lockPath: string, inspectedLegacyTokens: Set<string>): boolean {
+function clearStaleRawLogLock(lockPath: string): boolean {
   try {
     const token = fs.readFileSync(lockPath, "utf8");
     const tokenParts = token.split(":");
@@ -164,82 +160,21 @@ function clearStaleRawLogLock(lockPath: string, inspectedLegacyTokens: Set<strin
       return true;
     }
     if (Number.isSafeInteger(owner) && owner > 0) {
-      let ownerAlive = true;
       try {
         process.kill(owner, 0);
+        return false;
       } catch (error) {
         if (!(error instanceof Error) || Reflect.get(error, "code") !== "ESRCH") return false;
-        ownerAlive = false;
       }
-      if (!ownerAlive) {
-        if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-        return true;
-      }
-      if (!inspectedLegacyTokens.has(token)) {
-        inspectedLegacyTokens.add(token);
-        if (legacyOwnerHasLockOpen(owner, lockPath) === false) {
-          if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-          return true;
-        }
-      }
+    } else {
       return false;
     }
-    return false;
+    if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
+    return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
     throw error;
   }
-}
-
-function legacyOwnerHasLockOpen(owner: number, lockPath: string): boolean | undefined {
-  if (process.platform === "linux") {
-    try {
-      const lock = fs.statSync(lockPath);
-      for (const descriptor of fs.readdirSync(`/proc/${owner}/fd`)) {
-        try {
-          const openFile = fs.statSync(`/proc/${owner}/fd/${descriptor}`);
-          if (openFile.dev === lock.dev && openFile.ino === lock.ino) return true;
-        } catch (error) {
-          if (!(error instanceof Error) || Reflect.get(error, "code") !== "ENOENT") return undefined;
-        }
-      }
-      return false;
-    } catch (error) {
-      if (error instanceof Error && Reflect.get(error, "code") === "ENOENT") return false;
-      return undefined;
-    }
-  }
-  if (process.platform === "darwin") {
-    const result = spawnSync("/usr/sbin/lsof", ["-a", "-p", String(owner), "-Fn", "--", lockPath], {
-      encoding: "utf8",
-      timeout: 1_000,
-      windowsHide: true,
-    });
-    if (result.status === 0) return true;
-    if (result.status === 1 && result.stdout.length === 0 && result.stderr.length === 0) return false;
-  }
-  if (process.platform === "win32") {
-    const result = spawnSync("powershell.exe", [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      WINDOWS_LOCK_OWNER_SCRIPT,
-      "-OwnerPid",
-      String(owner),
-      "-LockPath",
-      lockPath,
-    ], {
-      encoding: "utf8",
-      timeout: 5_000,
-      windowsHide: true,
-    });
-    if (result.status === 0) return true;
-    if (result.status === 1) return false;
-  }
-  return undefined;
 }
 
 function clearStaleRawLogCandidates(lockPath: string): void {

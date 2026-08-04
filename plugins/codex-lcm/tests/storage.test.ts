@@ -1256,21 +1256,6 @@ test("dead-owner raw-log lock does not delay a hook append", () => {
   storage.close();
 });
 
-test("legacy raw-log lock is reclaimed when its PID no longer owns the file", () => {
-  // Given: an abandoned legacy lock names a PID that has since been reused by this process.
-  const home = tempHome();
-  const rawLogPath = path.join(home, "events.jsonl");
-  fs.writeFileSync(`${rawLogPath}.lock`, `${process.pid}:stale-owner`, { mode: 0o600 });
-
-  // When: the current process requests the raw-log lock.
-  const startedAt = Date.now();
-  withRawLogLock(rawLogPath, () => {});
-  const elapsedMs = Date.now() - startedAt;
-
-  // Then: the closed legacy file is reclaimed instead of timing out on the reused PID.
-  assert.equal(elapsedMs < 1_000, true, `PID-reused lock delayed acquisition by ${elapsedMs}ms`);
-});
-
 test("current raw-log lock serializes with the legacy lock protocol", async () => {
   // Given: a legacy process owns events.jsonl.lock and marks its critical section active.
   const home = tempHome();
