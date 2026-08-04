@@ -26,8 +26,10 @@ const RAW_LOG_LOCK_TOKEN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}
 export class RawLogLockTimeoutError extends Error {
   readonly lockPath: string;
 
-  constructor(lockPath: string) {
-    super(`codex-lcm: raw log lock timeout: ${lockPath}`);
+  constructor(lockPath: string, legacyOwnerPid?: number) {
+    super(legacyOwnerPid === undefined
+      ? `codex-lcm: raw log lock timeout: ${lockPath}`
+      : `codex-lcm: raw log lock timeout: ${lockPath}; legacy raw lock owner PID ${legacyOwnerPid} is still live, so confirm it is not an active writer before removing this lock`);
     this.name = "RawLogLockTimeoutError";
     this.lockPath = lockPath;
   }
@@ -94,7 +96,24 @@ export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
 }
 
 function waitForRawLogLock(deadline: number, lockPath: string): void {
-  if (Date.now() >= deadline) throw new RawLogLockTimeoutError(lockPath);
+  if (Date.now() >= deadline) {
+    let legacyOwnerPid: number | undefined;
+    try {
+      const tokenParts = fs.readFileSync(lockPath, "utf8").split(":");
+      const owner = Number(tokenParts[0]);
+      if (tokenParts.length === 2 && tokenParts[1]?.length && Number.isSafeInteger(owner) && owner > 0) {
+        try {
+          process.kill(owner, 0);
+          legacyOwnerPid = owner;
+        } catch (error) {
+          if (!(error instanceof Error) || Reflect.get(error, "code") !== "ESRCH") legacyOwnerPid = owner;
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    throw new RawLogLockTimeoutError(lockPath, legacyOwnerPid);
+  }
   Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
 }
 
@@ -145,7 +164,7 @@ function clearStaleRawLogLock(lockPath: string): boolean {
         process.kill(owner, 0);
         return false;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return false;
+        if (!(error instanceof Error) || Reflect.get(error, "code") !== "ESRCH") return false;
       }
     } else {
       return false;

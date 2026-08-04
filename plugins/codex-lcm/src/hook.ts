@@ -49,12 +49,12 @@ export async function runHook(args: string[]): Promise<void> {
     };
   }
   const storage = createStorage({ config });
-  if (toolHook) {
-    const session = storage.getCurrentSession({ sessionId: event.session_id });
-    event.repo_root = session?.repo_root;
-    event.git_branch = session?.git_branch;
-  }
   try {
+    if (toolHook) {
+      const session = storage.getCurrentSession({ sessionId: event.session_id });
+      event.repo_root = session?.repo_root;
+      event.git_branch = session?.git_branch;
+    }
     storage.ingest(event);
     if (transcriptPath) {
       try {

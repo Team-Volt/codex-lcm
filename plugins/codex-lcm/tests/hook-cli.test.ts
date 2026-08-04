@@ -58,6 +58,7 @@ test("hook command reports raw-log lock timeout and persists on retry", () => {
   // Then: failure is machine-visible and no event was acknowledged.
   assert.equal(blocked.status, 1, blocked.stderr);
   assert.match(blocked.stderr, /codex-lcm: raw log lock timeout:/u);
+  assert.match(blocked.stderr, new RegExp(`legacy raw lock owner PID ${process.pid}`, "u"));
   assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
 
   // When: the owner releases and the same hook is retried.
@@ -381,7 +382,48 @@ test("tool hooks skip Git metadata probes", () => {
   }>).filter((event) => event.hook_event === "PreToolUse" || event.hook_event === "PostToolUse");
   assert.equal(toolEvents.length, 2);
   assert.equal(toolEvents.every((event) => typeof event.repo_root === "string" && event.repo_root.length > 0), true);
-  assert.equal(toolEvents.every((event) => fs.realpathSync(event.repo_root!) === fs.realpathSync(repoRoot)), true);
+  assert.equal(toolEvents.every((event) => fs.realpathSync(event.repo_root ?? "") === fs.realpathSync(repoRoot)), true);
+});
+
+test("tool hook closes storage when session metadata lookup fails", () => {
+  // Given: the real hook CLI loads an injector that fails tool-session lookup and records storage cleanup.
+  const home = tempHome();
+  const fixtureDir = tempHome("codex-lcm-hook-close-");
+  const closeMarker = path.join(fixtureDir, "closed");
+  const preloadPath = path.join(fixtureDir, "fail-session-lookup.mjs");
+  const storageModuleUrl = new URL("../src/storage.ts", import.meta.url).href;
+  fs.writeFileSync(preloadPath, `
+    import fs from "node:fs";
+    const { LcmStorage } = await import(process.env.STORAGE_MODULE_URL);
+    const originalClose = LcmStorage.prototype.close;
+    LcmStorage.prototype.close = function() {
+      fs.writeFileSync(process.env.CLOSE_MARKER, "closed");
+      return originalClose.call(this);
+    };
+    LcmStorage.prototype.getCurrentSession = function() {
+      throw new Error("forced tool-session lookup failure");
+    };
+  `);
+
+  // When: a tool hook fails after storage opens but before ingest begins.
+  const result = spawnSync(process.execPath, [
+    "--no-warnings",
+    "--import",
+    preloadPath,
+    "bin/codex-lcm",
+    "hook",
+    "PreToolUse",
+  ], {
+    cwd: path.resolve("."),
+    encoding: "utf8",
+    input: JSON.stringify({ session_id: "tool-close-session", cwd: "/tmp/tool-close", tool_name: "Read" }),
+    env: { ...process.env, CLOSE_MARKER: closeMarker, CODEX_LCM_HOME: home, STORAGE_MODULE_URL: storageModuleUrl },
+  });
+
+  // Then: the failure remains visible and the opened storage is closed.
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /forced tool-session lookup failure/u);
+  assert.equal(fs.existsSync(closeMarker), true);
 });
 
 test("SubagentStop imports only the child portion of a forked rollout", () => {
