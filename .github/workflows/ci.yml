@@ -27,3 +27,23 @@ jobs:
       - run: npm test
       - run: npm run smoke
       - run: npm pack --dry-run
+
+  cross-platform-lock:
+    strategy:
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: plugins/codex-lcm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.3
+          cache: npm
+          cache-dependency-path: plugins/codex-lcm/package-lock.json
+      - run: npm ci
+      - run: node --test --test-name-pattern="legacy raw-log lock is reclaimed|hook command reports raw-log lock timeout" tests/storage.test.ts tests/hook-cli.test.ts
