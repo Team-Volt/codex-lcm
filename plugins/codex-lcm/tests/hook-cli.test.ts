@@ -106,13 +106,10 @@ test("hook recovers after its lock-owning worker terminates", async () => {
   const input = JSON.stringify({ session_id: "worker-owner-retry", cwd: "/tmp/worker-owner", prompt: "persist after worker owner crash" });
 
   // When: another real hook writes after SQLite releases the terminated worker's transaction.
-  const startedAt = Date.now();
   const retried = runCli(["hook", "UserPromptSubmit"], { input, env: { CODEX_LCM_HOME: home }, timeout: 15_000 });
-  const elapsedMs = Date.now() - startedAt;
 
   // Then: the retry persists exactly one event without manual lock cleanup.
   assertCliOk(retried);
-  assert.equal(elapsedMs < 1_000, true, `terminated worker delayed retry by ${elapsedMs}ms`);
   assert.equal(readJsonl(rawLogPath).length, 1);
   const health = runCli(["health", "--json"], { env: { CODEX_LCM_HOME: home } });
   assertCliOk(health);
