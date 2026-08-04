@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { threadId, Worker } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
 
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
 import { appendRawEvents, readRawLog, withRawLogLock } from "../src/raw-log.ts";
@@ -925,32 +925,14 @@ test("retry after a raw-log fsync failure appends and syncs the event again", ()
   }
 });
 
-test("raw-log lock setup failures do not enter the append callback", () => {
+test("raw-log coordinator setup failures do not enter the callback", () => {
   const home = tempHome();
-  const storage = createStorage({ home });
-  const event = normalizeHookEvent({
-    hookEvent: "UserPromptSubmit",
-    rawInput: JSON.stringify({
-      session_id: "raw-lock-setup-failure-session",
-      cwd: "/tmp/raw-lock-setup-failure",
-      prompt: "lock setup must clean up after itself",
-    }),
-    env: {},
-    now,
-  });
-  const originalLinkSync = fs.linkSync;
-  fs.linkSync = (existingPath, newPath) => {
-    if (String(newPath).endsWith("events.jsonl.lock")) throw new Error("forced lock setup failure");
-    return originalLinkSync(existingPath, newPath);
-  };
+  const rawLogPath = path.join(home, "events.jsonl");
+  fs.mkdirSync(`${rawLogPath}.lock.sqlite`);
+  let entered = false;
 
-  try {
-    assert.throws(() => storage.ingest(event), /forced lock setup failure/u);
-    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
-  } finally {
-    fs.linkSync = originalLinkSync;
-    storage.close();
-  }
+  assert.throws(() => withRawLogLock(rawLogPath, () => { entered = true; }));
+  assert.equal(entered, false);
 });
 
 test("constructor replay leaves an interleaved raw append visible to the next opener", () => {
@@ -997,111 +979,6 @@ test("constructor replay leaves an interleaved raw append visible to the next op
   assert.equal(reopened.health().event_count, 2);
   assert.equal(reopened.hasEvent(interleaved.event_id), true);
   reopened.close();
-});
-
-test("same-process orphaned raw-log lock is cleared", () => {
-  // Given: this process left a lock whose token is no longer active.
-  const home = tempHome();
-  const rawLogPath = path.join(home, "events.jsonl");
-  const lockPath = `${rawLogPath}.lock`;
-  fs.writeFileSync(lockPath, `${process.pid}:${threadId}:00000000-0000-4000-8000-000000000000`, { mode: 0o600 });
-
-  // When
-  let entered = false;
-  withRawLogLock(rawLogPath, () => {
-    entered = true;
-  });
-
-  // Then
-  assert.equal(entered, true);
-  assert.equal(fs.existsSync(lockPath), false);
-});
-
-test("raw-log reclaims a candidate left by a terminated worker", async () => {
-  // Given: a worker terminates after candidate creation but before atomic lock publication.
-  const home = tempHome();
-  const rawLogPath = path.join(home, "events.jsonl");
-  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
-  const worker = new Worker(String.raw`
-    const fs = require("node:fs");
-    const { parentPort, workerData } = require("node:worker_threads");
-    const originalLinkSync = fs.linkSync;
-    fs.linkSync = (existingPath, newPath) => {
-      if (String(newPath).endsWith(".lock")) {
-        parentPort.postMessage("candidate-created");
-        process.exit(0);
-      }
-      return originalLinkSync(existingPath, newPath);
-    };
-    (async () => {
-      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
-      withRawLogLock(workerData.rawLogPath, () => {});
-    })();
-  `, { eval: true, workerData: { rawLogModuleUrl, rawLogPath } });
-  const workerDone = new Promise<void>((resolve, reject) => {
-    worker.once("error", reject);
-    worker.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`worker exited ${code}`)));
-  });
-
-  // When: the parent enters after the worker has released its coordinator transaction.
-  await new Promise<void>((resolve, reject) => {
-    worker.once("error", reject);
-    worker.once("message", () => resolve());
-  });
-  await workerDone;
-  withRawLogLock(rawLogPath, () => {});
-
-  // Then: the abandoned same-process candidate is gone.
-  assert.deepEqual(fs.readdirSync(home).filter((name) => name.endsWith(".candidate")), []);
-});
-
-test("raw-log does not create a candidate before it owns the coordinator", async () => {
-  // Given: a separate writer reaches the coordinator while another process owns it.
-  const home = tempHome();
-  const rawLogPath = path.join(home, "events.jsonl");
-  const coordinator = new DatabaseSync(`${rawLogPath}.lock.sqlite`);
-  const barrier = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
-  coordinator.exec("BEGIN IMMEDIATE");
-  const waiter = new Worker(String.raw`
-    const { DatabaseSync } = require("node:sqlite");
-    const { parentPort, workerData } = require("node:worker_threads");
-    const barrier = new Int32Array(workerData.barrier);
-    const originalExec = DatabaseSync.prototype.exec;
-    DatabaseSync.prototype.exec = function(sql) {
-      if (sql === "BEGIN IMMEDIATE") {
-        parentPort.postMessage("before-coordinator");
-        Atomics.wait(barrier, 0, 0);
-      }
-      return originalExec.call(this, sql);
-    };
-    (async () => {
-      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
-      withRawLogLock(workerData.rawLogPath, () => {});
-    })();
-  `, { eval: true, workerData: { barrier: barrier.buffer, rawLogModuleUrl, rawLogPath } });
-  const waiterDone = new Promise<void>((resolve, reject) => {
-    waiter.once("error", reject);
-    waiter.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`waiter worker exited ${code}`)));
-  });
-
-  // When: the waiter has not yet attempted to acquire the held coordinator.
-  try {
-    await new Promise<void>((resolve, reject) => {
-      waiter.once("error", reject);
-      waiter.once("message", () => resolve());
-    });
-
-    // Then: it has no candidate that a cleaner could mistake for a crashed owner.
-    assert.deepEqual(fs.readdirSync(home).filter((name) => name.endsWith(".candidate")), []);
-  } finally {
-    coordinator.exec("ROLLBACK");
-    coordinator.close();
-    Atomics.store(barrier, 0, 1);
-    Atomics.notify(barrier, 0);
-    await waiterDone;
-    await waiter.terminate();
-  }
 });
 
 test("raw-log workers with the same PID do not clear each other's active lock", async () => {
@@ -1155,160 +1032,6 @@ test("raw-log workers with the same PID do not clear each other's active lock", 
   } finally {
     await Promise.all([holder.terminate(), waiter.terminate()]);
   }
-});
-
-test("concurrent stale clearers do not unlink a newly acquired raw-log lock", async () => {
-  // Given: two workers contend to clear one dead-owner lock while one pauses before unlink.
-  const home = tempHome();
-  const rawLogPath = path.join(home, "events.jsonl");
-  const lockPath = `${rawLogPath}.lock`;
-  const activePath = path.join(home, "new-owner-active");
-  const rawLogModuleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
-  const staleOwner = spawnSync(process.execPath, [
-    "--input-type=module",
-    "--eval",
-    `const fs = await import("node:fs"); fs.writeFileSync(process.env.RAW_LOCK_PATH, process.pid + ":0:00000000-0000-4000-8000-000000000000", { mode: 0o600 });`,
-  ], { env: { ...process.env, RAW_LOCK_PATH: lockPath } });
-  assert.equal(staleOwner.status, 0, staleOwner.stderr?.toString());
-  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const clearer = new Worker(String.raw`
-    const fs = require("node:fs");
-    const { workerData } = require("node:worker_threads");
-    const state = new Int32Array(workerData.barrier);
-    const originalReadFileSync = fs.readFileSync;
-    let lockReads = 0;
-    fs.readFileSync = (...args) => {
-      const result = originalReadFileSync(...args);
-      if (args[0] === workerData.lockPath && ++lockReads === 2) {
-        Atomics.store(state, 0, 1);
-        Atomics.notify(state, 0);
-        Atomics.wait(state, 0, 1, 500);
-      }
-      return result;
-    };
-    (async () => {
-      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
-      withRawLogLock(workerData.rawLogPath, () => {
-        if (fs.existsSync(workerData.activePath)) throw new Error("stale clearer entered concurrently");
-      });
-    })();
-  `, { eval: true, workerData: { activePath, barrier, lockPath, rawLogModuleUrl, rawLogPath } });
-  const owner = new Worker(String.raw`
-    const fs = require("node:fs");
-    const { workerData } = require("node:worker_threads");
-    const state = new Int32Array(workerData.barrier);
-    const wait = new Int32Array(new SharedArrayBuffer(4));
-    while (Atomics.load(state, 0) === 0) Atomics.wait(state, 0, 0);
-    (async () => {
-      const { withRawLogLock } = await import(workerData.rawLogModuleUrl);
-      withRawLogLock(workerData.rawLogPath, () => {
-        fs.writeFileSync(workerData.activePath, "active");
-        Atomics.wait(wait, 0, 0, 750);
-        fs.unlinkSync(workerData.activePath);
-      });
-    })();
-  `, { eval: true, workerData: { activePath, barrier, rawLogModuleUrl, rawLogPath } });
-
-  // When: both current-version workers complete their lock attempt.
-  const workerDone = (worker: Worker) => new Promise<void>((resolve, reject) => {
-    worker.once("error", reject);
-    worker.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`stale-clearer worker exited ${code}`)));
-  });
-
-  // Then: neither worker enters while the other owns the raw lock.
-  try {
-    await Promise.all([workerDone(clearer), workerDone(owner)]);
-  } finally {
-    await Promise.all([clearer.terminate(), owner.terminate()]);
-  }
-});
-
-test("dead-owner raw-log lock does not delay a hook append", () => {
-  // Given: a legacy lock left behind after its owning process exits without cleanup.
-  const home = tempHome();
-  const lockPath = path.join(home, "events.jsonl.lock");
-  const abandoned = spawnSync(process.execPath, [
-    "--no-warnings",
-    "--input-type=module",
-    "--eval",
-    `const fs = await import("node:fs"); fs.writeFileSync(process.env.RAW_LOCK_PATH, process.pid + ":dead-owner", { flag: "wx", mode: 0o600 });`,
-  ], {
-    encoding: "utf8",
-    env: { ...process.env, RAW_LOCK_PATH: lockPath },
-  });
-  assert.equal(abandoned.status, 0, abandoned.stderr);
-  const storage = createStorage({ home });
-  const event = normalizeHookEvent({
-    hookEvent: "UserPromptSubmit",
-    rawInput: JSON.stringify({ session_id: "stale-live-pid", cwd: "/tmp/stale-lock", prompt: "must persist" }),
-    env: {},
-    now,
-  });
-
-  // When: the hook path ingests one event.
-  const startedAt = Date.now();
-  storage.ingest(event);
-  const elapsedMs = Date.now() - startedAt;
-
-  // Then: stale ownership is cleared promptly and the raw event is durable.
-  assert.equal(elapsedMs < 1_000, true, `stale lock delayed append by ${elapsedMs}ms`);
-  assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events.map(({ event_id }) => event_id), [event.event_id]);
-  storage.close();
-});
-
-test("current raw-log lock serializes with the legacy lock protocol", async () => {
-  // Given: a legacy process owns events.jsonl.lock and marks its critical section active.
-  const home = tempHome();
-  const rawLogPath = path.join(home, "events.jsonl");
-  const activePath = path.join(home, "legacy-holder-active");
-  const moduleUrl = new URL("../src/raw-log.ts", import.meta.url).href;
-  const waiterEvent = normalizeHookEvent({
-    hookEvent: "UserPromptSubmit",
-    rawInput: JSON.stringify({ session_id: "mixed-version-waiter", cwd: "/tmp/mixed-version", prompt: "waiter" }),
-    env: {},
-    now,
-  });
-  const holder = spawn(process.execPath, [
-    "--no-warnings",
-    "--input-type=module",
-    "--eval",
-    `const fs = await import("node:fs"); const wait = new Int32Array(new SharedArrayBuffer(4)); const lockPath = process.env.RAW_LOG_PATH + ".lock"; const fd = fs.openSync(lockPath, "wx", 0o600); fs.writeFileSync(fd, process.pid + ":legacy-token"); fs.writeFileSync(process.env.ACTIVE_PATH, "active"); process.stdout.write("locked\\n"); Atomics.wait(wait, 0, 0, 250); fs.unlinkSync(process.env.ACTIVE_PATH); fs.closeSync(fd); fs.unlinkSync(lockPath);`,
-  ], {
-    env: { ...process.env, ACTIVE_PATH: activePath, RAW_LOG_PATH: rawLogPath },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const holderDone = new Promise<void>((resolve, reject) => {
-    holder.once("error", reject);
-    holder.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`legacy holder exited ${code}`)));
-  });
-  const holderReady = await new Promise<string>((resolve, reject) => {
-    holder.stdout.once("data", (chunk: Buffer) => resolve(chunk.toString("utf8")));
-    holder.once("exit", (code) => reject(new Error(`legacy holder exited before acquiring lock: ${code}`)));
-  });
-  assert.match(holderReady, /locked/u);
-
-  // When: the current implementation tries to enter the same critical section.
-  const waiter = spawnSync(process.execPath, [
-    "--no-warnings",
-    "--input-type=module",
-    "--eval",
-    `const fs = await import("node:fs"); const { appendRawEvents, withRawLogLock } = await import(process.env.RAW_LOG_MODULE_URL); withRawLogLock(process.env.RAW_LOG_PATH, () => { if (fs.existsSync(process.env.ACTIVE_PATH)) throw new Error("waiter entered concurrently"); appendRawEvents(process.env.RAW_LOG_PATH, [JSON.parse(process.env.RAW_EVENT)]); });`,
-  ], {
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      ACTIVE_PATH: activePath,
-      RAW_EVENT: JSON.stringify(waiterEvent),
-      RAW_LOG_MODULE_URL: moduleUrl,
-      RAW_LOG_PATH: rawLogPath,
-    },
-    timeout: 5_000,
-  });
-  await holderDone;
-
-  // Then: it enters only after the legacy owner releases the shared lock.
-  assert.equal(waiter.status, 0, waiter.stderr || `waiter terminated with ${waiter.signal}`);
-  assert.deepEqual(readRawLog(rawLogPath).events.map(({ event_id }) => event_id), [waiterEvent.event_id]);
 });
 
 test("raw-log waiter times out without evicting an active owner after ten seconds", async () => {

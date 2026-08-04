@@ -1,8 +1,6 @@
-import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { threadId } from "node:worker_threads";
 
 import { parsePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
@@ -21,15 +19,12 @@ export type RawLogState = {
 const RAW_LOG_LOCK_TIMEOUT_MS = 10_000;
 const RAW_LOG_LOCK_POLL_MS = 10;
 const RAW_LOG_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-const RAW_LOG_LOCK_TOKEN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export class RawLogLockTimeoutError extends Error {
   readonly lockPath: string;
 
-  constructor(lockPath: string, legacyOwnerPid?: number) {
-    super(legacyOwnerPid === undefined
-      ? `codex-lcm: raw log lock timeout: ${lockPath}`
-      : `codex-lcm: raw log lock timeout: ${lockPath}; legacy raw lock owner PID ${legacyOwnerPid} is still live, so confirm it is not an active writer before removing this lock`);
+  constructor(lockPath: string) {
+    super(`codex-lcm: raw log lock timeout: ${lockPath}`);
     this.name = "RawLogLockTimeoutError";
     this.lockPath = lockPath;
   }
@@ -37,82 +32,34 @@ export class RawLogLockTimeoutError extends Error {
 
 export function withRawLogLock<T>(rawLogPath: string, callback: () => T): T {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
-  const lockPath = `${rawLogPath}.lock`;
-  const coordinatorPath = `${rawLogPath}.lock.sqlite`;
-  const tokenId = randomUUID();
-  const token = `${process.pid}:${threadId}:${tokenId}`;
-  const candidatePath = `${lockPath}.${tokenId}.candidate`;
+  const lockPath = `${rawLogPath}.lock.sqlite`;
   const deadline = Date.now() + RAW_LOG_LOCK_TIMEOUT_MS;
-  let coordinator: DatabaseSync | undefined;
+  const coordinator = new DatabaseSync(lockPath, { timeout: RAW_LOG_LOCK_POLL_MS });
   let transactionOpen = false;
-  let published = false;
 
   try {
-    coordinator = new DatabaseSync(coordinatorPath, { timeout: RAW_LOG_LOCK_POLL_MS });
-    fs.chmodSync(coordinatorPath, 0o600);
-    while (!published) {
-      if (!transactionOpen) {
-        try {
-          coordinator.exec("BEGIN IMMEDIATE");
-          transactionOpen = true;
-          clearStaleRawLogCandidates(lockPath);
-          fs.writeFileSync(candidatePath, token, { flag: "wx", mode: 0o600 });
-        } catch (error) {
-          if (!isSqliteBusy(error)) throw error;
-          waitForRawLogLock(deadline, lockPath);
-          continue;
-        }
-      }
+    fs.chmodSync(lockPath, 0o600);
+    while (!transactionOpen) {
       try {
-        fs.linkSync(candidatePath, lockPath);
-        published = true;
+        coordinator.exec("BEGIN IMMEDIATE");
+        transactionOpen = true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (clearStaleRawLogLock(lockPath)) continue;
-        coordinator.exec("ROLLBACK");
-        transactionOpen = false;
+        if (!isSqliteBusy(error)) throw error;
         waitForRawLogLock(deadline, lockPath);
       }
     }
-    fs.unlinkSync(candidatePath);
 
     // ponytail: one writer lock is enough; shard only if raw-log contention becomes measurable.
     return callback();
   } finally {
-    try {
-      if (published && fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    } finally {
-      if (transactionOpen) coordinator?.exec("ROLLBACK");
-      coordinator?.close();
-      try {
-        fs.unlinkSync(candidatePath);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    }
+    if (transactionOpen) coordinator.exec("ROLLBACK");
+    coordinator.close();
   }
 }
 
 function waitForRawLogLock(deadline: number, lockPath: string): void {
   if (Date.now() >= deadline) {
-    let legacyOwnerPid: number | undefined;
-    try {
-      const tokenParts = fs.readFileSync(lockPath, "utf8").split(":");
-      const owner = Number(tokenParts[0]);
-      if (tokenParts.length === 2 && tokenParts[1]?.length && Number.isSafeInteger(owner) && owner > 0) {
-        try {
-          process.kill(owner, 0);
-          legacyOwnerPid = owner;
-        } catch (error) {
-          if (!(error instanceof Error) || Reflect.get(error, "code") !== "ESRCH") legacyOwnerPid = owner;
-        }
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    throw new RawLogLockTimeoutError(lockPath, legacyOwnerPid);
+    throw new RawLogLockTimeoutError(lockPath);
   }
   Atomics.wait(RAW_LOG_LOCK_WAIT, 0, 0, RAW_LOG_LOCK_POLL_MS);
 }
@@ -138,70 +85,6 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
       throw new AggregateError([error, rollbackError], "Raw log append failed and rollback failed.");
     }
     throw error;
-  }
-}
-
-function clearStaleRawLogLock(lockPath: string): boolean {
-  try {
-    const token = fs.readFileSync(lockPath, "utf8");
-    const tokenParts = token.split(":");
-    const [ownerText, ownerThreadText, tokenId] = tokenParts;
-    const owner = Number(ownerText);
-    const ownerThread = Number(ownerThreadText);
-    const currentToken = tokenParts.length === 3
-      && Number.isSafeInteger(owner)
-      && owner > 0
-      && Number.isSafeInteger(ownerThread)
-      && ownerThread >= 0
-      && typeof tokenId === "string"
-      && RAW_LOG_LOCK_TOKEN_ID_PATTERN.test(tokenId);
-    if (currentToken) {
-      if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-      return true;
-    }
-    if (Number.isSafeInteger(owner) && owner > 0) {
-      try {
-        process.kill(owner, 0);
-        return false;
-      } catch (error) {
-        if (!(error instanceof Error) || Reflect.get(error, "code") !== "ESRCH") return false;
-      }
-    } else {
-      return false;
-    }
-    if (fs.readFileSync(lockPath, "utf8") === token) fs.unlinkSync(lockPath);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
-  }
-}
-
-function clearStaleRawLogCandidates(lockPath: string): void {
-  const directory = path.dirname(lockPath);
-  const candidatePrefix = `${path.basename(lockPath)}.`;
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    if (!entry.isFile() || !entry.name.startsWith(candidatePrefix) || !entry.name.endsWith(".candidate")) continue;
-    clearStaleRawLogCandidate(path.join(directory, entry.name));
-  }
-}
-
-function clearStaleRawLogCandidate(candidatePath: string): void {
-  try {
-    const token = fs.readFileSync(candidatePath, "utf8");
-    const tokenParts = token.split(":");
-    const tokenId = tokenParts[2];
-    const currentToken = tokenParts.length === 3
-      && Number.isSafeInteger(Number(tokenParts[0]))
-      && Number(tokenParts[0]) > 0
-      && Number.isSafeInteger(Number(tokenParts[1]))
-      && Number(tokenParts[1]) >= 0
-      && typeof tokenId === "string"
-      && RAW_LOG_LOCK_TOKEN_ID_PATTERN.test(tokenId);
-    if (!currentToken) return;
-    if (fs.readFileSync(candidatePath, "utf8") === token) fs.unlinkSync(candidatePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
