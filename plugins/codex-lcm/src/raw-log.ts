@@ -76,7 +76,7 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
   const separator = rawLogNeedsSeparator(rawLogPath) ? "\n" : "";
   try {
     fs.appendFileSync(rawLogPath, `${separator}${events.map((event) => JSON.stringify(event)).join("\n")}\n`, { mode: 0o600 });
-    fsyncPath(rawLogPath);
+    fsyncPath(rawLogPath, true);
     if (!existed && process.platform !== "win32") fsyncPath(path.dirname(rawLogPath));
   } catch (error) {
     try {
@@ -91,7 +91,7 @@ export function appendRawEvents(rawLogPath: string, events: readonly NormalizedE
 function restoreRawLog(rawLogPath: string, existed: boolean, previousSize: number): void {
   if (existed) {
     fs.truncateSync(rawLogPath, previousSize);
-    fsyncPath(rawLogPath);
+    fsyncPath(rawLogPath, true);
     return;
   }
   if (fs.existsSync(rawLogPath)) fs.unlinkSync(rawLogPath);
@@ -111,8 +111,8 @@ function rawLogNeedsSeparator(rawLogPath: string): boolean {
   }
 }
 
-function fsyncPath(targetPath: string): void {
-  const descriptor = fs.openSync(targetPath, "r");
+function fsyncPath(targetPath: string, writable = false): void {
+  const descriptor = fs.openSync(targetPath, writable ? "r+" : "r");
   try {
     fs.fsyncSync(descriptor);
   } finally {
