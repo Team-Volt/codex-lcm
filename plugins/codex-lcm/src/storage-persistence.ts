@@ -5,10 +5,13 @@ import type { LcmConfig } from "./config.ts";
 import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
 import { extractFileReferences } from "./file-refs.ts";
-import { rawLogState, rawLogStat, readRawEventIds, readRawEvents, type RawLogState } from "./raw-log.ts";
+import { overflowReferenceFromEvent } from "./overflow.ts";
+import { rawLogState, rawLogStat, readRawEventIds, readRawEvents, segmentedRawLogState, type RawEventLocation, type RawLogState } from "./raw-log.ts";
 import { eventSearchText } from "./storage-context.ts";
 import { recordValue } from "./storage-rows.ts";
 import { initializeStorageSchema } from "./storage-schema.ts";
+import { segmentStorageHealth } from "./raw-segments.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import { getSummaryBackfillSessionIds, rebuildSessionMemorySummary, shouldRebuildSessionMemorySummary } from "./storage-summaries.ts";
 import { extractEventMetadata, extractSessionMetadata, isCodexLcmToolEvent, isSearchIndexEvent, maxNullable, scalar, summarizeSessions } from "./storage-sessions.ts";
 import type { Health, IndexCleanupReport } from "./storage-types.ts";
@@ -18,6 +21,7 @@ const SUMMARY_SOURCE_HOOKS = "('UserPromptSubmit', 'Note', 'Stop', 'PreCompact',
 const FILE_REF_BACKFILL_KEY = "file_refs_backfilled_v1";
 const DELEGATION_PARENT_BACKFILL_KEY = "delegation_parent_backfilled_v1";
 const EVENT_METADATA_BACKFILL_KEY = "event_metadata_backfilled_v1";
+const EVENT_LOCATOR_METADATA_BACKFILL_KEY = "event_locator_metadata_backfilled_v1";
 const RAW_LOG_INDEX_STATE_KEY = "raw_log_index_state_v1";
 
 export type IndexEventResult = { readonly inserted: boolean; readonly summaryTouched: boolean };
@@ -88,7 +92,7 @@ export function emptyCleanupReport(indexPath: string): IndexCleanupReport {
 
 export function inspectIndexForCleanup(db: DatabaseSync, indexPath: string): CleanupInspection {
   const searchableEvents = db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE hook_event IN ${SUMMARY_SOURCE_HOOKS}
     ORDER BY timestamp ASC, rowid ASC
   `).all()
@@ -158,6 +162,7 @@ export function writableIndexHealth(
   graphEdgeCounts: Record<string, number>,
 ): Health {
   return {
+    ...segmentStorageHealth(config),
     home: config.home, raw_log_path: config.rawLogPath, index_path: config.indexPath,
     raw_log_exists: fs.existsSync(config.rawLogPath), index_exists: fs.existsSync(config.indexPath),
     index_available: true, ...(indexError ? { index_error: indexError } : {}),
@@ -172,6 +177,7 @@ export function writableIndexHealth(
 export function rawHealth(config: LcmConfig, indexError: string | undefined): Health {
   const rawEvents = readRawEvents(config.rawLogPath);
   return {
+    ...segmentStorageHealth(config),
     home: config.home, raw_log_path: config.rawLogPath, index_path: config.indexPath,
     raw_log_exists: fs.existsSync(config.rawLogPath), index_exists: fs.existsSync(config.indexPath),
     index_available: false, ...(indexError ? { index_error: indexError } : {}),
@@ -209,7 +215,7 @@ export function knownEventIds(db: DatabaseSync | undefined, rawLogPath: string, 
 }
 
 export function indexedEventsById(db: DatabaseSync): Map<string, string> {
-  return new Map(db.prepare("SELECT event_id, raw_json FROM events").all().map((row) => {
+  return new Map(db.prepare(`SELECT event_id, ${STORED_EVENT_JSON_SQL} AS raw_json FROM events`).all().map((row) => {
     const record = recordValue(row);
     return [String(record.event_id), String(record.raw_json)];
   }));
@@ -220,8 +226,31 @@ export function indexedRawLogState(db: DatabaseSync): string | undefined {
   return typeof row.value === "string" ? row.value : undefined;
 }
 
-export function isRawLogIndexed(db: DatabaseSync, rawLogPath: string): boolean {
-  return indexedRawLogState(db) === JSON.stringify(rawLogState(rawLogPath));
+export function indexedActiveLogIsAppendOnly(db: DatabaseSync, config: LcmConfig): boolean {
+  const parsed = parsedIndexedRawLogState(db);
+  const current = segmentedRawLogState(config);
+  return parsed !== undefined && parsed.segmentState === current.segmentState && current.size > parsed.size;
+}
+
+function parsedIndexedRawLogState(db: DatabaseSync): { readonly size: number; readonly segmentState?: string } | undefined {
+  const state = indexedRawLogState(db);
+  if (!state) return undefined;
+  try {
+    const parsed = JSON.parse(state);
+    if (typeof parsed !== "object" || parsed === null || typeof Reflect.get(parsed, "size") !== "number") return undefined;
+    const segmentState = Reflect.get(parsed, "segmentState");
+    return {
+      size: Number(Reflect.get(parsed, "size")),
+      ...(typeof segmentState === "string" ? { segmentState } : {}),
+    };
+  } catch (error) {
+    if (error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+}
+
+export function isRawLogIndexed(db: DatabaseSync, config: LcmConfig): boolean {
+  return indexedRawLogState(db) === JSON.stringify(segmentedRawLogState(config));
 }
 
 export function recordRawLogState(db: DatabaseSync, state: RawLogState): void {
@@ -231,8 +260,12 @@ export function recordRawLogState(db: DatabaseSync, state: RawLogState): void {
   `).run(RAW_LOG_INDEX_STATE_KEY, JSON.stringify(state));
 }
 
-export function currentRawLogState(rawLogPath: string): RawLogState {
-  return rawLogState(rawLogPath);
+export function invalidateRawLogState(db: DatabaseSync): void {
+  db.prepare("DELETE FROM index_metadata WHERE key = ?1").run(RAW_LOG_INDEX_STATE_KEY);
+}
+
+export function currentRawLogState(config: LcmConfig): RawLogState {
+  return segmentedRawLogState(config);
 }
 
 export function initializeIndex(db: DatabaseSync): void {
@@ -241,18 +274,26 @@ export function initializeIndex(db: DatabaseSync): void {
   if (backfillSessionMetadata) backfillExistingSessionMetadata(db);
 }
 
-export function indexEventInTransaction(db: DatabaseSync | undefined, event: NormalizedEvent, rebuildSummary: boolean): IndexEventResult {
+export function indexEventInTransaction(
+  db: DatabaseSync | undefined,
+  event: NormalizedEvent,
+  rebuildSummary: boolean,
+  location?: RawEventLocation,
+): IndexEventResult {
   if (!db) return { inserted: false, summaryTouched: false };
   const metadata = extractEventMetadata(event);
   const sessionMetadata = extractSessionMetadata(event);
   const insert = db.prepare(`
     INSERT OR IGNORE INTO events
-      (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, text, raw_json)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+      (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, turn_id, tool_use_id, text, raw_json,
+       segment_id, raw_offset, raw_length, agent_id, overflow_sha256)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
   `).run(
     event.event_id, event.session_id, event.timestamp, event.hook_event, event.cwd,
     event.repo_root ?? null, event.git_branch ?? null, metadata.turn_id ?? null,
-    metadata.tool_use_id ?? null, "", JSON.stringify(event),
+    metadata.tool_use_id ?? null, "", JSON.stringify(event), location?.segmentId ?? null,
+    location?.offset ?? null, location?.length ?? null, eventAgentId(event) ?? null,
+    overflowReferenceFromEvent(event)?.sha256 ?? null,
   );
   if (insert.changes === 0) return { inserted: false, summaryTouched: false };
   db.prepare(`
@@ -298,6 +339,56 @@ export function indexEventInTransaction(db: DatabaseSync | undefined, event: Nor
   return { inserted: true, summaryTouched };
 }
 
+export function clearVerifiedRawJson(db: DatabaseSync, segmentId: string, batchSize = 500): number {
+  if (segmentId.length === 0 || !Number.isSafeInteger(batchSize) || batchSize <= 0) {
+    throw new TypeError("Raw JSON clearing requires a segment ID and positive batch size.");
+  }
+  const markerKey = `raw_json_clear_v1:${segmentId}`;
+  let cursor = Number(recordValue(db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(markerKey)).value ?? 0);
+  let cleared = 0;
+  for (;;) {
+    const rows = db.prepare(`
+      SELECT rowid, event_id, lcm_raw_json('', segment_id, raw_offset, raw_length) AS located_json
+      FROM events
+      WHERE segment_id = ?1 AND rowid > ?2 AND raw_json <> ''
+      ORDER BY rowid ASC LIMIT ?3
+    `).all(segmentId, cursor, batchSize);
+    if (rows.length === 0) return cleared;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const row of rows) {
+        const record = recordValue(row);
+        const rowId = Number(record.rowid);
+        const eventId = String(record.event_id);
+        const event = decodePersistedEvent(String(record.located_json));
+        if (event.event_id === eventId) {
+          cleared += Number(db.prepare("UPDATE events SET raw_json = '' WHERE rowid = ?1 AND event_id = ?2").run(rowId, eventId).changes);
+        }
+        cursor = rowId;
+      }
+      db.prepare(`
+        INSERT INTO index_metadata (key, value) VALUES (?1, ?2)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run(markerKey, String(cursor));
+      db.exec("COMMIT");
+    } catch (error) {
+      const rollback = rollbackPreservingError(db, error);
+      if (rollback.kind === "rolled_back") throw error;
+      throw new AggregateError([error, rollback.rollbackError], "Raw JSON clearing rollback failed.");
+    }
+  }
+}
+
+export function segmentsNeedRawJsonClearing(db: DatabaseSync, segmentIds: readonly string[]): boolean {
+  const marker = db.prepare("SELECT 1 FROM index_metadata WHERE key = ?1");
+  return segmentIds.some((segmentId) => marker.get(`raw_json_clear_v1:${segmentId}`) === undefined);
+}
+
+function eventAgentId(event: NormalizedEvent): string | undefined {
+  const value = event.payload.agent_id ?? event.payload.agentId;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function indexFileRefsForEvent(db: DatabaseSync, event: NormalizedEvent): void {
   for (const ref of extractFileReferences(event)) {
     db.prepare(`
@@ -320,19 +411,31 @@ function indexFileRefsForEvent(db: DatabaseSync, event: NormalizedEvent): void {
 function backfillExistingEventMetadata(db: DatabaseSync): void {
   const marker = recordValue(db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(EVENT_METADATA_BACKFILL_KEY));
   if (marker.value === "1") return;
-  const rows = db.prepare("SELECT raw_json FROM events").all();
-  const update = db.prepare("UPDATE events SET turn_id = ?1, tool_use_id = ?2 WHERE event_id = ?3");
+  const rows = db.prepare(`SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events`).all();
+  const update = db.prepare(`
+    UPDATE events SET turn_id = ?1, tool_use_id = ?2, agent_id = ?3, overflow_sha256 = ?4 WHERE event_id = ?5
+  `);
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const row of rows) {
       const event = decodePersistedEvent(String(recordValue(row).raw_json));
       const metadata = extractEventMetadata(event);
-      update.run(metadata.turn_id ?? null, metadata.tool_use_id ?? null, event.event_id);
+      update.run(
+        metadata.turn_id ?? null,
+        metadata.tool_use_id ?? null,
+        eventAgentId(event) ?? null,
+        overflowReferenceFromEvent(event)?.sha256 ?? null,
+        event.event_id,
+      );
     }
     db.prepare(`
       INSERT INTO index_metadata (key, value) VALUES (?1, '1')
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(EVENT_METADATA_BACKFILL_KEY);
+    db.prepare(`
+      INSERT INTO index_metadata (key, value) VALUES (?1, '1')
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(EVENT_LOCATOR_METADATA_BACKFILL_KEY);
     db.exec("COMMIT");
   } catch (error) {
     try {
@@ -344,8 +447,30 @@ function backfillExistingEventMetadata(db: DatabaseSync): void {
   }
 }
 
+export function backfillLocatorMetadata(db: DatabaseSync): void {
+  const marker = recordValue(db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(EVENT_LOCATOR_METADATA_BACKFILL_KEY));
+  if (marker.value === "1") return;
+  const rows = db.prepare(`SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events ORDER BY rowid ASC`).all();
+  const update = db.prepare("UPDATE events SET agent_id = ?1, overflow_sha256 = ?2 WHERE event_id = ?3");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const row of rows) {
+      const event = decodePersistedEvent(String(recordValue(row).raw_json));
+      update.run(eventAgentId(event) ?? null, overflowReferenceFromEvent(event)?.sha256 ?? null, event.event_id);
+    }
+    db.prepare(`
+      INSERT INTO index_metadata (key, value) VALUES (?1, '1')
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(EVENT_LOCATOR_METADATA_BACKFILL_KEY);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 function backfillExistingSessionMetadata(db: DatabaseSync): void {
-  const rows = db.prepare("SELECT raw_json FROM events WHERE hook_event = 'SessionStart'").all();
+  const rows = db.prepare(`SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events WHERE hook_event = 'SessionStart'`).all();
   const update = db.prepare("UPDATE sessions SET parent_session_id = ?2, agent_role = ?3, agent_nickname = ?4 WHERE session_id = ?1");
   for (const row of rows) {
     const event = decodePersistedEvent(String(recordValue(row).raw_json));
@@ -359,7 +484,8 @@ export function backfillDelegationParents(db: DatabaseSync | undefined): string 
   const marker = recordValue(db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(DELEGATION_PARENT_BACKFILL_KEY));
   if (marker.value === "1") return undefined;
   const rows = db.prepare(`
-    SELECT e.raw_json FROM events e JOIN sessions s ON s.session_id = e.session_id
+    SELECT lcm_raw_json(e.raw_json, e.segment_id, e.raw_offset, e.raw_length) AS raw_json
+    FROM events e JOIN sessions s ON s.session_id = e.session_id
     WHERE e.hook_event = 'UserPromptSubmit' AND s.parent_session_id IS NULL
     ORDER BY e.timestamp ASC, e.rowid ASC
   `).all();
@@ -388,11 +514,8 @@ export function backfillFileRefs(db: DatabaseSync | undefined): string | undefin
   const marker = recordValue(db.prepare("SELECT value FROM index_metadata WHERE key = ?1").get(FILE_REF_BACKFILL_KEY));
   if (marker.value === "1") return undefined;
   const rows = db.prepare(`
-    SELECT raw_json FROM events
-    WHERE hook_event = 'PostToolUse' AND (
-      raw_json LIKE '%file_path%' OR raw_json LIKE '%filepath%' OR raw_json LIKE '%absolute_path%'
-      OR raw_json LIKE '%filename%' OR raw_json LIKE '%"path"%' OR raw_json LIKE '%"file"%'
-    ) ORDER BY timestamp ASC, rowid ASC
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
+    WHERE hook_event = 'PostToolUse' ORDER BY timestamp ASC, rowid ASC
   `).all();
   db.exec("BEGIN IMMEDIATE");
   try {

@@ -4,6 +4,7 @@ import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
 import { readRawEvents } from "./raw-log.ts";
 import { isRecord, recordValue, rowToSessionSummary } from "./storage-rows.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import type {
   Health,
   LcmStats,
@@ -439,8 +440,7 @@ export function resolveStoredSessionIdentifier(
   const row = recordValue(db.prepare(`
     SELECT session_id
     FROM events
-    WHERE json_extract(raw_json, '$.payload.agent_id') = ?1
-       OR json_extract(raw_json, '$.payload.agentId') = ?1
+    WHERE agent_id = ?1
     ORDER BY timestamp DESC, rowid DESC
     LIMIT 1
   `).get(trimmed));
@@ -466,12 +466,12 @@ export function getStoredSession(
   }
   const rows = limit === undefined
     ? db.prepare(`
-        SELECT raw_json FROM events
+        SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
         WHERE session_id = ?1
         ORDER BY timestamp ASC, rowid ASC
       `).all(sessionId)
     : db.prepare(`
-        SELECT raw_json FROM events
+        SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
         WHERE session_id = ?1
         ORDER BY timestamp ASC, rowid ASC
         LIMIT ?2 OFFSET ?3

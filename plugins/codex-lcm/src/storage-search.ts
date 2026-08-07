@@ -5,6 +5,7 @@ import type { NormalizedEvent } from "./events.ts";
 import { overflowReferenceFromEvent, searchOverflowContent, type OverflowSearchMatch } from "./overflow.ts";
 import { readRawEvents } from "./raw-log.ts";
 import { parseStringArray, recordValue, rowToSessionSummary } from "./storage-rows.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import { getCurrentStoredSession, summarizeSessions } from "./storage-sessions.ts";
 export { searchSummaryNodes } from "./storage-summaries.ts";
 import type { SearchOverflowArgs, SearchSessionArgs, SessionDiscovery, SessionSearchMatch, SessionSummary } from "./storage-types.ts";
@@ -333,7 +334,8 @@ export function searchStoredSessions(db: DatabaseSync | undefined, rawLogPath: s
   let rows: unknown[] = [];
   const eventStatement = db.prepare(`
     SELECT s.*,
-           e.raw_json AS match_text, e.timestamp AS match_timestamp, 1 AS match_weight,
+           lcm_raw_json(e.raw_json, e.segment_id, e.raw_offset, e.raw_length) AS match_text,
+           e.timestamp AS match_timestamp, 1 AS match_weight,
            'event' AS match_kind, e.event_id AS match_event_id
     FROM event_fts f
     JOIN events e ON e.event_id = f.event_id
@@ -395,9 +397,9 @@ export function searchStoredOverflow(
   const limit = clampLimit(args.limit, 10, 50);
   const events = db
     ? db.prepare(`
-        SELECT raw_json
+        SELECT ${STORED_EVENT_JSON_SQL} AS raw_json
         FROM events
-        WHERE json_extract(raw_json, '$.payload.overflow_ref.sha256') IS NOT NULL
+        WHERE overflow_sha256 IS NOT NULL
           AND (?1 IS NULL OR cwd = ?1)
           AND (?2 IS NULL OR repo_root = ?2)
         ORDER BY timestamp DESC, rowid DESC

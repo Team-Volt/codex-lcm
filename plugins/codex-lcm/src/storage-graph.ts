@@ -4,6 +4,7 @@ import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
 import { readRawEvents } from "./raw-log.ts";
 import { recordValue } from "./storage-rows.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import { countMap, extractEventMetadata } from "./storage-sessions.ts";
 import { getSummaryNodesForGraph } from "./storage-summaries.ts";
 import type { GraphEdge, GraphNode, SessionGraph } from "./storage-types.ts";
@@ -215,7 +216,7 @@ export function getStoredSessionGraph(
     : Math.max(0, Math.floor(limit / 4));
   const graphNodeLimit = Math.max(1, limit - summaryBudget);
   const events = db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE session_id = ?1
     ORDER BY timestamp ASC, rowid ASC
     LIMIT ?2
@@ -249,7 +250,7 @@ export function getLatestCheckpoint(db: DatabaseSync | undefined, sessionId: str
   if (!db) return undefined;
   const row = recordValue(db.prepare(`
     SELECT raw_json, position FROM (
-      SELECT raw_json, hook_event,
+      SELECT ${STORED_EVENT_JSON_SQL} AS raw_json, hook_event,
         ROW_NUMBER() OVER (ORDER BY timestamp, rowid) AS position
       FROM events
       WHERE session_id = ?1

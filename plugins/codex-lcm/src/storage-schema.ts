@@ -39,7 +39,12 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
       turn_id TEXT,
       tool_use_id TEXT,
       text TEXT NOT NULL DEFAULT '',
-      raw_json TEXT NOT NULL
+      raw_json TEXT NOT NULL,
+      segment_id TEXT,
+      raw_offset INTEGER,
+      raw_length INTEGER,
+      agent_id TEXT,
+      overflow_sha256 TEXT
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
       event_id UNINDEXED,
@@ -123,6 +128,11 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
   `);
   ensureColumn(db, "events", "turn_id", "TEXT");
   ensureColumn(db, "events", "tool_use_id", "TEXT");
+  ensureColumn(db, "events", "segment_id", "TEXT");
+  ensureColumn(db, "events", "raw_offset", "INTEGER");
+  ensureColumn(db, "events", "raw_length", "INTEGER");
+  ensureColumn(db, "events", "agent_id", "TEXT");
+  ensureColumn(db, "events", "overflow_sha256", "TEXT");
   ensureColumn(db, "session_summaries", "summary_version", "INTEGER");
   const backfillSessionMetadata = [
     ensureColumn(db, "sessions", "parent_session_id", "TEXT"),
@@ -143,6 +153,8 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
     CREATE INDEX IF NOT EXISTS idx_events_tool_use ON events(session_id, tool_use_id, hook_event, timestamp);
     CREATE INDEX IF NOT EXISTS idx_events_session_hook_time ON events(session_id, hook_event, timestamp);
     CREATE INDEX IF NOT EXISTS idx_events_session_time ON events(session_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_events_overflow_sha256 ON events(overflow_sha256);
     CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, last_seen);
     CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
   `);

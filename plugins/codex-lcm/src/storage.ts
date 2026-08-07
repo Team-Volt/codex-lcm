@@ -5,10 +5,13 @@ import { loadConfig, type LcmConfig } from "./config.ts";
 import { createNoteEvent, type NormalizedEvent } from "./events.ts";
 import type { FileReference } from "./file-refs.ts";
 import type { OverflowReference, OverflowSearchMatch } from "./overflow.ts";
+import { cutOverLegacyLog, migrationInProgress } from "./maintenance.ts";
 import {
-  appendRawEvents,
-  readRawEventIds,
-  readRawEvents,
+  appendSegmentedEvents,
+  readActiveRawEvents,
+  readAllLocatedRawEvents,
+  readAllRawEvents,
+  readAllRawLog,
   readRawLog,
   RawLogLockTimeoutError,
   withRawLogLock,
@@ -43,6 +46,7 @@ import {
   currentRawLogState,
   emptyCleanupReport,
   indexedEventsById as readIndexedEventsById,
+  indexedActiveLogIsAppendOnly,
   indexedRawLogState as readIndexedRawLogState,
   indexEventInTransaction as indexStoredEventInTransaction,
   initializeIndex,
@@ -78,6 +82,7 @@ import {
   storageStats,
   storedUsage,
 } from "./storage-sessions.ts";
+import { registerStoredEventReader } from "./stored-event.ts";
 import {
   type SessionMemorySummary,
   type SummaryNode,
@@ -109,16 +114,27 @@ export class LcmStorage {
     if (!this.readOnly) {
       fs.mkdirSync(this.config.home, { recursive: true, mode: 0o700 });
       fs.chmodSync(this.config.home, 0o700);
+      cutOverLegacyLog(this.config);
     }
     if (this.readOnly && !fs.existsSync(this.config.indexPath)) {
       return;
     }
     try {
       this.db = new DatabaseSync(this.config.indexPath, { readOnly: this.readOnly, timeout: 5_000 });
+      registerStoredEventReader(this.db, this.config);
       if (!this.readOnly) {
         fs.chmodSync(this.config.indexPath, 0o600);
         this.initialize();
-        this.replayRawLogToIndex();
+        if (migrationInProgress(this.config)) {
+          const indexedCount = Number(this.db.prepare("SELECT COUNT(*) AS count FROM events").get()?.count ?? 0);
+          if (indexedCount === 0) this.rebuildIndexFromRawStream();
+          else this.replayActiveRawLogToIndex();
+        } else {
+          if (!this.rawLogIsIndexed()) {
+            if (indexedActiveLogIsAppendOnly(this.db, this.config)) this.replayActiveRawLogToIndex();
+            else this.rebuildIndexFromRawStream();
+          }
+        }
         this.backfillDelegationParents();
         this.backfillFileRefs();
         this.backfillSessionMemorySummaries();
@@ -138,7 +154,7 @@ export class LcmStorage {
     if (this.db) {
       return this.db.prepare("SELECT 1 FROM events WHERE event_id = ?1 LIMIT 1").get(eventId) !== undefined;
     }
-    return readRawEvents(this.config.rawLogPath).some((event) => event.event_id === eventId);
+    return Array.from(readAllRawEvents(this.config)).some((event) => event.event_id === eventId);
   }
 
   ingest(event: NormalizedEvent): void {
@@ -151,7 +167,7 @@ export class LcmStorage {
       if (!(error instanceof DerivedIndexError)) throw error;
       let rawDurable: boolean;
       try {
-        rawDurable = readRawEventIds(this.config.rawLogPath).has(event.event_id);
+        rawDurable = this.readRawEventIds().has(event.event_id);
       } catch {
         throw error;
       }
@@ -199,11 +215,18 @@ export class LcmStorage {
       }
 
       if (eventsToAppend.length > 0) {
-        appendRawEvents(this.config.rawLogPath, eventsToAppend);
+        const locations = appendSegmentedEvents(this.config, eventsToAppend);
         this.storeRawEventIds(rawSeen);
+        return {
+          eventsToAppend,
+          locationsByEventId: new Map(eventsToAppend.map((event, index) => [event.event_id, locations[index]])),
+          rawLogState: rawLogWasIndexed ? this.rawLogState() : undefined,
+          skippedDuplicate,
+        };
       }
       return {
         eventsToAppend,
+        locationsByEventId: new Map<string, ReturnType<typeof appendSegmentedEvents>[number]>(),
         rawLogState: rawLogWasIndexed ? this.rawLogState() : undefined,
         skippedDuplicate,
       };
@@ -223,7 +246,11 @@ export class LcmStorage {
       for (const event of events) {
         if (indexSeen.has(event.event_id)) continue;
         indexSeen.add(event.event_id);
-        const result = this.indexEventInTransaction(event, { rebuildSummary: summaryRebuild === "event" });
+        const result = this.indexEventInTransaction(
+          event,
+          { rebuildSummary: summaryRebuild === "event" },
+          rawWrite.locationsByEventId.get(event.event_id),
+        );
         if (result.summaryTouched) touchedSessions.add(event.session_id);
       }
       const rebuiltSessions = summaryRebuild === "sessions"
@@ -249,9 +276,7 @@ export class LcmStorage {
   }
 
   private readRawEventIds(): Set<string> {
-    const result = readCachedRawEventIds(this.config.rawLogPath, this.rawEventIdCache);
-    this.rawEventIdCache = result.cache;
-    return result.eventIds;
+    return new Set(Array.from(readAllRawEvents(this.config), (event) => event.event_id));
   }
 
   private storeRawEventIds(eventIds: Set<string>): void {
@@ -320,6 +345,7 @@ export class LcmStorage {
   private reopenWritableIndex(): void {
     this.db?.close();
     this.db = new DatabaseSync(this.config.indexPath, { timeout: 5_000 });
+    registerStoredEventReader(this.db, this.config);
   }
 
   health(): Health {
@@ -353,7 +379,7 @@ export class LcmStorage {
     if (!this.db) return;
     if (this.rawLogIsIndexed()) return;
     const snapshot = withRawLogLock(this.config.rawLogPath, () => ({
-      rawLog: readRawLog(this.config.rawLogPath),
+      rawLog: readAllRawLog(this.config),
       state: this.rawLogState(),
     }));
     const rawLog = snapshot.rawLog;
@@ -365,7 +391,7 @@ export class LcmStorage {
       this.indexError = `Raw JSONL contains ${rawLog.malformedLineCount} malformed ${noun}; destructive index reconciliation is disabled until the log is repaired.`;
     }
     if (rawEvents.length === 0) {
-      if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawEvents([], snapshot.state);
+      if (indexedIds.size > 0 && rawLog.malformedLineCount === 0) this.rebuildIndexFromRawStream();
       else if (rawLog.malformedLineCount === 0) this.recordRawLogState(snapshot.state);
       return;
     }
@@ -376,7 +402,7 @@ export class LcmStorage {
       return indexedRaw !== undefined && indexedRaw !== JSON.stringify(event);
     });
     if ((hasStaleIndexedRows || hasChangedIndexedRows) && rawLog.malformedLineCount === 0) {
-      this.rebuildIndexFromRawEvents(rawEvents, snapshot.state);
+      this.rebuildIndexFromRawStream();
       return;
     }
     const missingEvents = rawEvents.filter((event) => !indexedIds.has(event.event_id));
@@ -386,11 +412,13 @@ export class LcmStorage {
     }
 
     const touchedSessions = new Set<string>();
+    const missingIds = new Set(missingEvents.map((event) => event.event_id));
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      for (const event of missingEvents) {
-        const result = this.indexEventInTransaction(event, { rebuildSummary: false });
-        if (result.summaryTouched) touchedSessions.add(event.session_id);
+      for (const located of readAllLocatedRawEvents(this.config)) {
+        if (!missingIds.has(located.event.event_id)) continue;
+        const result = this.indexEventInTransaction(located.event, { rebuildSummary: false }, located.location);
+        if (result.summaryTouched) touchedSessions.add(located.event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
       if (rawLog.malformedLineCount === 0) this.recordRawLogState(snapshot.state);
@@ -401,15 +429,41 @@ export class LcmStorage {
     }
   }
 
-  private rebuildIndexFromRawEvents(rawEvents: NormalizedEvent[], state: RawLogState): void {
+  private replayActiveRawLogToIndex(): void {
     if (!this.db) return;
+    const rawLog = withRawLogLock(this.config.rawLogPath, () => readRawLog(this.config.rawLogPath));
+    if (rawLog.malformedLineCount > 0) {
+      this.indexError = `Active raw JSONL contains ${rawLog.malformedLineCount} malformed lines.`;
+    }
+    const indexedIds = this.knownEventIds(rawLog.events.map((event) => event.event_id));
+    const missingIds = new Set(rawLog.events.filter((event) => !indexedIds.has(event.event_id)).map((event) => event.event_id));
+    if (missingIds.size === 0) return;
+    const touchedSessions = new Set<string>();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const located of readActiveRawEvents(this.config)) {
+        if (!missingIds.has(located.event.event_id)) continue;
+        const result = this.indexEventInTransaction(located.event, { rebuildSummary: false }, located.location);
+        if (result.summaryTouched) touchedSessions.add(located.event.session_id);
+      }
+      this.rebuildTouchedSummarySessions(touchedSessions);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      const failure = rollbackPreservingError(this.db, error).original;
+      this.indexError = failure instanceof Error ? failure.message : String(failure);
+    }
+  }
+
+  private rebuildIndexFromRawStream(): void {
+    if (!this.db) return;
+    const state = withRawLogLock(this.config.rawLogPath, () => this.rawLogState());
     const touchedSessions = new Set<string>();
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.clearDerivedIndex();
-      for (const event of rawEvents) {
-        const result = this.indexEventInTransaction(event, { rebuildSummary: false });
-        if (result.summaryTouched) touchedSessions.add(event.session_id);
+      for (const located of readAllLocatedRawEvents(this.config)) {
+        const result = this.indexEventInTransaction(located.event, { rebuildSummary: false }, located.location);
+        if (result.summaryTouched) touchedSessions.add(located.event.session_id);
       }
       this.rebuildTouchedSummarySessions(touchedSessions);
       this.recordRawLogState(state);
@@ -417,7 +471,9 @@ export class LcmStorage {
     } catch (error) {
       const rollback = rollbackPreservingError(this.db, error);
       const message = error instanceof Error ? error.message : String(error);
-      this.indexError = rollback.kind === "rolled_back" ? message : `${message}; rollback failed: ${rollback.rollbackError instanceof Error ? rollback.rollbackError.message : String(rollback.rollbackError)}`;
+      this.indexError = rollback.kind === "rolled_back"
+        ? message
+        : `${message}; rollback failed: ${rollback.rollbackError instanceof Error ? rollback.rollbackError.message : String(rollback.rollbackError)}`;
     }
   }
 
@@ -434,7 +490,7 @@ export class LcmStorage {
   }
 
   private rawLogIsIndexed(): boolean {
-    return this.db ? isRawLogIndexed(this.db, this.config.rawLogPath) : false;
+    return this.db ? isRawLogIndexed(this.db, this.config) : false;
   }
 
   private indexedRawLogState(): string | undefined {
@@ -446,7 +502,7 @@ export class LcmStorage {
   }
 
   private rawLogState(): RawLogState {
-    return currentRawLogState(this.config.rawLogPath);
+    return currentRawLogState(this.config);
   }
 
   private rebuildTouchedSummarySessions(sessionIds: Iterable<string>): string[] {
@@ -596,8 +652,12 @@ export class LcmStorage {
     if (this.db) initializeIndex(this.db);
   }
 
-  private indexEventInTransaction(event: NormalizedEvent, options: { rebuildSummary: boolean }): IndexEventResult {
-    return indexStoredEventInTransaction(this.db, event, options.rebuildSummary);
+  private indexEventInTransaction(
+    event: NormalizedEvent,
+    options: { rebuildSummary: boolean },
+    location?: ReturnType<typeof appendSegmentedEvents>[number],
+  ): IndexEventResult {
+    return indexStoredEventInTransaction(this.db, event, options.rebuildSummary, location);
   }
 
   private backfillDelegationParents(): void {

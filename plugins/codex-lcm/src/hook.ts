@@ -5,6 +5,7 @@ import { DEFAULT_LIMITS, loadConfig } from "./config.ts";
 import { importCodexSessions } from "./codex-import.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
+import { queueMaintenance } from "./maintenance.ts";
 import { sha256 } from "./redact.ts";
 import { createStorage } from "./storage.ts";
 
@@ -71,6 +72,7 @@ export async function runHook(args: string[]): Promise<void> {
   } finally {
     storage.close();
   }
+  queueMaintenance(config);
   const output = postCompactRecoveryOutput({
     home: config.home,
     hookEvent: event.hook_event,

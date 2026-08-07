@@ -51,11 +51,26 @@ Default home:
 
 ```text
 ~/.codex-lcm/
-  events.jsonl
+  events.jsonl                 # active append target, capped at 64 MiB
+  segments/
+    manifest.json
+    *.jsonl.gz                 # verified closed segments
   index.sqlite
 ```
 
-`events.jsonl` is the source of truth. `index.sqlite` is derived and can be deleted or rebuilt later.
+The active log and manifest-listed segments are the source of truth.
+`index.sqlite` is derived and can be deleted or rebuilt later. Closed segments
+use gzip level 1. SQLite keeps byte locators for archived events and drops its
+duplicate JSON after the segment checksum and event IDs pass verification.
+
+Writable startup cuts an older single-file store over under the raw writer
+lock. The hook gets a fresh active log at once, while a one-shot worker migrates
+the renamed legacy file in bounded batches. The manifest records progress, so a
+stopped worker resumes at the last published byte offset.
+
+The default retention policy is unlimited. A positive
+`CODEX_LCM_RETENTION_DAYS` in `~/.codex-lcm/.env` expires closed raw segments,
+detailed event rows, and orphan overflow files. Session and summary rows remain.
 
 SQLite tables:
 
