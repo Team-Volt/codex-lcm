@@ -576,6 +576,7 @@ function hashFile(filePath: string): string {
 }
 
 function fsyncDirectory(directory: string): void {
+  if (process.platform === "win32") return;
   const descriptor = fs.openSync(directory, "r");
   try {
     fs.fsyncSync(descriptor);
