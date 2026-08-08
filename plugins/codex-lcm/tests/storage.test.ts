@@ -6,13 +6,456 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
 
+import { loadConfig } from "../src/config.ts";
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
-import { appendRawEvents, readRawLog, withRawLogLock } from "../src/raw-log.ts";
+import { runMaintenanceOnce } from "../src/maintenance.ts";
+import {
+  appendRawEvents,
+  appendSegmentedEvents,
+  readAllRawEvents,
+  readLocatedEvent,
+  readRawLog,
+  withRawLogLock,
+} from "../src/raw-log.ts";
+import { readManifest, segmentStoreState, writeManifestAtomic, type SegmentManifest } from "../src/raw-segments.ts";
 import { sha256 } from "../src/redact.ts";
+import { recordValue } from "../src/storage-rows.ts";
+import { clearVerifiedRawJson, segmentsNeedRawJsonClearing } from "../src/storage-persistence.ts";
+import { registerStoredEventReader } from "../src/stored-event.ts";
 import { createStorage, LcmStorage } from "../src/storage.ts";
 import { clearDerivedSummaries, readJsonl, tempHome } from "./helpers.ts";
 
 const now = () => new Date("2026-06-09T12:00:00.000Z");
+
+test("retention configuration reads valid .env values and rejects invalid values", () => {
+  const missingHome = tempHome();
+  assert.equal(loadConfig({ home: missingHome, env: {} }).retentionDays, undefined);
+
+  const validHome = tempHome();
+  fs.writeFileSync(path.join(validHome, ".env"), "# local retention\nCODEX_LCM_RETENTION_DAYS=90\n");
+  const config = loadConfig({ home: validHome, env: {} });
+  assert.equal(config.retentionDays, 90);
+  assert.equal(config.configError, undefined);
+  assert.equal(loadConfig({ home: validHome, env: { CODEX_LCM_RETENTION_DAYS: "30" } }).retentionDays, 30);
+
+  for (const value of ["0", "-1", "2.5", "ninety"]) {
+    const home = tempHome();
+    fs.writeFileSync(path.join(home, ".env"), `CODEX_LCM_RETENTION_DAYS=${value}\n`);
+    const invalid = loadConfig({ home, env: {} });
+    assert.equal(invalid.retentionDays, undefined, value);
+    assert.equal(invalid.configError, "CODEX_LCM_RETENTION_DAYS must be a positive integer.", value);
+  }
+  const unsafe = loadConfig({ home: tempHome(), env: { CODEX_LCM_RETENTION_DAYS: "9".repeat(400) } });
+  assert.equal(unsafe.retentionDays, undefined);
+  assert.equal(unsafe.configError, "CODEX_LCM_RETENTION_DAYS must be a positive safe integer.");
+
+  const duplicateHome = tempHome();
+  fs.writeFileSync(duplicateHome + "/.env", "CODEX_LCM_RETENTION_DAYS=90\nCODEX_LCM_RETENTION_DAYS=91\n");
+  const duplicate = loadConfig({ home: duplicateHome, env: {} });
+  assert.equal(duplicate.retentionDays, undefined);
+  assert.notEqual(duplicate.configError, undefined);
+});
+
+test("segment manifest defaults, validates, writes atomically, and changes store state", () => {
+  const home = tempHome();
+  const manifestPath = path.join(home, "segments", "manifest.json");
+  assert.deepEqual(readManifest(manifestPath), { version: 1, segments: [] });
+
+  const manifest: SegmentManifest = {
+    version: 1,
+    segments: [{
+      id: "2026-06-09-000001",
+      path: "segments/2026-06-09-000001.jsonl",
+      compressed: false,
+      byte_count: 42,
+      event_count: 1,
+      first_timestamp: "2026-06-09T12:00:00.000Z",
+      last_timestamp: "2026-06-09T12:00:00.000Z",
+      sha256: "a".repeat(64),
+    }],
+  };
+  writeManifestAtomic(manifestPath, manifest);
+  assert.deepEqual(readManifest(manifestPath), manifest);
+  assert.notEqual(
+    segmentStoreState(manifest),
+    segmentStoreState({ ...manifest, segments: [{ ...manifest.segments[0], sha256: "b".repeat(64) }] }),
+  );
+
+  fs.writeFileSync(manifestPath, "{not json");
+  assert.throws(() => readManifest(manifestPath), /manifest/u);
+  assert.equal(fs.readFileSync(manifestPath, "utf8"), "{not json");
+  fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, segments: [{ ...manifest.segments[0], path: "../escape.jsonl" }] }));
+  assert.throws(() => readManifest(manifestPath), /manifest/u);
+});
+
+test("rotates active raw log before a record exceeds the configured cap", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const seed = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "segment-seed", cwd: "/tmp/segment-seed", prompt: "seed" }),
+    env: {},
+    now,
+  });
+  const next = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "segment-next", cwd: "/tmp/segment-next", prompt: "next" }),
+    env: {},
+    now,
+  });
+  appendRawEvents(config.rawLogPath, [seed]);
+  const cap = fs.statSync(config.rawLogPath).size + 1;
+
+  appendSegmentedEvents(config, [next], { segmentCapBytes: cap });
+
+  const manifest = readManifest(config.manifestPath);
+  assert.equal(manifest.segments.length, 1);
+  assert.equal(manifest.segments[0].event_count, 1);
+  assert.equal(manifest.segments[0].sha256, sha256(fs.readFileSync(path.join(home, manifest.segments[0].path))));
+  assert.deepEqual(readJsonl(path.join(home, manifest.segments[0].path)), [seed]);
+  assert.deepEqual(readJsonl(config.rawLogPath), [next]);
+});
+
+test("reads located raw event from a closed segment", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const seed = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "located-seed", cwd: "/tmp/located-seed", prompt: "seed" }),
+    env: {},
+    now,
+  });
+  const next = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "located-next", cwd: "/tmp/located-next", prompt: "next" }),
+    env: {},
+    now,
+  });
+  appendRawEvents(config.rawLogPath, [seed]);
+  appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+  const record = readManifest(config.manifestPath).segments[0];
+  const length = fs.statSync(path.join(home, record.path)).size;
+
+  assert.deepEqual(readLocatedEvent(config, { segmentId: record.id, offset: 0, length }), seed);
+});
+
+test("keeps active event locators valid after rotation", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const first = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "stable-first", cwd: "/tmp/stable-first", prompt: "first" }),
+    env: {},
+    now,
+  });
+  const second = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "stable-second", cwd: "/tmp/stable-second", prompt: "second" }),
+    env: {},
+    now,
+  });
+  const firstLocation = appendSegmentedEvents(config, [first], { segmentCapBytes: 1_024 })[0];
+
+  appendSegmentedEvents(config, [second], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+
+  assert.deepEqual(readLocatedEvent(config, firstLocation), first);
+});
+
+test("streams segmented history across closed and active logs", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const seed = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "stream-seed", cwd: "/tmp/stream-seed", prompt: "seed" }),
+    env: {},
+    now,
+  });
+  const next = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "stream-next", cwd: "/tmp/stream-next", prompt: "next" }),
+    env: {},
+    now,
+  });
+  appendRawEvents(config.rawLogPath, [seed]);
+  appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+  const eventIds: string[] = [];
+  for (const event of readAllRawEvents(config)) eventIds.push(event.event_id);
+  assert.deepEqual(eventIds, [seed.event_id, next.event_id]);
+});
+
+test("hydrates an event from its raw locator after SQLite payload clearing", () => {
+  const home = tempHome();
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "cold-locator", cwd: "/tmp/cold-locator", prompt: "keep me" }),
+    env: {},
+    now,
+  });
+  const storage = createStorage({ home });
+  storage.ingest(event);
+  storage.close();
+  const next = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "cold-locator-next", cwd: "/tmp/cold-locator", prompt: "rotate" }),
+    env: {},
+    now,
+  });
+  const config = loadConfig({ home });
+  appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  registerStoredEventReader(db, config);
+  const row = recordValue(db.prepare(`
+    SELECT segment_id, raw_offset, raw_length, raw_json FROM events WHERE event_id = ?1
+  `).get(event.event_id));
+  assert.equal(row.segment_id, "0000000000000001");
+  assert.equal(row.raw_offset, 0);
+  assert.equal(typeof row.raw_length, "number");
+  assert.equal(typeof row.raw_json, "string");
+  assert.equal(clearVerifiedRawJson(db, String(row.segment_id), 1), 1);
+  assert.equal(db.prepare("SELECT raw_json FROM events WHERE event_id = ?1").get(event.event_id)?.raw_json, "");
+  db.close();
+
+  const reopened = createStorage({ home, readOnly: true });
+  try {
+    assert.deepEqual(reopened.getSession(event.session_id).events, [event]);
+    assert.deepEqual(reopened.getRecentContext({ sessionId: event.session_id }).events, [event]);
+    assert.equal(reopened.getSessionGraph(event.session_id).nodes.some((node) => node.event_id === event.event_id), true);
+    assert.equal(reopened.searchSessions({ query: "keep me" }).some((match) => match.session_id === event.session_id), true);
+    assert.equal(reopened.packContext({ sessionIds: [event.session_id], query: "keep me" }).sources.some(
+      (source) => source.kind === "event" && source.event_id === event.event_id,
+    ), true);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("automatically cuts over a legacy raw log without dropping indexed history", () => {
+  const home = tempHome();
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "legacy-cutover", cwd: "/tmp/legacy-cutover", prompt: "old history" }),
+    env: {},
+    now,
+  });
+  const legacy = createStorage({ home });
+  legacy.ingest(event);
+  legacy.close();
+  const config = loadConfig({ home });
+  fs.unlinkSync(config.manifestPath);
+
+  const reopened = createStorage({ home });
+  try {
+    const manifest = readManifest(config.manifestPath);
+    assert.deepEqual(manifest.migration, {
+      legacy_path: "segments/legacy.jsonl",
+      offset: 0,
+      complete: false,
+    });
+    assert.equal(fs.statSync(config.rawLogPath).size, 0);
+    assert.equal(fs.existsSync(path.join(home, "segments", "legacy.jsonl")), true);
+    assert.deepEqual(reopened.getSession(event.session_id).events, [event]);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("recovers a legacy cutover interrupted after the authoritative log rename", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "legacy-cutover-recovery", cwd: "/tmp/legacy-cutover", prompt: "recover me" }),
+    env: {},
+    now,
+  });
+  appendRawEvents(config.rawLogPath, [event]);
+  fs.mkdirSync(config.segmentsDir, { recursive: true });
+  fs.renameSync(config.rawLogPath, path.join(config.segmentsDir, "legacy.jsonl"));
+
+  const recovered = createStorage({ config });
+  try {
+    assert.equal(readManifest(config.manifestPath).migration?.complete, false);
+    assert.equal(fs.existsSync(config.rawLogPath), true);
+    assert.deepEqual(recovered.getSession(event.session_id).events, [event]);
+  } finally {
+    recovered.close();
+  }
+});
+
+test("resumes legacy migration without duplicating events", () => {
+  const home = tempHome();
+  const legacy = createStorage({ home });
+  const events = ["one", "two", "three"].map((prompt, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "legacy-resume", cwd: "/tmp/legacy-resume", prompt }),
+    env: {},
+    now: () => new Date(`2026-06-09T12:00:0${index}.000Z`),
+  }));
+  legacy.ingestMany(events);
+  legacy.close();
+  const config = loadConfig({ home });
+  fs.unlinkSync(config.manifestPath);
+  const cutover = createStorage({ home });
+  cutover.close();
+
+  const first = runMaintenanceOnce(config, { maxSegments: 1, segmentCapBytes: Buffer.byteLength(JSON.stringify(events[0])) + 1 });
+  assert.equal(first.migrated, 1);
+  assert.equal(readManifest(config.manifestPath).migration?.complete, false);
+
+  const second = runMaintenanceOnce(config, { segmentCapBytes: Buffer.byteLength(JSON.stringify(events[0])) + 1 });
+  assert.equal(second.migrated, 2);
+  assert.equal(readManifest(config.manifestPath).migration?.complete, true);
+  assert.deepEqual(Array.from(readAllRawEvents(config)).map((event) => event.event_id), events.map((event) => event.event_id));
+});
+
+test("keeps earlier quarantine findings when a resumed migration reaches EOF", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const events = ["before", "after"].map((prompt, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "legacy-quarantine", cwd: "/tmp/legacy-quarantine", prompt }),
+    env: {},
+    now: () => new Date(`2026-06-09T12:00:0${index}.000Z`),
+  }));
+  fs.writeFileSync(config.rawLogPath, `${JSON.stringify(events[0])}\nnot-json\n${JSON.stringify(events[1])}\n`);
+  const cutover = createStorage({ config });
+  cutover.close();
+  const segmentCapBytes = Buffer.byteLength(JSON.stringify(events[0])) + Buffer.byteLength("\nnot-json\n");
+
+  const first = runMaintenanceOnce(config, { maxSegments: 1, segmentCapBytes });
+  assert.equal(first.quarantined, 1);
+  assert.equal(readManifest(config.manifestPath).migration?.complete, false);
+
+  const second = runMaintenanceOnce(config, { segmentCapBytes });
+  assert.equal(second.quarantined, 1);
+  assert.deepEqual(second.errors, ["1 malformed legacy records were quarantined."]);
+  assert.equal(readManifest(config.manifestPath).migration?.complete, true);
+  assert.equal(fs.existsSync(path.join(config.segmentsDir, "legacy.jsonl")), true);
+});
+
+test("compresses a verified closed segment and keeps locator reads available", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const first = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "compressed-locator", cwd: "/tmp/compressed-locator", prompt: "archive me" }),
+    env: {},
+    now,
+  });
+  const firstLocation = appendSegmentedEvents(config, [first], { segmentCapBytes: 1_024 })[0];
+  const next = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "compressed-next", cwd: "/tmp/compressed-locator", prompt: "rotate" }),
+    env: {},
+    now,
+  });
+  appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+
+  const report = runMaintenanceOnce(config);
+
+  assert.equal(report.compressed, 1);
+  const record = readManifest(config.manifestPath).segments[0];
+  assert.equal(record.compressed, true);
+  assert.equal(fs.existsSync(path.join(home, record.path)), true);
+  assert.deepEqual(readLocatedEvent(config, firstLocation), first);
+});
+
+test("rebuilds a deleted index with locators that allow archived payload clearing", () => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const archived = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "locator-rebuild", cwd: "/tmp/locator-rebuild", prompt: "archive" }),
+    env: {},
+    now,
+  });
+  const storage = createStorage({ config });
+  storage.ingest(archived);
+  storage.close();
+  const active = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "locator-rebuild-active", cwd: "/tmp/locator-rebuild", prompt: "active" }),
+    env: {},
+    now,
+  });
+  appendSegmentedEvents(config, [active], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+  runMaintenanceOnce(config);
+  fs.unlinkSync(config.indexPath);
+
+  const rebuilt = createStorage({ config });
+  rebuilt.close();
+  const beforeMaintenance = new DatabaseSync(config.indexPath);
+  assert.equal(segmentsNeedRawJsonClearing(beforeMaintenance, readManifest(config.manifestPath).segments.map((record) => record.id)), true);
+  beforeMaintenance.close();
+  runMaintenanceOnce(config);
+
+  const db = new DatabaseSync(config.indexPath, { readOnly: true });
+  const row = db.prepare("SELECT raw_json, segment_id, raw_offset, raw_length FROM events WHERE event_id = ?1").get(archived.event_id);
+  assert.equal(row?.raw_json, "");
+  assert.equal(typeof row?.segment_id, "string");
+  assert.equal(typeof row?.raw_offset, "number");
+  assert.equal(typeof row?.raw_length, "number");
+  assert.equal(segmentsNeedRawJsonClearing(db, readManifest(config.manifestPath).segments.map((record) => record.id)), false);
+  db.close();
+  const reopened = createStorage({ config, readOnly: true });
+  try {
+    assert.deepEqual(reopened.getSession(archived.session_id).events, [archived]);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("expires configured raw history while preserving session summaries", () => {
+  const home = tempHome();
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_RETENTION_DAYS=30\n", { mode: 0o600 });
+  const config = loadConfig({ home });
+  const oldEvent = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "retained-summary", cwd: "/tmp/retention", prompt: "old detail" }),
+    env: {},
+    now: () => new Date("2026-06-01T00:00:00.000Z"),
+  });
+  const storage = createStorage({ config });
+  storage.ingest(oldEvent);
+  storage.close();
+  const next = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "retention-active", cwd: "/tmp/retention", prompt: "active" }),
+    env: {},
+    now: () => new Date("2026-08-06T00:00:00.000Z"),
+  });
+  appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+
+  const report = runMaintenanceOnce(config, { now: () => new Date("2026-08-06T00:00:00.000Z") });
+
+  assert.equal(report.expired, 1);
+  assert.equal(readManifest(config.manifestPath).segments.length, 0);
+  const db = new DatabaseSync(config.indexPath, { readOnly: true });
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM events WHERE event_id = ?1").get(oldEvent.event_id)?.count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE session_id = ?1").get(oldEvent.session_id)?.count, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM session_summaries WHERE session_id = ?1").get(oldEvent.session_id)?.count, 1);
+  db.close();
+});
+
+test("invalid retention configuration blocks source deletion", () => {
+  const home = tempHome();
+  fs.writeFileSync(path.join(home, ".env"), "CODEX_LCM_RETENTION_DAYS=0\n", { mode: 0o600 });
+  const config = loadConfig({ home });
+  const event = normalizeHookEvent({
+    hookEvent: "UserPromptSubmit",
+    rawInput: JSON.stringify({ session_id: "invalid-retention", cwd: "/tmp/retention", prompt: "preserve" }),
+    env: {},
+    now: () => new Date("2026-06-01T00:00:00.000Z"),
+  });
+  appendSegmentedEvents(config, [event], { segmentCapBytes: 1_024 });
+  appendSegmentedEvents(config, [event], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+
+  const report = runMaintenanceOnce(config, { now: () => new Date("2026-08-06T00:00:00.000Z") });
+
+  assert.deepEqual(report.errors, ["CODEX_LCM_RETENTION_DAYS must be a positive integer."]);
+  assert.equal(readManifest(config.manifestPath).segments.length, 1);
+});
 
 test("writable storage restricts its home and SQLite index permissions", () => {
   if (process.platform === "win32") return;
@@ -975,7 +1418,7 @@ test("constructor replay leaves an interleaved raw append visible to the next op
   const reopened = createStorage({ home });
 
   // Then: the append that raced replay is present in both authority and index.
-  assert.equal(readRawLog(rawLogPath).events.length, 2);
+  assert.equal(Array.from(readAllRawEvents(loadConfig({ home }))).length, 2);
   assert.equal(reopened.health().event_count, 2);
   assert.equal(reopened.hasEvent(interleaved.event_id), true);
   reopened.close();
@@ -1759,7 +2202,7 @@ test("cleanup acquires the write lock before snapshotting searchable events", ()
   storage.close();
 
   const beginIndex = calls.findIndex((sql) => sql === "BEGIN IMMEDIATE");
-  const snapshotIndex = calls.findIndex((sql) => sql.includes("SELECT raw_json") && sql.includes("FROM events"));
+  const snapshotIndex = calls.findIndex((sql) => sql.includes("AS raw_json") && sql.includes("FROM events"));
   const optimizeIndex = calls.findIndex((sql) => sql === "INSERT INTO event_fts(event_fts) VALUES('optimize')");
   const vacuumIndex = calls.findIndex((sql) => sql === "VACUUM");
   assert.equal(beginIndex >= 0, true);

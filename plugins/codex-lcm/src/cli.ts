@@ -3,6 +3,7 @@ import { runLongContextBenchmark, runRetrievalQualityBenchmark } from "./benchma
 import { importCodexSessions } from "./codex-import.ts";
 import { buildDoctorReport } from "./doctor.ts";
 import { runHook } from "./hook.ts";
+import { runMaintenanceOnce } from "./maintenance.ts";
 import { readStatus } from "./installer.ts";
 import { startMcpServer } from "./mcp.ts";
 import { createStorage } from "./storage.ts";
@@ -23,6 +24,10 @@ export async function main(argv: string[]): Promise<void> {
   }
   if (command === "hook") {
     await runHook(rest);
+    return;
+  }
+  if (command === "maintain" && rest[0] === "--once") {
+    printObjectOrText(runMaintenanceOnce(loadConfig()));
     return;
   }
   if (command === "status") {

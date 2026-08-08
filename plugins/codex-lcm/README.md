@@ -35,6 +35,16 @@ Storage defaults to `~/.codex-lcm`. Override storage for hook and MCP operations
 CODEX_LCM_HOME=/path/to/lcm-home node bin/codex-lcm health
 ```
 
+Raw history remains available forever unless `~/.codex-lcm/.env` sets a
+positive retention window:
+
+```dotenv
+CODEX_LCM_RETENTION_DAYS=90
+```
+
+The process environment takes precedence over `.env`. Invalid, zero, negative,
+and fractional values disable deletion and appear in `health` and `stats`.
+
 Useful diagnostics and backfill commands:
 
 ```sh
@@ -57,7 +67,7 @@ reasoning metadata, and cumulative token usage from existing transcripts.
 and cursor filters. `usage --roots-only` includes descendant session tokens, so
 root-task totals account for delegated work. `cleanup` previews a high-signal
 FTS rebuild and SQLite compaction; `--apply` performs it while preserving the
-raw JSONL source of truth. `context-plan`
+configured raw history. `context-plan`
 estimates recent-session token pressure and recommends
 when to pack LCM context; it does not control Codex compaction. The benchmark
 command generates a temporary synthetic long session and verifies old evidence

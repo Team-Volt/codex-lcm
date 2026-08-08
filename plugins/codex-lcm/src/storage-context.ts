@@ -6,6 +6,7 @@ import type { FileReference } from "./file-refs.ts";
 import { overflowReferenceFromEvent, readOverflowContent, type OverflowReference } from "./overflow.ts";
 import { readRawEvents } from "./raw-log.ts";
 import { recordValue, rowToFileReference } from "./storage-rows.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import {
   clampLimit,
   positiveInteger,
@@ -190,7 +191,7 @@ export function getRecentContext(
   }
   const rows = db.prepare(`
     SELECT raw_json FROM (
-      SELECT raw_json, timestamp, rowid
+      SELECT ${STORED_EVENT_JSON_SQL} AS raw_json, timestamp, rowid
       FROM events
       WHERE session_id = ?1
       ORDER BY timestamp DESC, rowid DESC
@@ -289,9 +290,9 @@ export function getOverflowRef(db: DatabaseSync | undefined, rawLogPath: string,
       .find((reference) => reference?.sha256 === hash);
   }
   const rawJson = recordValue(db.prepare(`
-    SELECT raw_json
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json
     FROM events
-    WHERE json_extract(raw_json, '$.payload.overflow_ref.sha256') = ?1
+    WHERE overflow_sha256 = ?1
     ORDER BY timestamp DESC, rowid DESC
     LIMIT 1
   `).get(hash)).raw_json;
@@ -599,7 +600,7 @@ function getContextPlanEvents(db: DatabaseSync | undefined, rawLogPath: string, 
   }
   const rows = db.prepare(`
     SELECT raw_json FROM (
-      SELECT raw_json, timestamp, rowid
+      SELECT ${STORED_EVENT_JSON_SQL} AS raw_json, timestamp, rowid
       FROM events
       WHERE session_id = ?1
       ORDER BY timestamp DESC, rowid DESC

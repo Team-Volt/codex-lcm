@@ -4,6 +4,7 @@ import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
 import { readRawEvents } from "./raw-log.ts";
 import { recordValue, rowToSessionMemorySummary, rowToSummaryNode } from "./storage-rows.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import type { SearchSessionArgs } from "./storage-types.ts";
 import { isCodexLcmToolEvent, isSummaryHook } from "./storage-sessions.ts";
 import {
@@ -212,7 +213,7 @@ export function getSummaryNodeSourceEvents(
   if (selectedIds.length === 0) return [];
   const placeholders = selectedIds.map((_, index) => `?${index + 1}`).join(", ");
   const rows = db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE event_id IN (${placeholders})
     ORDER BY timestamp ASC, rowid ASC
   `).all(...selectedIds);
@@ -236,7 +237,7 @@ export function getSessionSummarySourceEvents(
   if (!db || summary.source_event_ids.length === 0) return [];
   const placeholders = summary.source_event_ids.map((_, index) => `?${index + 1}`).join(", ");
   const events = db.prepare(`
-    SELECT raw_json
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json
     FROM events
     WHERE event_id IN (${placeholders})
     ORDER BY timestamp ASC, rowid ASC
@@ -441,7 +442,7 @@ function insertSummaryNode(db: DatabaseSync, node: SummaryNode): void {
 
 function getAllSummarySourceEventsForSession(db: DatabaseSync, sessionId: string): NormalizedEvent[] {
   return db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE session_id = ?1
       AND hook_event IN ('UserPromptSubmit', 'Note', 'Stop', 'PreCompact', 'PostCompact')
     ORDER BY timestamp ASC, rowid ASC
@@ -453,21 +454,21 @@ function getAllSummarySourceEventsForSession(db: DatabaseSync, sessionId: string
 
 function getSummaryEventsForSession(db: DatabaseSync, sessionId: string): NormalizedEvent[] {
   const earlySignals = db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE session_id = ?1
       AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
     ORDER BY timestamp ASC, rowid ASC
     LIMIT ?2
   `).all(sessionId, SUMMARY_EARLY_SIGNAL_LIMIT);
   const latestSignals = db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE session_id = ?1
       AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
     ORDER BY timestamp DESC, rowid DESC
     LIMIT ?2
   `).all(sessionId, SUMMARY_LATEST_SIGNAL_LIMIT);
   const recentEvents = db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE session_id = ?1
     ORDER BY timestamp DESC, rowid DESC
     LIMIT ?2

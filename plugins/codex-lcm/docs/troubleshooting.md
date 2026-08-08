@@ -85,7 +85,8 @@ CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm health --json
 CODEX_LCM_HOME=/private/tmp/codex-lcm-check node bin/codex-lcm stats --json
 ```
 
-If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and falls back to raw-log scanning.
+If SQLite cannot open `index.sqlite`, Codex LCM still appends `events.jsonl` and
+falls back to scanning the active log and archived segments.
 Use `stats --json` when you need aggregate hook-event, summary-depth,
 graph-count, and freshness checks without opening the SQLite database directly.
 For compaction hook verification, check `hook_event_counts.PreCompact` and
@@ -106,8 +107,8 @@ The preview reports the current index size, retained search rows, duplicated
 event-text bytes, and the projected high-signal search-row count. It does not
 write to SQLite.
 
-`events.jsonl` remains the source of truth, so cleanup never deletes transcript
-events. If you also want a point-in-time copy of the derived index, make an
+The active log and archived segments remain the source of truth, so cleanup
+never deletes retained transcript events. If you also want a point-in-time copy of the derived index, make an
 online SQLite backup first:
 
 ```sh
@@ -126,6 +127,25 @@ duplicate event-text column, refreshes deterministic summaries, and runs
 `VACUUM` so SQLite can return unused pages to disk. Close other Codex sessions
 first if SQLite reports that the database is busy. Set `CODEX_LCM_HOME` when
 cleaning a non-default LCM home.
+
+## Retention and automatic migration
+
+Codex LCM keeps raw history forever by default. To set a limit, create
+`~/.codex-lcm/.env` with one positive whole number:
+
+```dotenv
+CODEX_LCM_RETENTION_DAYS=90
+```
+
+A process-level value overrides the file. Check `config_error` in `health
+--json` if deletion does not run. Finite retention removes exact old event
+sources after the cutoff, but keeps session and summary records.
+
+An upgraded store migrates without a manual command. `migration_state` reports
+`pending`, `complete`, or `error`; `plain_segment_count`,
+`compressed_segment_count`, and `archive_bytes` show its progress. Do not remove
+`segments/legacy.jsonl` when migration reports an error because it remains the
+forensic source for any quarantined record.
 
 ## Node Warnings
 

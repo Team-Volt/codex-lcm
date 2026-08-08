@@ -5,6 +5,7 @@ import type { NormalizedEvent } from "./events.ts";
 import { readRawEvents } from "./raw-log.ts";
 import { getLatestCheckpoint } from "./storage-graph.ts";
 import { recordValue } from "./storage-rows.ts";
+import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import {
   bestMatchSnippet,
   compactWhitespace,
@@ -108,7 +109,7 @@ function searchContextEvents(db: DatabaseSync | undefined, rawLogPath: string, a
     : "";
   const limitParameter = sessionIds.length + 3;
   const statement = db.prepare(`
-    SELECT e.raw_json
+    SELECT lcm_raw_json(e.raw_json, e.segment_id, e.raw_offset, e.raw_length) AS raw_json
     FROM event_fts f
     JOIN events e ON e.event_id = f.event_id
     WHERE event_fts MATCH ?1
@@ -140,7 +141,7 @@ function getRecentContextEvents(db: DatabaseSync | undefined, rawLogPath: string
       .reverse();
   }
   return db.prepare(`
-    SELECT raw_json FROM events
+    SELECT ${STORED_EVENT_JSON_SQL} AS raw_json FROM events
     WHERE session_id = ?1
       AND hook_event IN ${SUMMARY_SOURCE_HOOKS}
     ORDER BY timestamp DESC, rowid DESC

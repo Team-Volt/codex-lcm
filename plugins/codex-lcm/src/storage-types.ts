@@ -278,6 +278,13 @@ export type Health = {
   summary_count?: number;
   session_summary_count?: number;
   summary_node_count?: number;
+  storage_layout: "segmented-v1";
+  migration_state: "none" | "pending" | "complete" | "error";
+  active_bytes: number;
+  archive_bytes: number;
+  plain_segment_count: number;
+  compressed_segment_count: number;
+  config_error?: string;
 };
 
 export type LcmStats = Health & {
