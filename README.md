@@ -1,3 +1,5 @@
+> **Notice:** This repository will soon be deprecated and replaced by [agent-lcm](https://github.com/Team-Volt/agent-lcm).
+
 # Codex LCM
 
 Codex LCM is a local context memory plugin for Codex. It captures Codex session
