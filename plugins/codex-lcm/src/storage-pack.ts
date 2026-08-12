@@ -111,7 +111,7 @@ function searchContextEvents(db: DatabaseSync | undefined, rawLogPath: string, a
   const statement = db.prepare(`
     SELECT lcm_raw_json(e.raw_json, e.segment_id, e.raw_offset, e.raw_length) AS raw_json
     FROM event_fts f
-    JOIN events e ON e.event_id = f.event_id
+    JOIN events e ON e.rowid = f.rowid
     WHERE event_fts MATCH ?1
       AND (?2 IS NULL OR e.cwd = ?2)
       AND e.hook_event IN ${SUMMARY_SOURCE_HOOKS}

@@ -338,7 +338,7 @@ export function searchStoredSessions(db: DatabaseSync | undefined, rawLogPath: s
            e.timestamp AS match_timestamp, 1 AS match_weight,
            'event' AS match_kind, e.event_id AS match_event_id
     FROM event_fts f
-    JOIN events e ON e.event_id = f.event_id
+    JOIN events e ON e.rowid = f.rowid
     JOIN sessions s ON s.session_id = e.session_id
     WHERE event_fts MATCH ?1
       AND (?2 IS NULL OR s.cwd = ?2)
@@ -353,7 +353,7 @@ export function searchStoredSessions(db: DatabaseSync | undefined, rawLogPath: s
            'session_summary' AS match_kind, ss.topics_json AS match_topics_json,
            ss.source_event_ids_json AS match_source_event_ids_json
     FROM session_summary_fts f
-    JOIN session_summaries ss ON ss.session_id = f.session_id
+    JOIN session_summaries ss ON ss.rowid = f.rowid
     JOIN sessions s ON s.session_id = ss.session_id
     WHERE session_summary_fts MATCH ?1
       AND (?2 IS NULL OR s.cwd = ?2)
@@ -369,7 +369,7 @@ export function searchStoredSessions(db: DatabaseSync | undefined, rawLogPath: s
            n.source_event_ids_json AS match_source_event_ids_json,
            n.source_token_count AS match_source_token_count
     FROM summary_node_fts f
-    JOIN summary_nodes n ON n.node_id = f.node_id
+    JOIN summary_nodes n ON n.rowid = f.rowid
     JOIN sessions s ON s.session_id = n.session_id
     WHERE summary_node_fts MATCH ?1
       AND (?2 IS NULL OR s.cwd = ?2)

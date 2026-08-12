@@ -158,7 +158,7 @@ export function searchSummaryNodes(db: DatabaseSync | undefined, args: SummaryNo
            n.source_type, n.source_ids_json, n.source_event_ids_json, n.earliest_at, n.latest_at,
            n.created_at, n.cwd, n.repo_root, n.git_branch, n.topics_json
     FROM summary_node_fts f
-    JOIN summary_nodes n ON n.node_id = f.node_id
+    JOIN summary_nodes n ON n.rowid = f.rowid
     WHERE summary_node_fts MATCH ?1
       AND (?2 IS NULL OR n.cwd = ?2)
       AND (?3 IS NULL OR n.repo_root = ?3)
@@ -297,14 +297,14 @@ export function rebuildSessionMemorySummary(db: DatabaseSync | undefined, sessio
   if (!db) return;
   const events = getSummaryEventsForSession(db, sessionId);
   if (events.length === 0) {
-    db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
+    db.prepare("DELETE FROM session_summary_fts WHERE rowid IN (SELECT rowid FROM session_summaries WHERE session_id = ?1)").run(sessionId);
     db.prepare("DELETE FROM session_summaries WHERE session_id = ?1").run(sessionId);
     rebuildSummaryNodes(db, sessionId);
     return;
   }
   const summary = buildSessionMemorySummary(events);
   const summaryText = summarySearchText(summary);
-  db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run(sessionId);
+  db.prepare("DELETE FROM session_summary_fts WHERE rowid IN (SELECT rowid FROM session_summaries WHERE session_id = ?1)").run(sessionId);
   db.prepare(`
     INSERT INTO session_summaries
       (session_id, summary_version, updated_at, cwd, repo_root, git_branch, title, overview, topics_json,
@@ -341,8 +341,8 @@ export function rebuildSessionMemorySummary(db: DatabaseSync | undefined, sessio
     summaryText,
   );
   db.prepare(`
-    INSERT INTO session_summary_fts (session_id, cwd, repo_root, content)
-    VALUES (?1, ?2, ?3, ?4)
+    INSERT INTO session_summary_fts (rowid, session_id, cwd, repo_root, content)
+    SELECT rowid, ?1, ?2, ?3, ?4 FROM session_summaries WHERE session_id = ?1
   `).run(summary.session_id, summary.cwd, summary.repo_root ?? "", summaryText);
   rebuildSummaryNodes(db, sessionId);
 }
@@ -370,7 +370,7 @@ function rebuildSummaryNodes(db: DatabaseSync, sessionId: string): void {
     existing.set(String(record.node_id), Number(record.summary_version));
   }
   const nextIds = new Set(nodes.map((node) => node.node_id));
-  const deleteFts = db.prepare("DELETE FROM summary_node_fts WHERE node_id = ?1");
+  const deleteFts = db.prepare("DELETE FROM summary_node_fts WHERE rowid IN (SELECT rowid FROM summary_nodes WHERE node_id = ?1)");
   const deleteNode = db.prepare("DELETE FROM summary_nodes WHERE node_id = ?1");
   for (const nodeId of existing.keys()) {
     if (nextIds.has(nodeId)) continue;
@@ -428,8 +428,8 @@ function insertSummaryNode(db: DatabaseSync, node: SummaryNode): void {
     JSON.stringify(node.topics),
   );
   db.prepare(`
-    INSERT INTO summary_node_fts (node_id, session_id, cwd, repo_root, depth, content)
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+    INSERT INTO summary_node_fts (rowid, node_id, session_id, cwd, repo_root, depth, content)
+    SELECT rowid, ?1, ?2, ?3, ?4, ?5, ?6 FROM summary_nodes WHERE node_id = ?1
   `).run(
     node.node_id,
     node.session_id,

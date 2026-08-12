@@ -4,8 +4,12 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
+import { loadConfig } from "../src/config.ts";
 import { normalizeHookEvent } from "../src/events.ts";
+import { runMaintenanceOnce } from "../src/maintenance.ts";
 import { createStorage } from "../src/storage.ts";
+import { initializeIndex } from "../src/storage-persistence.ts";
+import { registerStoredEventReader } from "../src/stored-event.ts";
 import { clearDerivedSummaries, tempHome } from "./helpers.ts";
 
 test("derives sessions, turns, events, tool pairs, and checkpoints as a bounded DAG", () => {
@@ -767,7 +771,17 @@ test("migrates pre-DAG SQLite indexes without persisting graph projections", () 
       INSERT INTO events (event_id, session_id, timestamp, hook_event, cwd, repo_root, git_branch, text, raw_json)
       VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7)
     `).run(event.event_id, event.session_id, event.timestamp, event.hook_event, event.cwd, JSON.stringify(event.payload), JSON.stringify(event));
+    db.prepare(`
+      INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
+      VALUES (?1, ?2, ?3, '', ?4, ?5)
+    `).run(event.event_id, event.session_id, event.cwd, event.hook_event, JSON.stringify(event.payload));
   }
+  registerStoredEventReader(db, loadConfig({ home }));
+  db.prepare("UPDATE events SET raw_json = ?1 WHERE event_id = ?2").run(JSON.stringify(events[1]), events[0].event_id);
+  assert.throws(() => initializeIndex(db), /Stored event locator mismatch/u);
+  const legacySchema = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'event_fts'").get();
+  assert.equal(String(legacySchema?.sql).includes("contentless_delete=1"), false);
+  db.prepare("UPDATE events SET raw_json = ?1 WHERE event_id = ?2").run(JSON.stringify(events[0]), events[0].event_id);
   db.close();
 
   const storage = createStorage({ home });
@@ -778,6 +792,27 @@ test("migrates pre-DAG SQLite indexes without persisting graph projections", () 
   assert.equal(storage.getSessionGraph("legacy-session", { limit: 20 }).nodes.some((node) => node.kind === "turn"), true);
 
   storage.close();
+  runMaintenanceOnce(loadConfig({ home }));
+
+  const migrated = new DatabaseSync(path.join(home, "index.sqlite"), { readOnly: true });
+  const schemas = migrated.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'table' AND name IN ('event_fts', 'session_summary_fts', 'summary_node_fts')
+  `).all();
+  assert.equal(schemas.length, 3);
+  assert.equal(schemas.every((row) => String(row.sql).includes("contentless_delete=1")), true);
+  const ftsRow = migrated.prepare("SELECT rowid, event_id FROM event_fts LIMIT 1").get();
+  assert.equal(typeof ftsRow?.rowid, "number");
+  assert.equal(ftsRow?.event_id, null);
+  assert.equal(migrated.prepare("SELECT 1 FROM index_metadata WHERE key = 'search_index_vacuum_v1'").get(), undefined);
+  migrated.close();
+
+  const reopened = createStorage({ home, readOnly: true });
+  assert.deepEqual(
+    reopened.searchSessions({ query: "legacy migration event 1", limit: 5 }).map((match) => match.session_id),
+    ["legacy-session"],
+  );
+  reopened.close();
 });
 
 function ingest(

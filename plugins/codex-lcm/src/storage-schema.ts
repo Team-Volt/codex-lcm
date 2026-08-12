@@ -46,15 +46,6 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
       agent_id TEXT,
       overflow_sha256 TEXT
     );
-    CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
-      event_id UNINDEXED,
-      session_id,
-      cwd,
-      repo_root,
-      hook_event,
-      content
-    );
-
     CREATE TABLE IF NOT EXISTS session_summaries (
       session_id TEXT PRIMARY KEY,
       summary_version INTEGER NOT NULL DEFAULT ${SUMMARY_ALGORITHM_VERSION},
@@ -70,12 +61,6 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
       tools_json TEXT NOT NULL,
       source_event_ids_json TEXT NOT NULL,
       summary_text TEXT NOT NULL
-    );
-    CREATE VIRTUAL TABLE IF NOT EXISTS session_summary_fts USING fts5(
-      session_id UNINDEXED,
-      cwd,
-      repo_root,
-      content
     );
     CREATE TABLE IF NOT EXISTS summary_nodes (
       node_id TEXT PRIMARY KEY,
@@ -112,20 +97,13 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
-    CREATE VIRTUAL TABLE IF NOT EXISTS summary_node_fts USING fts5(
-      node_id UNINDEXED,
-      session_id,
-      cwd,
-      repo_root,
-      depth,
-      content
-    );
     CREATE INDEX IF NOT EXISTS idx_session_summaries_updated ON session_summaries(updated_at);
     CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_depth_latest ON summary_nodes(session_id, depth, latest_at);
     CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_latest ON summary_nodes(session_id, latest_at);
     CREATE INDEX IF NOT EXISTS idx_file_refs_session_time ON file_refs(session_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_file_refs_path ON file_refs(path);
   `);
+  createSearchIndexTables(db);
   ensureColumn(db, "events", "turn_id", "TEXT");
   ensureColumn(db, "events", "tool_use_id", "TEXT");
   ensureColumn(db, "events", "segment_id", "TEXT");
@@ -159,6 +137,39 @@ export function initializeStorageSchema(db: DatabaseSync): SchemaInitialization 
     CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen);
   `);
   return { backfillSessionMetadata };
+}
+
+export function createSearchIndexTables(db: DatabaseSync): void {
+  db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5(
+      event_id UNINDEXED,
+      session_id,
+      cwd,
+      repo_root,
+      hook_event,
+      content,
+      content='',
+      contentless_delete=1
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS session_summary_fts USING fts5(
+      session_id UNINDEXED,
+      cwd,
+      repo_root,
+      content,
+      content='',
+      contentless_delete=1
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS summary_node_fts USING fts5(
+      node_id UNINDEXED,
+      session_id,
+      cwd,
+      repo_root,
+      depth,
+      content,
+      content='',
+      contentless_delete=1
+    );
+  `);
 }
 
 function ensureColumn(db: DatabaseSync, table: string, column: string, type: string): boolean {
