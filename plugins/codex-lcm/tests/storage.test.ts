@@ -2141,8 +2141,8 @@ test("cleanup compacts legacy search text while preserving the raw log", () => {
   try {
     db.exec("UPDATE events SET text = raw_json");
     db.exec(`
-      INSERT INTO event_fts (event_id, session_id, cwd, repo_root, hook_event, content)
-      SELECT event_id, session_id, cwd, COALESCE(repo_root, ''), hook_event, raw_json
+      INSERT INTO event_fts (rowid, event_id, session_id, cwd, repo_root, hook_event, content)
+      SELECT rowid, event_id, session_id, cwd, COALESCE(repo_root, ''), hook_event, raw_json
       FROM events
       WHERE hook_event = 'PreToolUse'
     `);
@@ -2464,10 +2464,10 @@ test("search sessions merges summary and raw-event candidates before ranking a q
 
   const db = new DatabaseSync(path.join(home, "index.sqlite"));
   try {
-    db.prepare("DELETE FROM event_fts WHERE session_id = ?1").run("summary-candidate");
-    db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run("summary-candidate");
-    db.prepare("DELETE FROM summary_node_fts WHERE session_id = ?1").run("raw-candidate");
-    db.prepare("DELETE FROM session_summary_fts WHERE session_id = ?1").run("raw-candidate");
+    db.prepare("DELETE FROM event_fts WHERE rowid IN (SELECT rowid FROM events WHERE session_id = ?1)").run("summary-candidate");
+    db.prepare("DELETE FROM session_summary_fts WHERE rowid IN (SELECT rowid FROM session_summaries WHERE session_id = ?1)").run("summary-candidate");
+    db.prepare("DELETE FROM summary_node_fts WHERE rowid IN (SELECT rowid FROM summary_nodes WHERE session_id = ?1)").run("raw-candidate");
+    db.prepare("DELETE FROM session_summary_fts WHERE rowid IN (SELECT rowid FROM session_summaries WHERE session_id = ?1)").run("raw-candidate");
   } finally {
     db.close();
   }

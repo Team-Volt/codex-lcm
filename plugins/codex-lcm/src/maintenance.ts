@@ -16,6 +16,7 @@ import {
   indexEventInTransaction,
   invalidateRawLogState,
   recordRawLogState,
+  SEARCH_INDEX_VACUUM_KEY,
   segmentsNeedRawJsonClearing,
 } from "./storage-persistence.ts";
 import { registerStoredEventReader } from "./stored-event.ts";
@@ -155,7 +156,22 @@ function maintenanceNeeded(config: LcmConfig): boolean {
   return manifest.migration?.complete === false
     || manifest.segments.some((record) => !record.compressed)
     || archivedPayloadClearingNeeded(config, manifest.segments.map((record) => record.id))
+    || searchIndexVacuumNeeded(config)
     || (config.retentionDays !== undefined && config.configError === undefined);
+}
+
+function searchIndexVacuumNeeded(config: LcmConfig): boolean {
+  if (!fs.existsSync(config.indexPath)) return false;
+  let db: DatabaseSync | undefined;
+  try {
+    db = new DatabaseSync(config.indexPath, { readOnly: true });
+    return db.prepare("SELECT 1 FROM index_metadata WHERE key = ?1").get(SEARCH_INDEX_VACUUM_KEY) !== undefined;
+  } catch (error) {
+    if (error instanceof Error) return true;
+    throw error;
+  } finally {
+    db?.close();
+  }
 }
 
 function archivedPayloadClearingNeeded(config: LcmConfig, segmentIds: readonly string[]): boolean {
@@ -252,9 +268,11 @@ function maintainSegments(config: LcmConfig, now: () => Date): MaintenanceReport
     }
     const retention = expireSegments(config, db, now());
     errors.push(...retention.errors);
-    if (db && (cleared > 0 || retention.expired > 0)) {
+    const vacuumSearchIndex = db?.prepare("SELECT 1 FROM index_metadata WHERE key = ?1").get(SEARCH_INDEX_VACUUM_KEY) !== undefined;
+    if (db && (cleared > 0 || retention.expired > 0 || vacuumSearchIndex)) {
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       db.exec("VACUUM");
+      if (vacuumSearchIndex) db.prepare("DELETE FROM index_metadata WHERE key = ?1").run(SEARCH_INDEX_VACUUM_KEY);
     }
     if (db && errors.length === 0) {
       const state = withRawLogLock(config.rawLogPath, () => segmentedRawLogState(config));
@@ -282,7 +300,7 @@ function expireSegments(
     try {
       invalidateRawLogState(db);
       for (const record of expired) {
-        db.prepare("DELETE FROM event_fts WHERE event_id IN (SELECT event_id FROM events WHERE segment_id = ?1)").run(record.id);
+        db.prepare("DELETE FROM event_fts WHERE rowid IN (SELECT rowid FROM events WHERE segment_id = ?1)").run(record.id);
         db.prepare("DELETE FROM file_refs WHERE observed_event_id IN (SELECT event_id FROM events WHERE segment_id = ?1)").run(record.id);
         db.prepare("DELETE FROM events WHERE segment_id = ?1").run(record.id);
       }
