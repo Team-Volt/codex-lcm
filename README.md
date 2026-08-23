@@ -108,7 +108,7 @@ operation.
 Install the latest tagged release from GitHub with Codex's native plugin flow:
 
 ```sh
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.9
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.10
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -125,20 +125,20 @@ The native plugin manifest wires the MCP server, lifecycle hooks, and
 The first TUI session after install asks you to review and trust the lifecycle
 hooks. That is expected. Hooks capture the session data that LCM indexes.
 
-Upgrade an existing GitHub marketplace install to `v0.2.9`:
+Upgrade an existing GitHub marketplace install to `v0.2.10`:
 
 ```sh
 codex plugin marketplace remove codex-lcm
-codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.9
+codex plugin marketplace add Team-Volt/codex-lcm --ref v0.2.10
 codex plugin add codex-lcm@codex-lcm
 ```
 
-Upgrade a local checkout install to `v0.2.9` by checking out the release tag,
+Upgrade a local checkout install to `v0.2.10` by checking out the release tag,
 then asking Codex to refresh the installed plugin cache:
 
 ```sh
 git -C /path/to/codex-lcm fetch --tags origin
-git -C /path/to/codex-lcm checkout v0.2.9
+git -C /path/to/codex-lcm checkout v0.2.10
 codex plugin add codex-lcm@codex-lcm
 ```
 
@@ -167,7 +167,7 @@ codex plugin remove codex-lcm@codex-lcm
 
 ## Release Status
 
-Current release: `v0.2.9`.
+Current release: `v0.2.10`.
 
 Codex LCM is a local-first Codex memory plugin with native plugin installation,
 hook ingestion, sanitized raw event storage, SQLite FTS, DAG-backed retrieval,
@@ -177,20 +177,19 @@ tools. The `lcm-recall` skill gives Codex a repeatable retrieval workflow for
 resumes, compaction recovery, long-running work, and questions about prior
 sessions.
 
-### v0.2.9 notes
+### v0.2.10 notes
 
-This release hardens raw event durability, fixes post-compaction recovery so it
-packs context once without exposing internal recovery work, expands secret
-redaction, and improves paraphrase recall guidance and measurement.
+This release bounds storage growth with compressed raw-log segments and smaller
+search indexes, and routes prior-work requests to LCM before curated memory.
 
-- Keeps raw events durable and recoverable across concurrent writers, lock
-  failures, SQLite failures, and interrupted indexing.
-- Requires one successful `lcm_pack_context` result after compaction, then
-  resumes the task without announcing the recovery step.
-- Redacts credential URI passwords and secret assignments nested inside JSON or
-  shell strings while preserving benign token metrics.
-- Expands the retrieval benchmark to 39 sessions and 38 queries, with separate
-  development and holdout results for paraphrase recall.
+- Rotates the authoritative raw log into compressed 64 MiB segments and replaces
+  duplicate SQLite payloads with verified byte locators.
+- Migrates existing stores with resumable state, keeps history by default, and
+  supports optional age-based retention.
+- Rebuilds the three FTS tables as contentless-delete indexes keyed by canonical
+  row IDs, cutting search-index size without changing ranked results.
+- Makes the `lcm-recall` skill the first route for prior-session evidence while
+  keeping curated memory separate.
 
 Use the [Installation](#installation) section for install and upgrade commands.
 
