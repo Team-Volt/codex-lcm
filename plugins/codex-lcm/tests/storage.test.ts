@@ -146,6 +146,72 @@ test("rotates active raw log before a record exceeds the configured cap", () => 
   assert.deepEqual(readJsonl(config.rawLogPath), [next]);
 });
 
+test("batched raw appends sync once and retain exact locators after an unterminated line", (t) => {
+  const home = tempHome();
+  const config = loadConfig({ home, env: {} });
+  const events = Array.from({ length: 40 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit", rawInput: JSON.stringify({ session_id: "batch-locators", prompt: `item ${index}` }), env: {}, now,
+  }));
+  try {
+    fs.writeFileSync(config.rawLogPath, JSON.stringify(events[0]));
+    const sync = t.mock.method(fs, "fsyncSync");
+    const locations = withRawLogLock(config.rawLogPath, () => appendSegmentedEvents(config, events.slice(1)));
+    assert.equal(sync.mock.callCount(), 1);
+    assert.deepEqual(Array.from(readAllRawEvents(config)), events);
+    assert.equal(locations.length, events.length - 1);
+    for (const [index, location] of locations.entries()) {
+      assert.deepEqual(readLocatedEvent(config, location), events[index + 1]);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a raw batch crossing segment boundaries retains every locator", () => {
+  const home = tempHome();
+  const config = loadConfig({ home, env: {} });
+  const events = Array.from({ length: 5 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit", rawInput: JSON.stringify({ session_id: "rotating-batch", prompt: `item ${index}` }), env: {}, now,
+  }));
+  try {
+    const cap = Buffer.byteLength(JSON.stringify(events[0]) + "\n") * 2;
+    const locations = withRawLogLock(config.rawLogPath, () => appendSegmentedEvents(config, events, { segmentCapBytes: cap }));
+    assert.equal(readManifest(config.manifestPath).segments.length, 2);
+    assert.deepEqual(Array.from(readAllRawEvents(config)), events);
+    assert.deepEqual(locations.map((location) => readLocatedEvent(config, location)), events);
+    for (const record of readManifest(config.manifestPath).segments) assert.ok(record.byte_count <= cap);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("failed raw batch fsync rolls back the batch and retry stores it once", (t) => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const events = Array.from({ length: 3 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit", rawInput: JSON.stringify({ session_id: "batch-fsync", prompt: `item ${index}` }), env: {}, now,
+  }));
+  const originalSync = fs.fsyncSync;
+  let fail = true;
+  t.mock.method(fs, "fsyncSync", (descriptor: number) => {
+    if (fail && fs.fstatSync(descriptor).isFile()) {
+      fail = false;
+      throw new Error("forced batch fsync failure");
+    }
+    return originalSync(descriptor);
+  });
+  try {
+    assert.throws(() => storage.ingestMany(events), /forced batch fsync failure/u);
+    assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events, []);
+    assert.equal(storage.ingestMany(events).imported, events.length);
+    assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events, events);
+    assert.equal(storage.health().event_count, events.length);
+  } finally {
+    storage.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("reads located raw event from a closed segment", () => {
   const home = tempHome();
   const config = loadConfig({ home });

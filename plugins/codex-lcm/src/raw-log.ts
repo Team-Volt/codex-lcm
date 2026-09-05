@@ -122,15 +122,29 @@ export function appendSegmentedEvents(
   }
 
   const locations: RawEventLocation[] = [];
+  let activeSize = rawLogStat(config.rawLogPath)?.size ?? 0;
+  let separatorBytes = rawLogNeedsSeparator(config.rawLogPath) ? 1 : 0;
+  let segmentId = activeSegmentId(config);
+  let pending: Buffer[] = [];
+  const flush = (): void => {
+    if (pending.length === 0) return;
+    for (const location of appendActiveEvents(config.rawLogPath, segmentId, pending)) locations.push(location);
+    pending = [];
+  };
   for (const event of events) {
     const serialized = Buffer.from(`${JSON.stringify(event)}\n`, "utf8");
-    const activeSize = fs.existsSync(config.rawLogPath) ? fs.statSync(config.rawLogPath).size : 0;
-    const separator = activeSize === 0 || !rawLogNeedsSeparator(config.rawLogPath) ? Buffer.alloc(0) : Buffer.from("\n");
-    if (activeSize > 0 && activeSize + separator.length + serialized.length > segmentCapBytes) {
+    if (activeSize > 0 && activeSize + separatorBytes + serialized.length > segmentCapBytes) {
+      flush();
       rotateActiveRawLog(config);
+      activeSize = 0;
+      separatorBytes = 0;
+      segmentId = activeSegmentId(config);
     }
-    locations.push(appendActiveEvent(config.rawLogPath, activeSegmentId(config), serialized));
+    pending.push(serialized);
+    activeSize += separatorBytes + serialized.length;
+    separatorBytes = 0;
   }
+  flush();
   return locations;
 }
 
@@ -298,13 +312,13 @@ export function segmentedRawLogState(config: LcmConfig): RawLogState {
   };
 }
 
-function appendActiveEvent(rawLogPath: string, segmentId: string, serialized: Buffer): RawEventLocation {
+function appendActiveEvents(rawLogPath: string, segmentId: string, serialized: readonly Buffer[]): RawEventLocation[] {
   fs.mkdirSync(path.dirname(rawLogPath), { recursive: true, mode: 0o700 });
   const existed = fs.existsSync(rawLogPath);
   const previousSize = existed ? fs.statSync(rawLogPath).size : 0;
   const separator = previousSize === 0 || !rawLogNeedsSeparator(rawLogPath) ? Buffer.alloc(0) : Buffer.from("\n");
   try {
-    fs.appendFileSync(rawLogPath, Buffer.concat([separator, serialized]), { mode: 0o600 });
+    fs.appendFileSync(rawLogPath, Buffer.concat([separator, ...serialized]), { mode: 0o600 });
     fsyncPath(rawLogPath, true);
     if (!existed && process.platform !== "win32") fsyncPath(path.dirname(rawLogPath));
   } catch (error) {
@@ -315,7 +329,12 @@ function appendActiveEvent(rawLogPath: string, segmentId: string, serialized: Bu
     }
     throw error;
   }
-  return { segmentId, offset: previousSize + separator.length, length: serialized.length };
+  let offset = previousSize + separator.length;
+  return serialized.map((content) => {
+    const location = { segmentId, offset, length: content.length };
+    offset += content.length;
+    return location;
+  });
 }
 
 function rotateActiveRawLog(config: LcmConfig): void {
