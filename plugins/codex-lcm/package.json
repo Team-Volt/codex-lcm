@@ -5,6 +5,16 @@
   "license": "MIT",
   "author": "Team Volt",
   "type": "module",
+  "files": [
+    ".codex-plugin/",
+    ".mcp.json",
+    "bin/",
+    "hooks/",
+    "skills/",
+    "src/",
+    "docs/",
+    "scripts/"
+  ],
   "bin": {
     "codex-lcm": "./bin/codex-lcm"
   },

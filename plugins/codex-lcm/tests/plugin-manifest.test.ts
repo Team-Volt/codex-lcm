@@ -1,6 +1,26 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
+
+test("npm package includes runtime wiring and excludes local evidence", () => {
+  const cache = fs.mkdtempSync(path.join(os.tmpdir(), "lcm-pack-cache-"));
+  try {
+    const result = spawnSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts", "--cache", cache], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const packed: unknown = JSON.parse(result.stdout);
+    assert.ok(Array.isArray(packed));
+    const files = packed[0].files.map((file: { path: string }) => file.path) as string[];
+    for (const required of [".codex-plugin/plugin.json", ".mcp.json", "bin/codex-lcm", "hooks/hooks.codex.json", "skills/lcm-recall/SKILL.md", "src/cli.ts", "LICENSE"]) {
+      assert.ok(files.includes(required), required);
+    }
+    assert.deepEqual(files.filter((file) => /(^|\/)(\.omo|\.superpowers|\.codegraph|tests|node_modules)(\/|$)/u.test(file)), []);
+  } finally {
+    fs.rmSync(cache, { recursive: true, force: true });
+  }
+});
 
 test("Codex plugin manifest points to MCP and skills", () => {
   const manifest = JSON.parse(fs.readFileSync(".codex-plugin/plugin.json", "utf8"));
