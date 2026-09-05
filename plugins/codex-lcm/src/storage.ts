@@ -41,7 +41,6 @@ import {
   backfillDelegationParents as runDelegationParentBackfill,
   backfillFileRefs as runFileRefBackfill,
   backfillSessionMemorySummaries as runSummaryBackfill,
-  cacheRawEventIds,
   clearDerivedIndex as clearStoredDerivedIndex,
   currentRawLogState,
   emptyCleanupReport,
@@ -154,7 +153,9 @@ export class LcmStorage {
     if (this.db) {
       return this.db.prepare("SELECT 1 FROM events WHERE event_id = ?1 LIMIT 1").get(eventId) !== undefined;
     }
-    return Array.from(readAllRawEvents(this.config)).some((event) => event.event_id === eventId);
+    const result = readCachedRawEventIds(this.config, this.rawEventIdCache);
+    this.rawEventIdCache = result.cache;
+    return result.eventIds.has(eventId);
   }
 
   ingest(event: NormalizedEvent): void {
@@ -216,7 +217,6 @@ export class LcmStorage {
 
       if (eventsToAppend.length > 0) {
         const locations = appendSegmentedEvents(this.config, eventsToAppend);
-        this.storeRawEventIds(rawSeen);
         return {
           eventsToAppend,
           locationsByEventId: new Map(eventsToAppend.map((event, index) => [event.event_id, locations[index]])),
@@ -277,10 +277,6 @@ export class LcmStorage {
 
   private readRawEventIds(): Set<string> {
     return new Set(Array.from(readAllRawEvents(this.config), (event) => event.event_id));
-  }
-
-  private storeRawEventIds(eventIds: Set<string>): void {
-    this.rawEventIdCache = cacheRawEventIds(this.config.rawLogPath, eventIds);
   }
 
   rebuildSessionMemorySummaries(sessionIds: Iterable<string>): string[] {

@@ -264,6 +264,7 @@ export type SessionGraph = {
 };
 
 export type Health = {
+  hook_event_counts?: Record<string, number>;
   home: string;
   raw_log_path: string;
   index_path: string;

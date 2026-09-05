@@ -31,6 +31,38 @@ import { clearDerivedSummaries, readJsonl, tempHome } from "./helpers.ts";
 
 const now = () => new Date("2026-06-09T12:00:00.000Z");
 
+test("raw-only lookup caches scans and stats shares the health scan", (t) => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const first = normalizeHookEvent({ hookEvent: "Note", rawInput: JSON.stringify({ session_id: "raw-cache", text: "first" }), env: {}, now });
+  appendRawEvents(config.rawLogPath, [first]);
+  const storage = createStorage({ home, readOnly: true });
+  const original = fs.readSync;
+  let reads = 0;
+  t.mock.method(fs, "readSync", (...args: unknown[]) => { reads += 1; return Reflect.apply(original, fs, args); });
+  try {
+    assert.equal(storage.hasEvent(first.event_id), true);
+    const initialReads = reads;
+    assert.ok(initialReads > 0);
+    assert.equal(storage.hasEvent("missing"), false);
+    assert.equal(reads, initialReads);
+    const second = normalizeHookEvent({ hookEvent: "Stop", rawInput: JSON.stringify({ session_id: "raw-cache", text: "second" }), env: {}, now });
+    appendRawEvents(config.rawLogPath, [second]);
+    assert.equal(storage.hasEvent(second.event_id), true);
+    reads = 0;
+    storage.health();
+    const healthReads = reads;
+    reads = 0;
+    const stats = storage.stats();
+    assert.equal(reads, healthReads);
+    assert.equal(stats.event_count, 2);
+    assert.deepEqual(stats.hook_event_counts, { Note: 1, Stop: 1 });
+  } finally {
+    fs.readSync = original;
+    storage.close();
+  }
+});
+
 test("retention configuration reads valid .env values and rejects invalid values", () => {
   const missingHome = tempHome();
   assert.equal(loadConfig({ home: missingHome, env: {} }).retentionDays, undefined);

@@ -208,7 +208,7 @@ export function storageStats(
   if (!db) {
     return {
       ...health,
-      hook_event_counts: countEventsByHook(readRawEvents(rawLogPath)),
+      hook_event_counts: health.hook_event_counts ?? countEventsByHook(readRawEvents(rawLogPath)),
       summary_nodes_by_depth: {},
       summary_nodes_by_source_type: {},
       graph_nodes_by_kind: {},
@@ -501,7 +501,7 @@ export function getStoredSessionSummary(
   return row ? rowToSessionSummary(row) : undefined;
 }
 
-function countEventsByHook(events: NormalizedEvent[]): Record<string, number> {
+export function countEventsByHook(events: NormalizedEvent[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const event of events) counts[event.hook_event] = (counts[event.hook_event] ?? 0) + 1;
   return Object.fromEntries(Object.entries(counts).sort(([left], [right]) => left.localeCompare(right)));

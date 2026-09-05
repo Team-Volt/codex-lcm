@@ -6,14 +6,14 @@ import { decodePersistedEvent } from "./event-codec.ts";
 import type { NormalizedEvent } from "./events.ts";
 import { extractFileReferences } from "./file-refs.ts";
 import { overflowReferenceFromEvent } from "./overflow.ts";
-import { rawLogState, rawLogStat, readRawEventIds, readRawEvents, segmentedRawLogState, type RawEventLocation, type RawLogState } from "./raw-log.ts";
+import { rawLogState, readAllRawEvents, readRawEvents, segmentedRawLogState, type RawEventLocation, type RawLogState } from "./raw-log.ts";
 import { eventSearchText } from "./storage-context.ts";
 import { recordValue, rowToSessionMemorySummary, rowToSummaryNode } from "./storage-rows.ts";
 import { createSearchIndexTables, initializeStorageSchema } from "./storage-schema.ts";
 import { segmentStorageHealth } from "./raw-segments.ts";
 import { STORED_EVENT_JSON_SQL } from "./stored-event.ts";
 import { getSummaryBackfillSessionIds, rebuildSessionMemorySummary, shouldRebuildSessionMemorySummary } from "./storage-summaries.ts";
-import { extractEventMetadata, extractSessionMetadata, isCodexLcmToolEvent, isSearchIndexEvent, maxNullable, scalar, summarizeSessions } from "./storage-sessions.ts";
+import { extractEventMetadata, extractSessionMetadata, isCodexLcmToolEvent, isSearchIndexEvent, maxNullable, scalar, summarizeSessions, countEventsByHook } from "./storage-sessions.ts";
 import type { Health, IndexCleanupReport } from "./storage-types.ts";
 import {
   SUMMARY_ALGORITHM_VERSION,
@@ -33,9 +33,7 @@ export const SEARCH_INDEX_VACUUM_KEY = "search_index_vacuum_v1";
 
 export type IndexEventResult = { readonly inserted: boolean; readonly summaryTouched: boolean };
 export type RawEventIdCache = {
-  readonly size: number;
-  readonly mtimeMs: number;
-  readonly ctimeMs: number;
+  readonly state: RawLogState;
   readonly eventIds: Set<string>;
 };
 type RawEventIdRead = { readonly eventIds: Set<string>; readonly cache: RawEventIdCache };
@@ -68,23 +66,13 @@ export function rollbackPreservingError(db: DatabaseSync | undefined, original: 
   }
 }
 
-export function readCachedRawEventIds(rawLogPath: string, cache: RawEventIdCache | undefined): RawEventIdRead {
-  const stat = rawLogStat(rawLogPath);
-  if (cache && stat && cache.size === stat.size && cache.mtimeMs === stat.mtimeMs && cache.ctimeMs === stat.ctimeMs) {
+export function readCachedRawEventIds(config: LcmConfig, cache: RawEventIdCache | undefined): RawEventIdRead {
+  const state = currentRawLogState(config);
+  if (cache && JSON.stringify(cache.state) === JSON.stringify(state)) {
     return { eventIds: cache.eventIds, cache };
   }
-  const eventIds = readRawEventIds(rawLogPath);
-  return { eventIds, cache: createRawEventIdCache(stat, eventIds) };
-}
-
-export function cacheRawEventIds(rawLogPath: string, eventIds: Set<string>): RawEventIdCache {
-  return createRawEventIdCache(rawLogStat(rawLogPath), eventIds);
-}
-
-function createRawEventIdCache(stat: fs.Stats | undefined, eventIds: Set<string>): RawEventIdCache {
-  return stat
-    ? { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, eventIds }
-    : { size: 0, mtimeMs: 0, ctimeMs: 0, eventIds };
+  const eventIds = new Set(Array.from(readAllRawEvents(config), (event) => event.event_id));
+  return { eventIds, cache: { state, eventIds } };
 }
 
 export function emptyCleanupReport(indexPath: string): IndexCleanupReport {
@@ -191,6 +179,7 @@ export function rawHealth(config: LcmConfig, indexError: string | undefined): He
     raw_log_exists: fs.existsSync(config.rawLogPath), index_exists: fs.existsSync(config.indexPath),
     index_available: false, ...(indexError ? { index_error: indexError } : {}),
     event_count: rawEvents.length, session_count: summarizeSessions(rawEvents).length,
+    hook_event_counts: countEventsByHook(rawEvents),
   };
 }
 
