@@ -244,6 +244,40 @@ test("bounded graph slices reserve room for summary nodes in long sessions", () 
   storage.close();
 });
 
+test("bounded graphs retain recent roots and their lineage beyond 2,000 summary nodes", () => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const sessionId = "large-summary-graph";
+  const db = new DatabaseSync(path.join(home, "index.sqlite"));
+  try {
+    ingest(storage, "SessionStart", { session_id: sessionId, cwd: home }, "2026-06-09T12:00:00.000Z");
+    const insert = db.prepare(`
+      INSERT INTO summary_nodes
+        (node_id, session_id, depth, summary_text, token_count, source_token_count,
+         source_type, source_ids_json, source_event_ids_json, earliest_at, latest_at, created_at, cwd, topics_json)
+      VALUES (?1, ?2, ?3, 'graph fixture', 1, 1, ?4, ?5, '[]', ?6, ?6, ?6, ?7, '[]')
+    `);
+    db.exec("BEGIN");
+    for (let index = 0; index < 2_001; index++) {
+      insert.run(`large-leaf-${index}`, sessionId, 0, "events", "[]", new Date(Date.UTC(2026, 5, 9, 12, 0, index)).toISOString(), home);
+    }
+    insert.run("recent-root", sessionId, 1, "nodes", '["large-leaf-0","large-leaf-2000"]', "2026-06-10T12:00:00.000Z", home);
+    db.exec("COMMIT");
+
+    const graph = storage.getSessionGraph(sessionId, { limit: 20 });
+    assert.ok(graph.nodes.length <= 20);
+    const ids = new Set(graph.nodes.map((node) => node.node_id));
+    assert.ok(ids.has("recent-root"));
+    assert.ok(ids.has("large-leaf-0"));
+    assert.ok(ids.has("large-leaf-2000"));
+    assert.ok(graph.edges.some((edge) => edge.kind === "summary_source" && edge.from_node_id === "recent-root" && edge.to_node_id === "large-leaf-0"));
+  } finally {
+    db.close();
+    storage.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("pack context expands summary-node sources without raw tool chatter", () => {
   const storage = createStorage({ home: tempHome() });
   const sessionId = "summary-node-pack-session";
