@@ -74,6 +74,19 @@ test("redacts obvious bearer and provider tokens inside strings", () => {
   assert.equal(result.redactions.length, 2);
 });
 
+test("redacts GitHub OAuth and app tokens including JWT installation tokens", () => {
+  for (const prefix of ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"]) {
+    const token = `${prefix}abcdefghijklmnopqrstuvwxyz0123456789`;
+    const result = sanitizeForStorage(`Use ${token}.`);
+    assert.equal(result.value, `Use ${prefix}[REDACTED:token].`);
+    assert.equal(result.redactions.length, 1);
+    assert.equal(sanitizeForStorage(result.value).value, result.value);
+  }
+  const installationToken = "ghs_12345_eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJnaXRodWIifQ.fake-signature_12345";
+  assert.equal(sanitizeForStorage(`Use ${installationToken}.`).value, "Use ghs_[REDACTED:token].");
+  assert.equal(sanitizeForStorage("ghs_short is a prefix example").value, "ghs_short is a prefix example");
+});
+
 test("redacts passwords embedded in credential URIs", () => {
   const result = sanitizeForStorage({
     text: "Use postgres://audit:password123@db.example.test/app, https://me:p%40ss@example.test/path, and redis://:redis-password@example.test/0",

@@ -49,8 +49,8 @@ const TOKEN_PATTERNS: TokenPattern[] = [
     replacement: (_match: string, prefix: string) => `${prefix}_[REDACTED:token]`,
   },
   {
-    regex: /\bghp_[A-Za-z0-9_]{20,}\b/gu,
-    replacement: "ghp_[REDACTED:token]",
+    regex: /\b(gh[pousr]_)[A-Za-z0-9_.-]{20,}\b/gu,
+    replacement: (_match: string, prefix: string) => `${prefix}[REDACTED:token]`,
   },
   {
     regex: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu,
