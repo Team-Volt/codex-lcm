@@ -182,7 +182,7 @@ export function readLocatedEvent(config: LcmConfig, location: RawEventLocation):
 }
 
 export function createLocatedEventReader(config: LcmConfig): (location: RawEventLocation) => NormalizedEvent {
-  let cachedSegmentId: string | undefined;
+  let cachedSegmentState: string | undefined;
   let cachedContent: Buffer | undefined;
   return (location) => {
     const record = readManifest(config.manifestPath).segments.find((segment) => segment.id === location.segmentId);
@@ -193,13 +193,16 @@ export function createLocatedEventReader(config: LcmConfig): (location: RawEvent
     if (!Number.isSafeInteger(location.offset) || location.offset < 0 || !Number.isSafeInteger(location.length) || location.length <= 0) {
       throw new Error("Invalid raw event location.");
     }
-    if (record?.compressed) {
-      if (cachedSegmentId !== record.id) {
-        cachedContent = gunzipSync(fs.readFileSync(targetPath));
-        cachedSegmentId = record.id;
+    if (record) {
+      const stat = fs.statSync(targetPath, { bigint: true });
+      const state = `${JSON.stringify(record)}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+      if (cachedSegmentState !== state) {
+        const content = readVerifiedSegmentContent(targetPath, record);
+        cachedContent = content;
+        cachedSegmentState = state;
       }
       const content = cachedContent;
-      if (!content) throw new Error(`Compressed raw segment could not be read: ${record.id}`);
+      if (!content) throw new Error(`Raw segment could not be read: ${record.id}`);
       const serialized = content.subarray(location.offset, location.offset + location.length);
       if (serialized.length !== location.length) throw new Error("Raw event location is outside the segment.");
       const event = parsePersistedEvent(serialized.toString("utf8").trim());
@@ -369,17 +372,39 @@ function segmentPath(config: LcmConfig, record: SegmentRecord): string {
 }
 
 function* readSegmentLocatedEvents(config: LcmConfig, record: SegmentRecord): Generator<LocatedRawEvent> {
+  const targetPath = segmentPath(config, record);
   if (!record.compressed) {
-    yield* readRawFileLocatedEvents(segmentPath(config, record), record.id);
+    verifyPlainSegment(targetPath, record);
+    yield* readRawFileLocatedEvents(targetPath, record.id);
     return;
   }
-  yield* readRawBufferLocatedEvents(gunzipSync(fs.readFileSync(segmentPath(config, record))), record.id);
+  yield* readRawBufferLocatedEvents(readVerifiedSegmentContent(targetPath, record), record.id);
 }
 
 function readSegmentLog(config: LcmConfig, record: SegmentRecord): RawLogReadResult {
-  return record.compressed
-    ? parseRawBuffer(gunzipSync(fs.readFileSync(segmentPath(config, record))))
-    : readRawLog(segmentPath(config, record));
+  const targetPath = segmentPath(config, record);
+  if (record.compressed) return parseRawBuffer(readVerifiedSegmentContent(targetPath, record));
+  verifyPlainSegment(targetPath, record);
+  return readRawLog(targetPath);
+}
+
+function verifyPlainSegment(targetPath: string, record: SegmentRecord): void {
+  verifySegmentChecksum(record, fs.statSync(targetPath).size, hashRawFile(targetPath));
+}
+
+function readVerifiedSegmentContent(targetPath: string, record: SegmentRecord): Buffer {
+  const stored = fs.readFileSync(targetPath);
+  const content = record.compressed
+    ? gunzipSync(stored, { maxOutputLength: Math.max(1, record.byte_count) })
+    : stored;
+  verifySegmentChecksum(record, content.length, createHash("sha256").update(content).digest("hex"));
+  return content;
+}
+
+function verifySegmentChecksum(record: SegmentRecord, bytes: number, digest: string): void {
+  if (bytes !== record.byte_count || digest !== record.sha256.toLowerCase()) {
+    throw new Error(`Segment checksum failed: ${record.id}`);
+  }
 }
 
 function parseRawBuffer(content: Buffer): RawLogReadResult {

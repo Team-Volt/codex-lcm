@@ -5,6 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 import { loadConfig } from "../src/config.ts";
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
@@ -12,7 +13,9 @@ import { runMaintenanceOnce } from "../src/maintenance.ts";
 import {
   appendRawEvents,
   appendSegmentedEvents,
+  createLocatedEventReader,
   readAllRawEvents,
+  readAllRawLog,
   readLocatedEvent,
   readRawLog,
   withRawLogLock,
@@ -138,6 +141,41 @@ test("reads located raw event from a closed segment", () => {
 
   assert.deepEqual(readLocatedEvent(config, { segmentId: record.id, offset: 0, length }), seed);
 });
+
+for (const compressed of [false, true]) {
+  test(`rejects altered ${compressed ? "compressed" : "plain"} archives and invalidates cached reads`, (t) => {
+    const home = tempHome();
+    const config = loadConfig({ home, env: {} });
+    try {
+      const seed = normalizeHookEvent({ hookEvent: "UserPromptSubmit", rawInput: '{"session_id":"integrity","prompt":"archive me"}', env: {}, now });
+      const next = normalizeHookEvent({ hookEvent: "Stop", rawInput: '{"session_id":"integrity","last_assistant_message":"next"}', env: {}, now });
+      const [location] = appendSegmentedEvents(config, [seed]);
+      appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+      if (compressed) assert.deepEqual(runMaintenanceOnce(config).errors, []);
+      const record = readManifest(config.manifestPath).segments[0];
+      assert.equal(record.compressed, compressed);
+      const target = path.join(home, record.path);
+      const readFile = t.mock.method(fs, "readFileSync");
+      const reader = createLocatedEventReader(config);
+      assert.deepEqual(reader(location), seed);
+      assert.deepEqual(reader(location), seed);
+      assert.equal(readFile.mock.calls.filter((call) => call.arguments[0] === target).length, 1);
+
+      const stored = fs.readFileSync(target);
+      const plain = compressed ? gunzipSync(stored) : stored;
+      const altered = Buffer.from(plain.toString("utf8").replace("archive me", "corrupt me"));
+      assert.equal(altered.length, plain.length);
+      fs.writeFileSync(target, compressed ? gzipSync(altered) : altered);
+
+      assert.throws(() => reader(location), /Segment checksum failed/u);
+      assert.throws(() => readLocatedEvent(config, location), /Segment checksum failed/u);
+      assert.throws(() => Array.from(readAllRawEvents(config)), /Segment checksum failed/u);
+      assert.throws(() => readAllRawLog(config), /Segment checksum failed/u);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
 
 test("keeps active event locators valid after rotation", () => {
   const home = tempHome();
