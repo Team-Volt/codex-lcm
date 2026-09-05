@@ -153,11 +153,12 @@ export function queueMaintenance(config: LcmConfig): void {
 function maintenanceNeeded(config: LcmConfig): boolean {
   if (!fs.existsSync(config.manifestPath)) return false;
   const manifest = readManifest(config.manifestPath);
+  const retentionCutoff = Date.now() - (config.retentionDays ?? Number.POSITIVE_INFINITY) * 24 * 60 * 60 * 1_000;
   return manifest.migration?.complete === false
     || manifest.segments.some((record) => !record.compressed)
     || archivedPayloadClearingNeeded(config, manifest.segments.map((record) => record.id))
     || searchIndexVacuumNeeded(config)
-    || (config.retentionDays !== undefined && config.configError === undefined);
+    || (config.configError === undefined && manifest.segments.some((record) => Date.parse(record.last_timestamp) < retentionCutoff));
 }
 
 function searchIndexVacuumNeeded(config: LcmConfig): boolean {

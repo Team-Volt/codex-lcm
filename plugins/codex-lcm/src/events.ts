@@ -89,7 +89,7 @@ export function normalizeHookEvent(args: NormalizeHookEventArgs): NormalizedEven
     redactions: sanitized.redactions,
     truncations: sanitized.truncations,
     rawHash,
-    originalBytes: sanitized.originalBytes,
+    originalBytes: Buffer.byteLength(rawInput, "utf8"),
     sanitizedBytes: sanitized.sanitizedBytes,
     repo: args.repo,
     limits,

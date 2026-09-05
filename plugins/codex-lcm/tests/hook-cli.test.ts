@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
 
+import { decodePersistedEvent } from "../src/event-codec.ts";
 import { assertCliOk, clearDerivedSummaries, readJsonl, runCli, tempHome } from "./helpers.ts";
 
 type HookAdditionalContextOutput = {
@@ -35,6 +37,57 @@ test("hook command ingests a synthetic projectless prompt event", () => {
   });
   assertCliOk(health);
   assert.equal(JSON.parse(health.stdout).event_count, 1);
+});
+
+test("hook command preserves UTF-8 split across stdin chunks", () => {
+  const home = tempHome();
+  const preloadPath = path.join(home, "split-stdin.mjs");
+  fs.writeFileSync(preloadPath, `
+    const iterate = process.stdin[Symbol.asyncIterator].bind(process.stdin);
+    process.stdin[Symbol.asyncIterator] = async function* () {
+      for await (const chunk of { [Symbol.asyncIterator]: iterate }) {
+        for (let offset = 0; offset < chunk.length; offset++) yield chunk.subarray(offset, offset + 1);
+      }
+    };
+  `);
+  const input = JSON.stringify({ session_id: "utf8-chunks", cwd: home, prompt: "Keep 🙂 and 水 intact" });
+  try {
+    const result = spawnSync(process.execPath, ["--no-warnings", "--import", preloadPath, "bin/codex-lcm", "hook", "UserPromptSubmit"], {
+      input, encoding: "utf8", timeout: 5_000,
+      env: { ...process.env, CODEX_LCM_HOME: home, CODEX_LCM_MAINTENANCE_WORKER: "1" },
+    });
+    assertCliOk(result);
+    const event = decodePersistedEvent(fs.readFileSync(path.join(home, "events.jsonl"), "utf8").trim());
+    assert.equal(event.payload.prompt, "Keep 🙂 and 水 intact");
+    assert.equal(event.raw_input_sha256, createHash("sha256").update(input).digest("hex"));
+    assert.equal(event.original_bytes, Buffer.byteLength(input));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("hook command bounds deeply nested payloads before persistence", () => {
+  const home = tempHome();
+  const input = `{"session_id":"deep-payload","cwd":${JSON.stringify(home)},"data":${"[".repeat(10_000)}"hidden-deep-value"${"]".repeat(10_000)}}`;
+  try {
+    const result = runCli(["hook", "UserPromptSubmit"], {
+      input, env: { CODEX_LCM_HOME: home, CODEX_LCM_MAINTENANCE_WORKER: "1" },
+    });
+    assertCliOk(result);
+    const persisted = fs.readFileSync(path.join(home, "events.jsonl"), "utf8").trim();
+    const event = decodePersistedEvent(persisted);
+    assert.equal(event.session_id, "deep-payload");
+    assert.equal(event.original_bytes, Buffer.byteLength(input));
+    assert.equal(event.raw_input_sha256, createHash("sha256").update(input).digest("hex"));
+    assert.match(JSON.stringify(event.truncations), /"kind":"depth"/u);
+    assert.doesNotMatch(persisted, /hidden-deep-value/u);
+    assert.ok(persisted.length < 10_000);
+    for (const entry of fs.readdirSync(path.join(home, "overflow"))) {
+      assert.doesNotMatch(fs.readFileSync(path.join(home, "overflow", entry), "utf8"), /hidden-deep-value/u);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("hook command reports raw fsync failure and persists on retry", () => {
@@ -233,6 +286,34 @@ test("hook command still rejects input above the overflow safety ceiling", () =>
   assert.equal(result.status, 1);
   assert.match(result.stderr, /exceeds the 8388608 byte limit/u);
   assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+});
+
+test("retention does not launch maintenance on every hook when no archive is due", () => {
+  const home = tempHome();
+  const preloadPath = path.join(home, "reject-idle-maintenance.mjs");
+  fs.writeFileSync(preloadPath, `
+    import childProcess from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
+    const spawn = childProcess.spawn;
+    childProcess.spawn = (...args) => {
+      if (args[1]?.includes("maintain")) throw new Error("unexpected idle maintenance launch");
+      return spawn(...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  try {
+    for (let index = 0; index < 3; index++) {
+      const result = spawnSync(process.execPath, ["--no-warnings", "--import", preloadPath, "bin/codex-lcm", "hook", "UserPromptSubmit"], {
+        input: JSON.stringify({ session_id: "retention-scheduling", cwd: home, prompt: `prompt ${index}` }),
+        encoding: "utf8", timeout: 5_000,
+        env: { ...process.env, CODEX_LCM_HOME: home, CODEX_LCM_RETENTION_DAYS: "90", CODEX_LCM_MAINTENANCE_WORKER: "0" },
+      });
+      assertCliOk(result);
+    }
+    assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 3);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("hook command captures git metadata as optional session metadata", () => {

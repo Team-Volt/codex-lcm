@@ -1,18 +1,22 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import childProcess, { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { syncBuiltinESMExports } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 import { loadConfig } from "../src/config.ts";
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
-import { runMaintenanceOnce } from "../src/maintenance.ts";
+import { queueMaintenance, runMaintenanceOnce } from "../src/maintenance.ts";
 import {
   appendRawEvents,
   appendSegmentedEvents,
+  createLocatedEventReader,
   readAllRawEvents,
+  readAllRawLog,
   readLocatedEvent,
   readRawLog,
   withRawLogLock,
@@ -26,6 +30,38 @@ import { createStorage, LcmStorage } from "../src/storage.ts";
 import { clearDerivedSummaries, readJsonl, tempHome } from "./helpers.ts";
 
 const now = () => new Date("2026-06-09T12:00:00.000Z");
+
+test("raw-only lookup caches scans and stats shares the health scan", (t) => {
+  const home = tempHome();
+  const config = loadConfig({ home });
+  const first = normalizeHookEvent({ hookEvent: "Note", rawInput: JSON.stringify({ session_id: "raw-cache", text: "first" }), env: {}, now });
+  appendRawEvents(config.rawLogPath, [first]);
+  const storage = createStorage({ home, readOnly: true });
+  const original = fs.readSync;
+  let reads = 0;
+  t.mock.method(fs, "readSync", (...args: unknown[]) => { reads += 1; return Reflect.apply(original, fs, args); });
+  try {
+    assert.equal(storage.hasEvent(first.event_id), true);
+    const initialReads = reads;
+    assert.ok(initialReads > 0);
+    assert.equal(storage.hasEvent("missing"), false);
+    assert.equal(reads, initialReads);
+    const second = normalizeHookEvent({ hookEvent: "Stop", rawInput: JSON.stringify({ session_id: "raw-cache", text: "second" }), env: {}, now });
+    appendRawEvents(config.rawLogPath, [second]);
+    assert.equal(storage.hasEvent(second.event_id), true);
+    reads = 0;
+    storage.health();
+    const healthReads = reads;
+    reads = 0;
+    const stats = storage.stats();
+    assert.equal(reads, healthReads);
+    assert.equal(stats.event_count, 2);
+    assert.deepEqual(stats.hook_event_counts, { Note: 1, Stop: 1 });
+  } finally {
+    fs.readSync = original;
+    storage.close();
+  }
+});
 
 test("retention configuration reads valid .env values and rejects invalid values", () => {
   const missingHome = tempHome();
@@ -54,6 +90,32 @@ test("retention configuration reads valid .env values and rejects invalid values
   const duplicate = loadConfig({ home: duplicateHome, env: {} });
   assert.equal(duplicate.retentionDays, undefined);
   assert.notEqual(duplicate.configError, undefined);
+});
+
+test("maintenance waits until an archive crosses the retention cutoff", (t) => {
+  const home = tempHome();
+  const config = loadConfig({ home, env: { CODEX_LCM_RETENTION_DAYS: "1" } });
+  let currentTime = Date.parse("2026-06-10T12:00:00.000Z");
+  t.mock.method(Date, "now", () => currentTime);
+  const spawnMock = t.mock.method(childProcess, "spawn", () => { throw new Error("maintenance queued"); });
+  syncBuiltinESMExports();
+  try {
+    writeManifestAtomic(config.manifestPath, {
+      version: 1,
+      segments: [{ id: "closed", path: "segments/closed.jsonl.gz", compressed: true, byte_count: 0, event_count: 0,
+        first_timestamp: "2026-06-09T12:00:00.000Z", last_timestamp: "2026-06-09T12:00:00.000Z", sha256: sha256("") }],
+    });
+    fs.writeFileSync(path.join(config.segmentsDir, "closed.jsonl.gz"), gzipSync(""));
+    queueMaintenance(config);
+    assert.equal(spawnMock.mock.callCount(), 0);
+    currentTime += 1;
+    assert.throws(() => queueMaintenance(config), /maintenance queued/u);
+    assert.equal(spawnMock.mock.callCount(), 1);
+  } finally {
+    spawnMock.mock.restore();
+    syncBuiltinESMExports();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("segment manifest defaults, validates, writes atomically, and changes store state", () => {
@@ -116,6 +178,72 @@ test("rotates active raw log before a record exceeds the configured cap", () => 
   assert.deepEqual(readJsonl(config.rawLogPath), [next]);
 });
 
+test("batched raw appends sync once and retain exact locators after an unterminated line", (t) => {
+  const home = tempHome();
+  const config = loadConfig({ home, env: {} });
+  const events = Array.from({ length: 40 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit", rawInput: JSON.stringify({ session_id: "batch-locators", prompt: `item ${index}` }), env: {}, now,
+  }));
+  try {
+    fs.writeFileSync(config.rawLogPath, JSON.stringify(events[0]));
+    const sync = t.mock.method(fs, "fsyncSync");
+    const locations = withRawLogLock(config.rawLogPath, () => appendSegmentedEvents(config, events.slice(1)));
+    assert.equal(sync.mock.callCount(), 1);
+    assert.deepEqual(Array.from(readAllRawEvents(config)), events);
+    assert.equal(locations.length, events.length - 1);
+    for (const [index, location] of locations.entries()) {
+      assert.deepEqual(readLocatedEvent(config, location), events[index + 1]);
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a raw batch crossing segment boundaries retains every locator", () => {
+  const home = tempHome();
+  const config = loadConfig({ home, env: {} });
+  const events = Array.from({ length: 5 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit", rawInput: JSON.stringify({ session_id: "rotating-batch", prompt: `item ${index}` }), env: {}, now,
+  }));
+  try {
+    const cap = Buffer.byteLength(JSON.stringify(events[0]) + "\n") * 2;
+    const locations = withRawLogLock(config.rawLogPath, () => appendSegmentedEvents(config, events, { segmentCapBytes: cap }));
+    assert.equal(readManifest(config.manifestPath).segments.length, 2);
+    assert.deepEqual(Array.from(readAllRawEvents(config)), events);
+    assert.deepEqual(locations.map((location) => readLocatedEvent(config, location)), events);
+    for (const record of readManifest(config.manifestPath).segments) assert.ok(record.byte_count <= cap);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("failed raw batch fsync rolls back the batch and retry stores it once", (t) => {
+  const home = tempHome();
+  const storage = createStorage({ home });
+  const events = Array.from({ length: 3 }, (_, index) => normalizeHookEvent({
+    hookEvent: "UserPromptSubmit", rawInput: JSON.stringify({ session_id: "batch-fsync", prompt: `item ${index}` }), env: {}, now,
+  }));
+  const originalSync = fs.fsyncSync;
+  let fail = true;
+  t.mock.method(fs, "fsyncSync", (descriptor: number) => {
+    if (fail && fs.fstatSync(descriptor).isFile()) {
+      fail = false;
+      throw new Error("forced batch fsync failure");
+    }
+    return originalSync(descriptor);
+  });
+  try {
+    assert.throws(() => storage.ingestMany(events), /forced batch fsync failure/u);
+    assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events, []);
+    assert.equal(storage.ingestMany(events).imported, events.length);
+    assert.deepEqual(readRawLog(path.join(home, "events.jsonl")).events, events);
+    assert.equal(storage.health().event_count, events.length);
+  } finally {
+    storage.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("reads located raw event from a closed segment", () => {
   const home = tempHome();
   const config = loadConfig({ home });
@@ -138,6 +266,41 @@ test("reads located raw event from a closed segment", () => {
 
   assert.deepEqual(readLocatedEvent(config, { segmentId: record.id, offset: 0, length }), seed);
 });
+
+for (const compressed of [false, true]) {
+  test(`rejects altered ${compressed ? "compressed" : "plain"} archives and invalidates cached reads`, (t) => {
+    const home = tempHome();
+    const config = loadConfig({ home, env: {} });
+    try {
+      const seed = normalizeHookEvent({ hookEvent: "UserPromptSubmit", rawInput: '{"session_id":"integrity","prompt":"archive me"}', env: {}, now });
+      const next = normalizeHookEvent({ hookEvent: "Stop", rawInput: '{"session_id":"integrity","last_assistant_message":"next"}', env: {}, now });
+      const [location] = appendSegmentedEvents(config, [seed]);
+      appendSegmentedEvents(config, [next], { segmentCapBytes: fs.statSync(config.rawLogPath).size + 1 });
+      if (compressed) assert.deepEqual(runMaintenanceOnce(config).errors, []);
+      const record = readManifest(config.manifestPath).segments[0];
+      assert.equal(record.compressed, compressed);
+      const target = path.join(home, record.path);
+      const readFile = t.mock.method(fs, "readFileSync");
+      const reader = createLocatedEventReader(config);
+      assert.deepEqual(reader(location), seed);
+      assert.deepEqual(reader(location), seed);
+      assert.equal(readFile.mock.calls.filter((call) => call.arguments[0] === target).length, 1);
+
+      const stored = fs.readFileSync(target);
+      const plain = compressed ? gunzipSync(stored) : stored;
+      const altered = Buffer.from(plain.toString("utf8").replace("archive me", "corrupt me"));
+      assert.equal(altered.length, plain.length);
+      fs.writeFileSync(target, compressed ? gzipSync(altered) : altered);
+
+      assert.throws(() => reader(location), /Segment checksum failed/u);
+      assert.throws(() => readLocatedEvent(config, location), /Segment checksum failed/u);
+      assert.throws(() => Array.from(readAllRawEvents(config)), /Segment checksum failed/u);
+      assert.throws(() => readAllRawLog(config), /Segment checksum failed/u);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
 
 test("keeps active event locators valid after rotation", () => {
   const home = tempHome();
