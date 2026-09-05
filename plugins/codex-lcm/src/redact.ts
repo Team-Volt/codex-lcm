@@ -13,13 +13,17 @@ export type TruncationRecord = {
   kind: "string" | "payload";
   original_bytes: number;
   sha256: string;
+} | {
+  readonly path: string;
+  readonly kind: "depth";
+  readonly max_depth: number;
 };
 
 export type SanitizeResult = {
   value: unknown;
   redactions: RedactionRecord[];
   truncations: TruncationRecord[];
-  originalBytes: number;
+  originalBytes: number | undefined;
   sanitizedBytes: number;
 };
 
@@ -29,6 +33,8 @@ type TokenPattern = {
   regex: RegExp;
   replacement: string | ((match: string, ...groups: string[]) => string);
 };
+
+const MAX_SANITIZE_DEPTH = 128;
 
 const TOKEN_PATTERNS: TokenPattern[] = [
   {
@@ -81,7 +87,7 @@ export function sanitizeForStorage(value: unknown, options: RedactionOptions = {
   const originalBytes = safeJsonByteLength(value);
 
   const sanitized = sanitizeValue(value, "$", limits, redactions, truncations);
-  const payloadBytes = safeJsonByteLength(sanitized);
+  const payloadBytes = byteLength(JSON.stringify(sanitized) ?? "");
   if (payloadBytes > limits.maxPayloadBytes) {
     const json = JSON.stringify(sanitized);
     const preview = truncateUtf8(json, limits.maxPayloadBytes);
@@ -103,7 +109,7 @@ export function sanitizeForStorage(value: unknown, options: RedactionOptions = {
       redactions,
       truncations,
       originalBytes,
-      sanitizedBytes: safeJsonByteLength(payload),
+      sanitizedBytes: byteLength(JSON.stringify(payload)),
     };
   }
 
@@ -122,6 +128,7 @@ function sanitizeValue(
   limits: LcmLimits,
   redactions: RedactionRecord[],
   truncations: TruncationRecord[],
+  depth = 0,
 ): unknown {
   if (value === null || value === undefined) return value;
 
@@ -133,8 +140,13 @@ function sanitizeValue(
   if (typeof value === "bigint") return value.toString();
   if (typeof value === "function" || typeof value === "symbol") return `[${typeof value}]`;
 
+  if (depth >= MAX_SANITIZE_DEPTH) {
+    truncations.push({ path, kind: "depth", max_depth: MAX_SANITIZE_DEPTH });
+    return { lcm_truncated: true, kind: "depth", max_depth: MAX_SANITIZE_DEPTH };
+  }
+
   if (Array.isArray(value)) {
-    return value.map((item, index) => sanitizeValue(item, `${path}[${index}]`, limits, redactions, truncations));
+    return value.map((item, index) => sanitizeValue(item, `${path}[${index}]`, limits, redactions, truncations, depth + 1));
   }
 
   if (typeof value === "object") {
@@ -146,7 +158,7 @@ function sanitizeValue(
         sanitizedChild = "[REDACTED:secret]";
         redactions.push({ path: childPath, reason: "secret-key" });
       } else {
-        sanitizedChild = sanitizeValue(child, childPath, limits, redactions, truncations);
+        sanitizedChild = sanitizeValue(child, childPath, limits, redactions, truncations, depth + 1);
       }
       Object.defineProperty(output, key, {
         value: sanitizedChild,
@@ -210,10 +222,11 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return output;
 }
 
-function safeJsonByteLength(value: unknown): number {
+function safeJsonByteLength(value: unknown): number | undefined {
   try {
     return byteLength(JSON.stringify(value) ?? "");
-  } catch {
-    return byteLength(String(value));
+  } catch (error) {
+    if (error instanceof RangeError || error instanceof TypeError) return undefined;
+    throw error;
   }
 }

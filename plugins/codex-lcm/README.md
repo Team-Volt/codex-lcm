@@ -134,6 +134,8 @@ Hooks capture the JSON payload Codex sends on stdin for:
 
 Events store session ID, cwd, optional project string, optional git repo root, optional git branch, hook event name, sanitized payload, redaction metadata, truncation metadata, timestamps, and hashes. Any valid hook input that exceeds an inline string or payload limit keeps the normal bounded event plus a sanitized, content-addressed overflow file; inputs over 8 MiB are rejected. Overflow recovery accepts only integrity-checked regular files inside the plugin's managed overflow directory. Large path-backed outputs are indexed as file references with path, byte count, SHA-256, MIME guess, and a compact exploration summary; the indexed metadata does not reload the full content.
 
+Objects and arrays nested 128 levels deep are replaced with an explicit depth-truncation marker, including in overflow files. Their omitted contents cannot be recovered. The event still records the original input byte count and SHA-256.
+
 Project and git data are metadata only. Search and retrieval are session-first and work for projectless sessions.
 
 ## DAG And Long Sessions
