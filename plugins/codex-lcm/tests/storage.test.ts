@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import childProcess, { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { syncBuiltinESMExports } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
@@ -9,7 +10,7 @@ import { gunzipSync, gzipSync } from "node:zlib";
 
 import { loadConfig } from "../src/config.ts";
 import { normalizeHookEvent, type NormalizedEvent } from "../src/events.ts";
-import { runMaintenanceOnce } from "../src/maintenance.ts";
+import { queueMaintenance, runMaintenanceOnce } from "../src/maintenance.ts";
 import {
   appendRawEvents,
   appendSegmentedEvents,
@@ -57,6 +58,32 @@ test("retention configuration reads valid .env values and rejects invalid values
   const duplicate = loadConfig({ home: duplicateHome, env: {} });
   assert.equal(duplicate.retentionDays, undefined);
   assert.notEqual(duplicate.configError, undefined);
+});
+
+test("maintenance waits until an archive crosses the retention cutoff", (t) => {
+  const home = tempHome();
+  const config = loadConfig({ home, env: { CODEX_LCM_RETENTION_DAYS: "1" } });
+  let currentTime = Date.parse("2026-06-10T12:00:00.000Z");
+  t.mock.method(Date, "now", () => currentTime);
+  const spawnMock = t.mock.method(childProcess, "spawn", () => { throw new Error("maintenance queued"); });
+  syncBuiltinESMExports();
+  try {
+    writeManifestAtomic(config.manifestPath, {
+      version: 1,
+      segments: [{ id: "closed", path: "segments/closed.jsonl.gz", compressed: true, byte_count: 0, event_count: 0,
+        first_timestamp: "2026-06-09T12:00:00.000Z", last_timestamp: "2026-06-09T12:00:00.000Z", sha256: sha256("") }],
+    });
+    fs.writeFileSync(path.join(config.segmentsDir, "closed.jsonl.gz"), gzipSync(""));
+    queueMaintenance(config);
+    assert.equal(spawnMock.mock.callCount(), 0);
+    currentTime += 1;
+    assert.throws(() => queueMaintenance(config), /maintenance queued/u);
+    assert.equal(spawnMock.mock.callCount(), 1);
+  } finally {
+    spawnMock.mock.restore();
+    syncBuiltinESMExports();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("segment manifest defaults, validates, writes atomically, and changes store state", () => {

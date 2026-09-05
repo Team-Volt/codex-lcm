@@ -288,6 +288,34 @@ test("hook command still rejects input above the overflow safety ceiling", () =>
   assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
 });
 
+test("retention does not launch maintenance on every hook when no archive is due", () => {
+  const home = tempHome();
+  const preloadPath = path.join(home, "reject-idle-maintenance.mjs");
+  fs.writeFileSync(preloadPath, `
+    import childProcess from "node:child_process";
+    import { syncBuiltinESMExports } from "node:module";
+    const spawn = childProcess.spawn;
+    childProcess.spawn = (...args) => {
+      if (args[1]?.includes("maintain")) throw new Error("unexpected idle maintenance launch");
+      return spawn(...args);
+    };
+    syncBuiltinESMExports();
+  `);
+  try {
+    for (let index = 0; index < 3; index++) {
+      const result = spawnSync(process.execPath, ["--no-warnings", "--import", preloadPath, "bin/codex-lcm", "hook", "UserPromptSubmit"], {
+        input: JSON.stringify({ session_id: "retention-scheduling", cwd: home, prompt: `prompt ${index}` }),
+        encoding: "utf8", timeout: 5_000,
+        env: { ...process.env, CODEX_LCM_HOME: home, CODEX_LCM_RETENTION_DAYS: "90", CODEX_LCM_MAINTENANCE_WORKER: "0" },
+      });
+      assertCliOk(result);
+    }
+    assert.equal(readJsonl(path.join(home, "events.jsonl")).length, 3);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("hook command captures git metadata as optional session metadata", () => {
   const home = tempHome();
   const repo = tempHome("codex-lcm-git-");
