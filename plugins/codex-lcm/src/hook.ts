@@ -5,6 +5,11 @@ import { DEFAULT_LIMITS, loadConfig } from "./config.ts";
 import { importCodexSessions } from "./codex-import.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
+import {
+  encodeDynamicHookStdout,
+  type ContextCapableHook,
+  type HookStdout,
+} from "./host-profile.ts";
 import { queueMaintenance } from "./maintenance.ts";
 import { sha256 } from "./redact.ts";
 import { createStorage } from "./storage.ts";
@@ -73,12 +78,13 @@ export async function runHook(args: string[]): Promise<void> {
     storage.close();
   }
   queueMaintenance(config);
-  const output = postCompactRecoveryOutput({
+  const stdout = postCompactRecoveryOutput({
     home: config.home,
     hookEvent: event.hook_event,
     sessionId: event.session_id,
     payload: event.payload,
   });
+  const output = encodeDynamicHookStdout(event.hook_event, stdout);
   if (output.length > 0) process.stdout.write(output);
 }
 
@@ -87,29 +93,49 @@ function postCompactRecoveryOutput(args: {
   hookEvent: string;
   sessionId: string;
   payload: Record<string, unknown>;
-}): string {
+}): HookStdout {
   if (args.hookEvent === "PostCompact") {
     markPostCompactPending(args.home, args.sessionId);
-    return "";
+    return { kind: "empty" };
   }
   if (args.hookEvent === "PostToolUse" && hasPostCompactPending(args.home, args.sessionId)) {
     const toolName = args.payload.tool_name;
     const isPackTool = toolName === "lcm_pack_context" || toolName === "mcp__codex_lcm__lcm_pack_context";
     if (isPackTool && hasPackedContextResult(args.payload)) {
       claimPostCompactPending(args.home, args.sessionId);
-      return "";
+      return { kind: "empty" };
     }
-    return formatAdditionalContextOutput(args.hookEvent, buildPostCompactLcmDirective());
+    return additionalContextStdout(args.hookEvent);
   }
   if (args.hookEvent === "Stop" && hasPostCompactPending(args.home, args.sessionId)) {
-    return `${JSON.stringify({ decision: "block", reason: "Post-compaction LCM recovery required: call `lcm_pack_context`, then continue." })}\n`;
+    return {
+      kind: "stopBlock",
+      reason: "Post-compaction LCM recovery required: call `lcm_pack_context`, then continue.",
+    };
   }
   if (
     args.hookEvent !== "UserPromptSubmit" &&
     (args.hookEvent !== "SessionStart" || (args.payload.source !== "compact" && args.payload.source !== "resume"))
-  ) return "";
-  if (!hasPostCompactPending(args.home, args.sessionId)) return "";
-  return formatAdditionalContextOutput(args.hookEvent, buildPostCompactLcmDirective());
+  ) return { kind: "empty" };
+  if (!hasPostCompactPending(args.home, args.sessionId)) return { kind: "empty" };
+  return additionalContextStdout(args.hookEvent);
+}
+
+function additionalContextStdout(hookEvent: string): HookStdout {
+  const hookEventName = asContextCapableHook(hookEvent);
+  if (!hookEventName) return { kind: "empty" };
+  return {
+    kind: "additionalContext",
+    hookEventName,
+    additionalContext: buildPostCompactLcmDirective(),
+  };
+}
+
+function asContextCapableHook(hookEvent: string): ContextCapableHook | undefined {
+  if (hookEvent === "SessionStart" || hookEvent === "UserPromptSubmit" || hookEvent === "PostToolUse") {
+    return hookEvent;
+  }
+  return undefined;
 }
 
 function hasPackedContextResult(payload: Record<string, unknown>): boolean {
@@ -155,15 +181,6 @@ function postCompactRecoveryPath(home: string, sessionId: string): string {
 
 function postCompactRecoveryDir(home: string): string {
   return path.join(home, "post-compact-recovery");
-}
-
-function formatAdditionalContextOutput(hookEventName: string, additionalContext: string): string {
-  return `${JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName,
-      additionalContext,
-    },
-  })}\n`;
 }
 
 function buildPostCompactLcmDirective(): string {
