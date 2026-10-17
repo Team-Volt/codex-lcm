@@ -58,16 +58,43 @@ export function redactSecretAssignments(value: string, path: string, redactions:
   return output;
 }
 
+export type KeyRedactionPolicy = "always-secret" | "never-secret" | "value-shape";
+
+export const KEY_POLICY = {
+  private: "value-shape",
+  token_budget: "value-shape",
+  tokens_budget: "value-shape",
+  tokens_used: "value-shape",
+  token_count: "value-shape",
+  auto_compact_token_limit: "value-shape",
+  password: "always-secret",
+  api_key: "always-secret",
+  secret: "always-secret",
+  token: "value-shape",
+} as const satisfies Record<string, KeyRedactionPolicy>;
+
 export function isBenignTokenMetric(key: string, value: unknown): boolean {
   if (!isTokenMetricKey(key)) return false;
   return typeof value === "number" || typeof value === "boolean";
 }
 
-export function shouldRedactSecretKey(key: string, value: unknown): boolean {
+export function keyRedactionPolicy(key: string): KeyRedactionPolicy | undefined {
   const parts = keyParts(key);
-  return isSecretAssignmentKey(key) &&
-    !isBenignTokenMetric(key, value) &&
-    !(typeof value === "boolean" && parts.length === 1 && parts[0] === "private");
+  const joined = parts.join("_");
+  if (Object.hasOwn(KEY_POLICY, joined)) return KEY_POLICY[joined as keyof typeof KEY_POLICY];
+  if (parts.length === 1 && Object.hasOwn(KEY_POLICY, parts[0])) {
+    return KEY_POLICY[parts[0] as keyof typeof KEY_POLICY];
+  }
+  return undefined;
+}
+
+export function shouldRedactSecretKey(key: string, value: unknown): boolean {
+  if (typeof value === "boolean" || typeof value === "number") return false;
+  const policy = keyRedactionPolicy(key);
+  if (policy === "never-secret") return false;
+  if (isBenignTokenMetric(key, value)) return false;
+  if (policy === "always-secret") return true;
+  return isSecretAssignmentKey(key);
 }
 
 function redactSecretAssignmentLine(value: string, path: string, redactions: RedactionRecord[]): string {

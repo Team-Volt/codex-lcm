@@ -2,7 +2,26 @@ import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
+import { KEY_POLICY, shouldRedactSecretKey } from "../src/redact-assignments.ts";
 import { sanitizeForStorage } from "../src/redact.ts";
+
+test("value-shape runs before key heuristics so metrics and boolean private survive", () => {
+  const cases: Array<{ key: string; value: unknown; redact: boolean; policy?: keyof typeof KEY_POLICY }> = [
+    { key: "private", value: true, redact: false, policy: "private" },
+    { key: "token_count", value: 42, redact: false, policy: "token_count" },
+    { key: "token_budget", value: 1200, redact: false, policy: "token_budget" },
+    { key: "password", value: "hunter2", redact: true, policy: "password" },
+    { key: "token", value: "sk-proj-secret-value", redact: true, policy: "token" },
+    { key: "nested.api_key", value: "sk-proj-secret-value", redact: true },
+  ];
+  for (const item of cases) {
+    assert.equal(shouldRedactSecretKey(item.key, item.value), item.redact, item.key);
+  }
+  assert.equal(KEY_POLICY.private, "value-shape");
+  assert.equal(KEY_POLICY.token_count, "value-shape");
+  assert.equal(KEY_POLICY.password, "always-secret");
+  assert.equal(shouldRedactSecretKey("tokens_budget", "not-a-number-secret"), true);
+});
 
 test("redacts secret-like object keys recursively", () => {
   const result = sanitizeForStorage({
