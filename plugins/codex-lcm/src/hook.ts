@@ -6,7 +6,7 @@ import { importCodexSessions } from "./codex-import.ts";
 import { normalizeHookEvent } from "./events.ts";
 import { resolveGitMetadata } from "./git.ts";
 import {
-  encodeHookStdout,
+  encodeDynamicHookStdout,
   type ContextCapableHook,
   type HookStdout,
 } from "./host-profile.ts";
@@ -84,7 +84,7 @@ export async function runHook(args: string[]): Promise<void> {
     sessionId: event.session_id,
     payload: event.payload,
   });
-  const output = encodeHookStdout(event.hook_event, stdout);
+  const output = encodeDynamicHookStdout(event.hook_event, stdout);
   if (output.length > 0) process.stdout.write(output);
 }
 

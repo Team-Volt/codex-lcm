@@ -51,25 +51,24 @@ export function parseCodexHookName(value: string): CodexHookName | undefined {
   return (CODEX_HOOK_NAMES as readonly string[]).includes(value) ? value as CodexHookName : undefined;
 }
 
-type EmptyStdoutHook = Extract<CodexHookName, "PreToolUse" | "PreCompact" | "PostCompact" | "SubagentStop">;
+type HookStdoutFor<Event extends CodexHookName> =
+  | Extract<HookStdout, { kind: "empty" }>
+  | (Event extends ContextCapableHook
+    ? Extract<HookStdout, { kind: "additionalContext" }> & { readonly hookEventName: Event }
+    : Event extends "Stop"
+      ? Extract<HookStdout, { kind: "stopBlock" }>
+      : never);
 
-export function encodeHookStdout(event: EmptyStdoutHook, stdout: { readonly kind: "empty" }): string;
-export function encodeHookStdout(
-  event: "Stop",
-  stdout: { readonly kind: "empty" } | { readonly kind: "stopBlock"; readonly reason: string },
-): string;
-export function encodeHookStdout(
-  event: ContextCapableHook,
-  stdout: {
-    readonly kind: "empty";
-  } | {
-    readonly kind: "additionalContext";
-    readonly hookEventName: ContextCapableHook;
-    readonly additionalContext: string;
-  },
-): string;
-export function encodeHookStdout(event: string, stdout: HookStdout): string;
-export function encodeHookStdout(event: string, stdout: HookStdout): string {
+type HookStdoutArgs = {
+  [Event in CodexHookName]: [event: Event, stdout: HookStdoutFor<Event>];
+}[CodexHookName];
+
+export function encodeHookStdout(...[event, stdout]: HookStdoutArgs): string {
+  return encodeDynamicHookStdout(event, stdout);
+}
+
+// Dynamic hook input must be validated at runtime, without weakening the literal API.
+export function encodeDynamicHookStdout(event: string, stdout: HookStdout): string {
   const name = parseCodexHookName(event);
   if (!name) {
     if (stdout.kind !== "empty") {
@@ -82,6 +81,9 @@ export function encodeHookStdout(event: string, stdout: HookStdout): string {
   if (stdout.kind === "additionalContext") {
     if (allowed !== "additionalContext") {
       throw new Error(`codex-lcm: ${name} cannot emit additionalContext`);
+    }
+    if (stdout.hookEventName !== name) {
+      throw new Error(`codex-lcm: ${name} cannot emit additionalContext for ${stdout.hookEventName}`);
     }
     return `${JSON.stringify({
       hookSpecificOutput: {
