@@ -5,6 +5,11 @@ import readline from "node:readline";
 
 import { codexRecordToEvent, type ImportState, rolloutSessionIdFromFile } from "./codex-record.ts";
 import { type NormalizedEvent } from "./events.ts";
+import {
+  classifySessionFile,
+  missingSessionSourceKinds,
+  type SessionSourceKind,
+} from "./session-source.ts";
 import { type LcmStorage } from "./storage.ts";
 
 export type ImportCodexSessionsOptions = {
@@ -12,6 +17,8 @@ export type ImportCodexSessionsOptions = {
   dryRun?: boolean;
   batchSize?: number;
   progress?: (report: ImportCodexSessionsReport) => void;
+  requireClassified?: boolean;
+  requireKinds?: readonly SessionSourceKind[];
 };
 
 export type ImportCodexSessionsReport = {
@@ -23,6 +30,8 @@ export type ImportCodexSessionsReport = {
   events_imported: number;
   events_skipped_duplicate: number;
   records_skipped: number;
+  files_unclassified: number;
+  files_by_source: Record<SessionSourceKind, number>;
   duration_ms: number;
   events_per_second: number;
   errors: Array<{ file: string; line?: number; message: string }>;
@@ -47,6 +56,13 @@ export async function importCodexSessions(
     events_imported: 0,
     events_skipped_duplicate: 0,
     records_skipped: 0,
+    files_unclassified: 0,
+    files_by_source: {
+      "uuid-rollout": 0,
+      "current-codex-record": 0,
+      "subagent-transcript": 0,
+      "forked-rollout-with-lineage": 0,
+    },
     duration_ms: 0,
     events_per_second: 0,
     errors: [],
@@ -81,6 +97,21 @@ export async function importCodexSessions(
   const files = listJsonlFiles(source);
   if (files.length === 0) {
     report.errors.push({ file: source, message: `No JSONL session files found at ${source}` });
+  }
+  const classified = files.map(classifySessionFile);
+  for (const file of classified) {
+    if (file.unclassified) report.files_unclassified += 1;
+    for (const kind of file.kinds) report.files_by_source[kind] += 1;
+    if (options.requireClassified && file.unclassified) {
+      throw new Error(`codex-lcm: unclassified session file: ${file.path}${file.reason ? ` (${file.reason})` : ""}`);
+    }
+  }
+  const requiredKinds = options.requireKinds ?? [];
+  if (requiredKinds.length > 0) {
+    const missing = missingSessionSourceKinds(classified).filter((kind) => requiredKinds.includes(kind));
+    if (missing.length > 0) {
+      throw new Error(`codex-lcm: import fixture missing session source kinds: ${missing.join(", ")}`);
+    }
   }
   for (const file of files) {
     report.files_scanned += 1;
