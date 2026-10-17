@@ -89,11 +89,11 @@ export function keyRedactionPolicy(key: string): KeyRedactionPolicy | undefined 
 }
 
 export function shouldRedactSecretKey(key: string, value: unknown): boolean {
-  if (typeof value === "boolean" || typeof value === "number") return false;
   const policy = keyRedactionPolicy(key);
-  if (policy === "never-secret") return false;
-  if (isBenignTokenMetric(key, value)) return false;
   if (policy === "always-secret") return true;
+  if (policy === "never-secret") return false;
+  if (policy === "value-shape" && keyParts(key).join("_") === "private" && typeof value === "boolean") return false;
+  if (isBenignTokenMetric(key, value)) return false;
   return isSecretAssignmentKey(key);
 }
 

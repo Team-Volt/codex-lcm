@@ -5,7 +5,7 @@ import test from "node:test";
 import { KEY_POLICY, shouldRedactSecretKey } from "../src/redact-assignments.ts";
 import { sanitizeForStorage } from "../src/redact.ts";
 
-test("value-shape runs before key heuristics so metrics and boolean private survive", () => {
+test("preserves known metrics and boolean private flags without exempting credentials", () => {
   const cases: Array<{ key: string; value: unknown; redact: boolean; policy?: keyof typeof KEY_POLICY }> = [
     { key: "private", value: true, redact: false, policy: "private" },
     { key: "token_count", value: 42, redact: false, policy: "token_count" },
@@ -21,6 +21,49 @@ test("value-shape runs before key heuristics so metrics and boolean private surv
   assert.equal(KEY_POLICY.token_count, "value-shape");
   assert.equal(KEY_POLICY.password, "always-secret");
   assert.equal(shouldRedactSecretKey("tokens_budget", "not-a-number-secret"), true);
+});
+
+test("secret-key policies and heuristics redact primitive credentials", () => {
+  for (const key of ["password", "api_key", "secret", "PASSWORD", "apiKey", "nested.api_key", "auth_token", "token", "private_key"]) {
+    for (const value of [123456, 0, true, false]) {
+      assert.equal(shouldRedactSecretKey(key, value), true, `${key}: ${value}`);
+    }
+  }
+  for (const value of [true, false]) {
+    assert.equal(shouldRedactSecretKey("private", value), false);
+    assert.equal(shouldRedactSecretKey("token_count", value), false);
+  }
+  assert.equal(shouldRedactSecretKey("private", 123456), true);
+});
+
+test("redacts primitive credentials recursively while preserving metrics and private flags", () => {
+  const result = sanitizeForStorage({
+    password: 123456,
+    api_key: 123456,
+    secret: 123456,
+    private: true,
+    token_count: 42,
+    nested: [{ password: 0, apiKey: false, secret: true, auth_token: 123456, private: false, tokens_used: 374 }],
+  });
+
+  assert.deepEqual(result.value, {
+    password: "[REDACTED:secret]",
+    api_key: "[REDACTED:secret]",
+    secret: "[REDACTED:secret]",
+    private: true,
+    token_count: 42,
+    nested: [{ password: "[REDACTED:secret]", apiKey: "[REDACTED:secret]", secret: "[REDACTED:secret]", auth_token: "[REDACTED:secret]", private: false, tokens_used: 374 }],
+  });
+  assert.deepEqual(result.redactions, [
+    { path: "$.password", reason: "secret-key" },
+    { path: "$.api_key", reason: "secret-key" },
+    { path: "$.secret", reason: "secret-key" },
+    { path: "$.nested[0].password", reason: "secret-key" },
+    { path: "$.nested[0].apiKey", reason: "secret-key" },
+    { path: "$.nested[0].secret", reason: "secret-key" },
+    { path: "$.nested[0].auth_token", reason: "secret-key" },
+  ]);
+  assert.equal(result.truncations.length, 0);
 });
 
 test("redacts secret-like object keys recursively", () => {
