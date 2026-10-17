@@ -5,6 +5,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 
+import { CODEX_HOOK_NAMES, CODEX_HOST } from "../src/host-profile.ts";
+
 test("npm package includes runtime wiring and excludes local evidence", () => {
   const cache = fs.mkdtempSync(path.join(os.tmpdir(), "lcm-pack-cache-"));
   try {
@@ -75,22 +77,15 @@ test("MCP manifest registers the local stdio server", () => {
 
 test("hook manifest registers all required Codex lifecycle hooks", () => {
   const manifest = JSON.parse(fs.readFileSync("hooks/hooks.codex.json", "utf8"));
-  const events = [
-    "SessionStart",
-    "UserPromptSubmit",
-    "PreToolUse",
-    "PostToolUse",
-    "PreCompact",
-    "PostCompact",
-    "SubagentStop",
-    "Stop",
-  ];
+  const events = [...CODEX_HOOK_NAMES];
 
   assert.deepEqual(Object.keys(manifest.hooks), events);
+  assert.deepEqual(Object.keys(CODEX_HOST.hooks), events);
   for (const event of events) {
     const command = manifest.hooks[event][0].hooks[0].command;
-    assert.match(command, /\$\{PLUGIN_ROOT\}/u);
+    assert.match(command, new RegExp(CODEX_HOST.pluginRootToken.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
     assert.doesNotMatch(command, /CLAUDE_PLUGIN_ROOT/u);
+    assert.doesNotMatch(command, /CURSOR_PLUGIN_ROOT/u);
     assert.match(command, new RegExp(`codex-lcm" hook ${event}`, "u"));
   }
 });
