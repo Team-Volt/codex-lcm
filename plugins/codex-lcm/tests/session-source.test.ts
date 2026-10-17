@@ -8,13 +8,13 @@ import { classifySessionFile, SESSION_SOURCE_KINDS } from "../src/session-source
 import { createStorage } from "../src/storage.ts";
 import { tempHome } from "./helpers.ts";
 
-test("classifies the four historical Codex session source kinds", () => {
+test("classifies the four historical Codex session source kinds", async () => {
   const dir = writeCorpus();
   const classified = {
-    "uuid-rollout": classifySessionFile(path.join(dir, "rollout-2026-07-09T14-41-58-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl")),
-    "current-codex-record": classifySessionFile(path.join(dir, "current.jsonl")),
-    "subagent-transcript": classifySessionFile(path.join(dir, "subagent.jsonl")),
-    "forked-rollout-with-lineage": classifySessionFile(path.join(dir, "lineage.jsonl")),
+    "uuid-rollout": await classifySessionFile(path.join(dir, "rollout-2026-07-09T14-41-58-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl")),
+    "current-codex-record": await classifySessionFile(path.join(dir, "current.jsonl")),
+    "subagent-transcript": await classifySessionFile(path.join(dir, "subagent.jsonl")),
+    "forked-rollout-with-lineage": await classifySessionFile(path.join(dir, "lineage.jsonl")),
   };
 
   assert.deepEqual(classified["uuid-rollout"].kinds, ["uuid-rollout"]);
@@ -106,7 +106,7 @@ for (const uuidNamed of [false, true]) {
     // CRLF metadata plus an unterminated final record exercise both line endings.
     fs.writeFileSync(file, `${JSON.stringify(metadata)}\r\n${JSON.stringify(response)}`);
     const expected = SESSION_SOURCE_KINDS.filter((kind) => uuidNamed || kind !== "uuid-rollout");
-    const classified = classifySessionFile(file);
+    const classified = await classifySessionFile(file);
     assert.deepEqual(classified.kinds, expected);
     assert.equal(classified.unclassified, false);
     assert.equal(classified.reason, undefined);
@@ -125,54 +125,108 @@ for (const uuidNamed of [false, true]) {
 }
 
 for (const prefixBytes of [64 * 1024 - 1, 64 * 1024, 64 * 1024 + 1]) {
-  test(`reads a source record around the old peek boundary (${prefixBytes} bytes)`, () => {
+  test(`reads a source record around the old peek boundary (${prefixBytes} bytes)`, async () => {
     const dir = tempHome("session-source-boundary-");
     const file = path.join(dir, "boundary.jsonl");
     const prefix = `${JSON.stringify({ padding: "" })}\n`;
     const header = `${JSON.stringify({ padding: "x".repeat(prefixBytes - Buffer.byteLength(prefix)) })}\n`;
     assert.equal(Buffer.byteLength(header), prefixBytes);
     fs.writeFileSync(file, `${header}${JSON.stringify({ type: "response_item" })}\n`);
-    assert.deepEqual(classifySessionFile(file).kinds, ["current-codex-record"]);
+    assert.deepEqual((await classifySessionFile(file)).kinds, ["current-codex-record"]);
   });
 }
 
-test("decodes UTF-8 spanning a read boundary before parsing the complete record", () => {
+test("decodes UTF-8 spanning a read boundary before parsing the complete record", async () => {
   const dir = tempHome("session-source-utf8-");
   const file = path.join(dir, "utf8.jsonl");
   const prefix = '{"type":"session_meta","payload":{"padding":"';
   fs.writeFileSync(file, `${prefix}${"x".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1)}😀","source":{"subagent":{}}}}`);
-  assert.deepEqual(classifySessionFile(file).kinds, ["subagent-transcript"]);
-  assert.equal(classifySessionFile(file).reason, undefined);
+  assert.deepEqual((await classifySessionFile(file)).kinds, ["subagent-transcript"]);
+  assert.equal((await classifySessionFile(file)).reason, undefined);
 });
 
-test("retains UUID filename evidence for empty and unreadable files", () => {
+test("retains UUID filename evidence for empty and unreadable files", async () => {
   const dir = tempHome("session-source-fallback-");
   const file = path.join(dir, "rollout-2026-07-09T14-41-58-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
   fs.writeFileSync(file, "");
-  assert.deepEqual(classifySessionFile(file), { path: file, kinds: ["uuid-rollout"], unclassified: false });
+  assert.deepEqual(await classifySessionFile(file), { path: file, kinds: ["uuid-rollout"], unclassified: false });
   // A missing path is a deterministic open failure even when tests run as root.
   fs.unlinkSync(file);
-  const unreadable = classifySessionFile(file);
+  const unreadable = await classifySessionFile(file);
   assert.deepEqual(unreadable.kinds, ["uuid-rollout"]);
   assert.equal(unreadable.unclassified, false);
   assert.match(unreadable.reason ?? "", /ENOENT/u);
-  const unknown = classifySessionFile(path.join(dir, "missing.jsonl"));
+  const unknown = await classifySessionFile(path.join(dir, "missing.jsonl"));
   assert.equal(unknown.unclassified, true);
   assert.deepEqual(unknown.kinds, []);
   assert.match(unknown.reason ?? "", /ENOENT/u);
 });
 
-test("malformed JSON preserves preceding metadata evidence and reports the physical line", () => {
+test("malformed JSON preserves preceding metadata evidence and reports the physical line", async () => {
   const dir = tempHome("session-source-malformed-");
   const file = path.join(dir, "malformed.jsonl");
   fs.writeFileSync(file, `\n${JSON.stringify({ type: "session_meta", payload: { source: { subagent: {} }, parent_thread_id: "parent" } })}\n{broken\n`);
-  const classified = classifySessionFile(file);
+  const classified = await classifySessionFile(file);
   assert.deepEqual(classified.kinds, ["subagent-transcript", "forked-rollout-with-lineage"]);
   assert.equal(classified.unclassified, false);
   assert.equal(classified.reason, "invalid JSON on line 3 of malformed.jsonl");
   fs.writeFileSync(file, "{broken\n");
-  assert.equal(classifySessionFile(file).unclassified, true);
-  assert.equal(classifySessionFile(file).reason, "invalid JSON on line 1 of malformed.jsonl");
+  assert.equal((await classifySessionFile(file)).unclassified, true);
+  assert.equal((await classifySessionFile(file)).reason, "invalid JSON on line 1 of malformed.jsonl");
+});
+
+test("classification yields to the event loop and reports progress before import", async () => {
+  const dir = tempHome("session-source-progress-");
+  fs.writeFileSync(path.join(dir, "large.jsonl"), `${JSON.stringify({ padding: "x".repeat(256 * 1024) })}\n`);
+  const storage = createStorage({ home: tempHome("session-source-progress-home-") });
+  let yielded = false;
+  let immediate: ReturnType<typeof setImmediate> | undefined;
+  const progress: Array<{ records: number; yielded: boolean }> = [];
+  try {
+    await importCodexSessions(storage, {
+      from: dir,
+      progress: (report) => {
+        if (!immediate) immediate = setImmediate(() => { yielded = true; });
+        progress.push({ records: report.records_read, yielded });
+      },
+    });
+    assert.ok(progress.some((snapshot) => snapshot.records === 0 && snapshot.yielded),
+      "classification must emit progress and yield before records are imported");
+    assert.equal(progress.at(-1)?.records, 1);
+  } finally {
+    if (immediate) clearImmediate(immediate);
+    storage.close();
+  }
+});
+
+test("required kind after malformed JSON is not counted and strict import writes nothing", async () => {
+  const dir = tempHome("session-source-malformed-kind-");
+  const file = path.join(dir, "malformed.jsonl");
+  fs.writeFileSync(file, [
+    JSON.stringify({ type: "session_meta", payload: { id: "malformed-kind" } }),
+    "{broken",
+    JSON.stringify({ type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "later" }] } }),
+  ].join("\n"));
+  const classified = await classifySessionFile(file);
+  assert.deepEqual(classified.kinds, [], "classification stops at malformed JSON, ignoring later kind evidence");
+  assert.equal(classified.unclassified, false, "known metadata before the malformed line remains evidence");
+  assert.equal(classified.reason, "invalid JSON on line 2 of malformed.jsonl");
+  const home = tempHome("session-source-malformed-kind-home-");
+  const storage = createStorage({ home });
+  try {
+    await assert.rejects(
+      importCodexSessions(storage, { from: dir, requireKinds: ["current-codex-record"] }),
+      /missing session source kinds: current-codex-record/u,
+    );
+    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
+    const report = await importCodexSessions(storage, { from: dir });
+    assert.equal(report.files_by_source["current-codex-record"], 0);
+    assert.equal(report.records_skipped, 1);
+    assert.equal(report.errors[0]?.line, 2);
+    assert.equal(report.events_imported, 2, "non-strict import still recovers valid records after malformed JSON");
+  } finally {
+    storage.close();
+  }
 });
 
 function writeCorpus(): string {

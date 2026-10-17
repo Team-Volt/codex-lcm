@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import fs from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
@@ -30,14 +30,14 @@ export type ClassifiedSessionFile = {
 
 const READ_BYTES = 64 * 1024;
 
-export function classifySessionFile(file: string): ClassifiedSessionFile {
+export async function classifySessionFile(file: string, onProgress?: () => void): Promise<ClassifiedSessionFile> {
   const kinds = new Set<SessionSourceKind>();
   if (rolloutSessionIdFromFile(file)) kinds.add("uuid-rollout");
 
   let sawKnownRecord = false;
   let reason: string | undefined;
   try {
-    for (const record of readJsonlRecords(file)) {
+    for await (const record of readJsonlRecords(file, onProgress)) {
       if (!isRecord(record)) continue;
       const type = record.type;
       if (typeof type === "string" && (CODEX_RECORD_TYPES as readonly string[]).includes(type)) {
@@ -73,8 +73,8 @@ export function missingSessionSourceKinds(
 }
 
 // Scan through EOF: an absent kind must not mean an exhausted prefix budget.
-function* readJsonlRecords(file: string): Generator<unknown> {
-  const fd = fs.openSync(file, "r");
+async function* readJsonlRecords(file: string, onProgress?: () => void): AsyncGenerator<unknown> {
+  const fd = await fs.open(file, "r");
   try {
     const buffer = Buffer.alloc(READ_BYTES);
     const decoder = new StringDecoder("utf8");
@@ -88,7 +88,8 @@ function* readJsonlRecords(file: string): Generator<unknown> {
       }
     };
     while (true) {
-      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      const { bytesRead } = await fd.read(buffer, 0, buffer.length, null);
+      onProgress?.();
       pending += bytesRead === 0 ? decoder.end() : decoder.write(buffer.subarray(0, bytesRead));
       let newline: number;
       while ((newline = pending.indexOf("\n")) !== -1) {
@@ -104,7 +105,7 @@ function* readJsonlRecords(file: string): Generator<unknown> {
       }
     }
   } finally {
-    fs.closeSync(fd);
+    await fd.close();
   }
 }
 

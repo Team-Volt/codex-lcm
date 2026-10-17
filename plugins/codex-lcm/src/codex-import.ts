@@ -98,8 +98,10 @@ export async function importCodexSessions(
   if (files.length === 0) {
     report.errors.push({ file: source, message: `No JSONL session files found at ${source}` });
   }
-  const classified = files.map(classifySessionFile);
-  for (const file of classified) {
+  const classified = [];
+  for (const sourceFile of files) {
+    const file = await classifySessionFile(sourceFile, () => emitProgress(true));
+    classified.push(file);
     if (file.unclassified) report.files_unclassified += 1;
     for (const kind of file.kinds) report.files_by_source[kind] += 1;
     if (options.requireClassified && file.unclassified) {
