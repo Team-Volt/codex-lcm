@@ -5,6 +5,13 @@ import readline from "node:readline";
 
 import { codexRecordToEvent, type ImportState, rolloutSessionIdFromFile } from "./codex-record.ts";
 import { type NormalizedEvent } from "./events.ts";
+import {
+  classifySessionFile,
+  createSessionSourceClassifier,
+  missingSessionSourceKinds,
+  type ClassifiedSessionFile,
+  type SessionSourceKind,
+} from "./session-source.ts";
 import { type LcmStorage } from "./storage.ts";
 
 export type ImportCodexSessionsOptions = {
@@ -12,6 +19,8 @@ export type ImportCodexSessionsOptions = {
   dryRun?: boolean;
   batchSize?: number;
   progress?: (report: ImportCodexSessionsReport) => void;
+  requireClassified?: boolean;
+  requireKinds?: readonly SessionSourceKind[];
 };
 
 export type ImportCodexSessionsReport = {
@@ -23,6 +32,8 @@ export type ImportCodexSessionsReport = {
   events_imported: number;
   events_skipped_duplicate: number;
   records_skipped: number;
+  files_unclassified: number;
+  files_by_source: Record<SessionSourceKind, number>;
   duration_ms: number;
   events_per_second: number;
   errors: Array<{ file: string; line?: number; message: string }>;
@@ -47,6 +58,13 @@ export async function importCodexSessions(
     events_imported: 0,
     events_skipped_duplicate: 0,
     records_skipped: 0,
+    files_unclassified: 0,
+    files_by_source: {
+      "uuid-rollout": 0,
+      "current-codex-record": 0,
+      "subagent-transcript": 0,
+      "forked-rollout-with-lineage": 0,
+    },
     duration_ms: 0,
     events_per_second: 0,
     errors: [],
@@ -82,9 +100,34 @@ export async function importCodexSessions(
   if (files.length === 0) {
     report.errors.push({ file: source, message: `No JSONL session files found at ${source}` });
   }
+  const countClassification = (file: ClassifiedSessionFile) => {
+    if (file.unclassified) report.files_unclassified += 1;
+    for (const kind of file.kinds) report.files_by_source[kind] += 1;
+  };
+  const requiredKinds = options.requireKinds ?? [];
+  const strict = options.requireClassified || requiredKinds.length > 0;
+  if (strict) {
+    const classified = [];
+    for (const sourceFile of files) {
+      const file = await classifySessionFile(sourceFile, () => emitProgress(true));
+      classified.push(file);
+      countClassification(file);
+      if (options.requireClassified && file.unclassified) {
+        throw new Error(`codex-lcm: unclassified session file: ${file.path}${file.reason ? ` (${file.reason})` : ""}`);
+      }
+    }
+    if (requiredKinds.length > 0) {
+      const missing = missingSessionSourceKinds(classified).filter((kind) => requiredKinds.includes(kind));
+      if (missing.length > 0) {
+        throw new Error(`codex-lcm: import fixture missing session source kinds: ${missing.join(", ")}`);
+      }
+    }
+  }
   for (const file of files) {
+    const classifier = strict ? undefined : createSessionSourceClassifier(file);
     report.files_scanned += 1;
     await importFile(file, report, {
+      classifier,
       onImportableEvent: (event) => {
         if (options.dryRun) {
           if (storage.hasEvent(event.event_id)) {
@@ -97,6 +140,7 @@ export async function importCodexSessions(
       },
       onProgress: emitProgress,
     });
+    if (classifier) countClassification(classifier.result());
   }
   if (!options.dryRun) flushBatch();
   if (!options.dryRun) storage.rebuildSessionMemorySummaries(touchedSessions);
@@ -109,6 +153,7 @@ async function importFile(
   file: string,
   report: ImportCodexSessionsReport,
   options: {
+    classifier?: ReturnType<typeof createSessionSourceClassifier>;
     onImportableEvent: (event: NormalizedEvent) => void;
     onProgress: () => void;
   },
@@ -125,7 +170,14 @@ async function importFile(
       report.records_read += 1;
       let event: NormalizedEvent | undefined;
       try {
-        const parsed = JSON.parse(line);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch (error) {
+          options.classifier?.fail(`invalid JSON on line ${lineNumber} of ${path.basename(file)}`);
+          throw error;
+        }
+        options.classifier?.observe(parsed);
         if (!isRecord(parsed)) throw new Error("record is not an object");
         event = codexRecordToEvent(parsed, file, state);
       } catch (error) {
@@ -145,6 +197,7 @@ async function importFile(
     }
   } catch (error) {
     if (!input.errored) throw error;
+    options.classifier?.fail(error instanceof Error ? error.message : String(error));
     report.records_skipped += 1;
     report.errors.push({
       file,
