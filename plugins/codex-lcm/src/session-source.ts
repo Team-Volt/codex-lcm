@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 import { rolloutSessionIdFromFile } from "./codex-record.ts";
 
@@ -27,45 +28,38 @@ export type ClassifiedSessionFile = {
   readonly reason?: string;
 };
 
-const PEEK_BYTES = 64 * 1024;
+const READ_BYTES = 64 * 1024;
 
 export function classifySessionFile(file: string): ClassifiedSessionFile {
   const kinds = new Set<SessionSourceKind>();
   if (rolloutSessionIdFromFile(file)) kinds.add("uuid-rollout");
 
-  let records: unknown[];
-  try {
-    records = peekJsonlRecords(file);
-  } catch (error) {
-    return {
-      path: file,
-      kinds: [...kinds],
-      unclassified: kinds.size === 0,
-      reason: error instanceof Error ? error.message : String(error),
-    };
-  }
-
   let sawKnownRecord = false;
-  for (const record of records) {
-    if (!isRecord(record)) continue;
-    const type = record.type;
-    if (typeof type === "string" && (CODEX_RECORD_TYPES as readonly string[]).includes(type)) {
-      sawKnownRecord = true;
-    }
-    if (type === "response_item") kinds.add("current-codex-record");
-    if (type === "session_meta" && isRecord(record.payload)) {
-      const payload = record.payload;
-      if (hasSubagentSource(payload)) kinds.add("subagent-transcript");
-      if (typeof payload.parent_thread_id === "string" && payload.parent_thread_id.trim().length > 0) {
-        kinds.add("forked-rollout-with-lineage");
+  let reason: string | undefined;
+  try {
+    for (const record of readJsonlRecords(file)) {
+      if (!isRecord(record)) continue;
+      const type = record.type;
+      if (typeof type === "string" && (CODEX_RECORD_TYPES as readonly string[]).includes(type)) {
+        sawKnownRecord = true;
+      }
+      if (type === "response_item") kinds.add("current-codex-record");
+      if (type === "session_meta" && isRecord(record.payload)) {
+        const payload = record.payload;
+        if (hasSubagentSource(payload)) kinds.add("subagent-transcript");
+        if (typeof payload.parent_thread_id === "string" && payload.parent_thread_id.trim().length > 0) {
+          kinds.add("forked-rollout-with-lineage");
+        }
       }
     }
+  } catch (error) {
+    reason = error instanceof Error ? error.message : String(error);
   }
 
   if (kinds.size === 0 && !sawKnownRecord) {
-    return { path: file, kinds: [], unclassified: true, reason: "no known Codex session shape" };
+    return { path: file, kinds: [], unclassified: true, reason: reason ?? "no known Codex session shape" };
   }
-  return { path: file, kinds: SESSION_SOURCE_KINDS.filter((kind) => kinds.has(kind)), unclassified: false };
+  return { path: file, kinds: SESSION_SOURCE_KINDS.filter((kind) => kinds.has(kind)), unclassified: false, ...(reason ? { reason } : {}) };
 }
 
 export function missingSessionSourceKinds(
@@ -78,21 +72,37 @@ export function missingSessionSourceKinds(
   return SESSION_SOURCE_KINDS.filter((kind) => !seen.has(kind));
 }
 
-function peekJsonlRecords(file: string): unknown[] {
+// Scan through EOF: an absent kind must not mean an exhausted prefix budget.
+function* readJsonlRecords(file: string): Generator<unknown> {
   const fd = fs.openSync(file, "r");
   try {
-    const buffer = Buffer.alloc(PEEK_BYTES);
-    const bytesRead = fs.readSync(fd, buffer, 0, PEEK_BYTES, 0);
-    const text = buffer.subarray(0, bytesRead).toString("utf8");
-    const lines = text.split(/\r?\n/u).filter((line) => line.trim().length > 0);
-    if (bytesRead === PEEK_BYTES && !text.endsWith("\n")) lines.pop();
-    return lines.map((line, index) => {
+    const buffer = Buffer.alloc(READ_BYTES);
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
+    let lineNumber = 0;
+    const parse = (line: string): unknown => {
       try {
         return JSON.parse(line);
       } catch {
-        throw new Error(`invalid JSON on line ${index + 1} of ${path.basename(file)}`);
+        throw new Error(`invalid JSON on line ${lineNumber} of ${path.basename(file)}`);
       }
-    });
+    };
+    while (true) {
+      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+      pending += bytesRead === 0 ? decoder.end() : decoder.write(buffer.subarray(0, bytesRead));
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        lineNumber += 1;
+        if (line.trim().length > 0) yield parse(line);
+      }
+      if (bytesRead === 0) {
+        lineNumber += 1;
+        if (pending.trim().length > 0) yield parse(pending);
+        break;
+      }
+    }
   } finally {
     fs.closeSync(fd);
   }
