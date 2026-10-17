@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
@@ -37,6 +38,67 @@ test("live import counts unclassified files and does not throw", async () => {
   }
 });
 
+test("default import reads and parses each source file once while classifying kinds", async (t) => {
+  const dir = writeCorpus();
+  const files = fs.readdirSync(dir).map((name) => path.join(dir, name));
+  const records = files.map((file) => fs.readFileSync(file, "utf8").trim());
+  const storage = createStorage({ home: tempHome("session-source-once-home-") });
+  const open = t.mock.method(fsPromises, "open");
+  const read = t.mock.method(fs, "createReadStream");
+  const parse = t.mock.method(JSON, "parse");
+  try {
+    const report = await importCodexSessions(storage, { from: dir });
+    for (const file of files) {
+      assert.equal(read.mock.calls.filter((call) => call.arguments[0] === file).length, 1);
+      assert.equal(open.mock.calls.filter((call) => call.arguments[0] === file).length, 0,
+        "default import must not open a classification pre-pass");
+    }
+    for (const record of records) {
+      assert.equal(parse.mock.calls.filter((call) => call.arguments[0] === record).length, 1);
+    }
+    assert.equal(report.files_scanned, 4);
+    assert.equal(report.records_read, 4);
+    assert.equal(report.events_imported, 4);
+    assert.equal(report.files_unclassified, 0);
+    assert.deepEqual(report.files_by_source, Object.fromEntries(SESSION_SOURCE_KINDS.map((kind) => [kind, 1])));
+  } finally {
+    t.mock.restoreAll();
+    storage.close();
+  }
+});
+
+test("default and strict imports report identical counts and classification", async () => {
+  const dir = writeCorpus();
+  const rows = [
+    { type: "session_meta", payload: { id: "overlap", source: { subagent: {} }, parent_thread_id: "parent" } },
+    { type: "response_item" },
+  ];
+  fs.writeFileSync(path.join(dir, "overlap.jsonl"), rows.map((row) => JSON.stringify(row)).join("\r\n"));
+  fs.writeFileSync(path.join(dir, "known.jsonl"), '{"type":"turn_context"}\n');
+  fs.writeFileSync(path.join(dir, "junk.jsonl"), '[]\n{"note":"not a session"}\n');
+  fs.writeFileSync(path.join(dir, "empty.jsonl"), "\n");
+  fs.writeFileSync(path.join(dir, "broken-first.jsonl"), '{broken\n{"type":"response_item"}\n');
+  fs.writeFileSync(path.join(dir, "broken-later.jsonl"), `${JSON.stringify(rows[0])}\n{broken\n${JSON.stringify(rows[1])}\n`);
+  const reports = [];
+  for (const options of [{}, { requireKinds: SESSION_SOURCE_KINDS }]) {
+    const storage = createStorage({ home: tempHome("session-source-parity-home-") });
+    try {
+      const { duration_ms, events_per_second, ...report } = await importCodexSessions(storage, { from: dir, ...options });
+      reports.push(report);
+    } finally {
+      storage.close();
+    }
+  }
+  assert.deepEqual(reports[0], reports[1]);
+  assert.equal(reports[0].files_unclassified, 3);
+  assert.deepEqual(reports[0].files_by_source, {
+    "uuid-rollout": 1,
+    "current-codex-record": 2,
+    "subagent-transcript": 3,
+    "forked-rollout-with-lineage": 3,
+  });
+});
+
 test("requireClassified fails live-looking junk only when requested", async () => {
   const dir = tempHome("session-source-strict-");
   fs.writeFileSync(path.join(dir, "notes.jsonl"), `${JSON.stringify({ note: "not a session" })}\n`);
@@ -51,19 +113,26 @@ test("requireClassified fails live-looking junk only when requested", async () =
   }
 });
 
-test("requireKinds fails a fixture corpus that omits a historical source", async () => {
+test("requireKinds rejects missing kinds before importing anything", async (t) => {
   const dir = tempHome("session-source-kinds-");
   fs.writeFileSync(
     path.join(dir, "current.jsonl"),
     `${JSON.stringify({ timestamp: "2026-06-18T12:00:00.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] } })}\n`,
   );
-  const storage = createStorage({ home: tempHome("session-source-kinds-home-") });
+  const home = tempHome("session-source-kinds-home-");
+  const storage = createStorage({ home });
+  const ingest = t.mock.method(storage, "ingestMany");
+  const read = t.mock.method(fs, "createReadStream");
   try {
     await assert.rejects(
-      importCodexSessions(storage, { from: dir, requireKinds: SESSION_SOURCE_KINDS }),
+      importCodexSessions(storage, { from: dir, requireKinds: SESSION_SOURCE_KINDS, batchSize: 1 }),
       /missing session source kinds: uuid-rollout, subagent-transcript, forked-rollout-with-lineage/u,
     );
+    assert.equal(ingest.mock.callCount(), 0);
+    assert.equal(read.mock.calls.filter((call) => call.arguments[0] === path.join(dir, "current.jsonl")).length, 0);
+    assert.equal(fs.existsSync(path.join(home, "events.jsonl")), false);
   } finally {
+    t.mock.restoreAll();
     storage.close();
   }
 });
@@ -175,9 +244,9 @@ test("malformed JSON preserves preceding metadata evidence and reports the physi
   assert.equal((await classifySessionFile(file)).reason, "invalid JSON on line 1 of malformed.jsonl");
 });
 
-test("classification yields to the event loop and reports progress before import", async () => {
+test("strict classification yields to the event loop and reports progress before import", async () => {
   const dir = tempHome("session-source-progress-");
-  fs.writeFileSync(path.join(dir, "large.jsonl"), `${JSON.stringify({ padding: "x".repeat(256 * 1024) })}\n`);
+  fs.writeFileSync(path.join(dir, "large.jsonl"), `${JSON.stringify({ type: "turn_context", padding: "x".repeat(256 * 1024) })}\n`);
   const storage = createStorage({ home: tempHome("session-source-progress-home-") });
   let yielded = false;
   let immediate: ReturnType<typeof setImmediate> | undefined;
@@ -185,6 +254,7 @@ test("classification yields to the event loop and reports progress before import
   try {
     await importCodexSessions(storage, {
       from: dir,
+      requireClassified: true,
       progress: (report) => {
         if (!immediate) immediate = setImmediate(() => { yielded = true; });
         progress.push({ records: report.records_read, yielded });

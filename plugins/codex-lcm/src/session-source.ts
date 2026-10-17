@@ -31,14 +31,24 @@ export type ClassifiedSessionFile = {
 const READ_BYTES = 64 * 1024;
 
 export async function classifySessionFile(file: string, onProgress?: () => void): Promise<ClassifiedSessionFile> {
+  const classifier = createSessionSourceClassifier(file);
+  try {
+    for await (const record of readJsonlRecords(file, onProgress)) classifier.observe(record);
+  } catch (error) {
+    classifier.fail(error instanceof Error ? error.message : String(error));
+  }
+  return classifier.result();
+}
+
+export function createSessionSourceClassifier(file: string) {
   const kinds = new Set<SessionSourceKind>();
   if (rolloutSessionIdFromFile(file)) kinds.add("uuid-rollout");
 
   let sawKnownRecord = false;
   let reason: string | undefined;
-  try {
-    for await (const record of readJsonlRecords(file, onProgress)) {
-      if (!isRecord(record)) continue;
+  return {
+    observe(record: unknown): void {
+      if (reason !== undefined || !isRecord(record)) return;
       const type = record.type;
       if (typeof type === "string" && (CODEX_RECORD_TYPES as readonly string[]).includes(type)) {
         sawKnownRecord = true;
@@ -51,15 +61,17 @@ export async function classifySessionFile(file: string, onProgress?: () => void)
           kinds.add("forked-rollout-with-lineage");
         }
       }
-    }
-  } catch (error) {
-    reason = error instanceof Error ? error.message : String(error);
-  }
-
-  if (kinds.size === 0 && !sawKnownRecord) {
-    return { path: file, kinds: [], unclassified: true, reason: reason ?? "no known Codex session shape" };
-  }
-  return { path: file, kinds: SESSION_SOURCE_KINDS.filter((kind) => kinds.has(kind)), unclassified: false, ...(reason ? { reason } : {}) };
+    },
+    fail(message: string): void {
+      reason ??= message;
+    },
+    result(): ClassifiedSessionFile {
+      if (kinds.size === 0 && !sawKnownRecord) {
+        return { path: file, kinds: [], unclassified: true, reason: reason ?? "no known Codex session shape" };
+      }
+      return { path: file, kinds: SESSION_SOURCE_KINDS.filter((kind) => kinds.has(kind)), unclassified: false, ...(reason ? { reason } : {}) };
+    },
+  };
 }
 
 export function missingSessionSourceKinds(
