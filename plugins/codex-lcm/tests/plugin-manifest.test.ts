@@ -26,8 +26,10 @@ test("npm package includes runtime wiring and excludes local evidence", () => {
 
 test("Codex plugin manifest points to MCP and skills", () => {
   const manifest = JSON.parse(fs.readFileSync(".codex-plugin/plugin.json", "utf8"));
+  const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
 
   assert.equal(manifest.name, "codex-lcm");
+  assert.equal(manifest.version, packageJson.version);
   assert.equal(manifest.license, "MIT");
   assert.equal(manifest.author.name, "Team Volt");
   assert.equal(manifest.mcpServers, "./.mcp.json");
